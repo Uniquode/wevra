@@ -43,6 +43,14 @@ async def _cache_provider(cache: CacheCapability) -> CacheCapability:
     return cache
 
 
+def invalid_redis_cache_settings() -> CacheSettings:
+    settings = object.__new__(CacheSettings)
+    object.__setattr__(settings, "name", "default")
+    object.__setattr__(settings, "backend", "redis")
+    object.__setattr__(settings, "url", None)
+    return settings
+
+
 @asynccontextmanager
 async def _started_events_site() -> AsyncIterator[Site]:
     site = await start(
@@ -299,6 +307,13 @@ url = "redis://cache/1"
         )
 
         assert implicit.partition == explicit.partition
+
+    def test_partition_rechecks_the_redis_url_invariant(self) -> None:
+        with pytest.raises(
+            ConfigurationError,
+            match=r"cache\.url is required when backend is 'redis'",
+        ):
+            assert invalid_redis_cache_settings().partition
 
     def test_rejects_duplicate_settings_names(self) -> None:
         with pytest.raises(ConfigurationError, match="duplicates: session"):
@@ -884,6 +899,16 @@ class TestCacheModule:
                     "redis": redis_factory,
                 },
             )
+
+    @pytest.mark.anyio
+    async def test_redis_backend_rechecks_the_url_invariant(self) -> None:
+        settings = CachesSettings(instances=(invalid_redis_cache_settings(),))
+
+        with pytest.raises(
+            ConfigurationError,
+            match=r"Cache 'default' backend 'redis' configuration failed",
+        ):
+            await build_caches(settings)
 
     @pytest.mark.anyio
     async def test_module_registration_failure_closes_new_registry_backends(

@@ -240,6 +240,20 @@ _.src
 _.alt
 _.fallback_text
 _.authenticated
+_.compare_and_swap
+_.compare_and_delete
+_.increment
+_.acquire
+_.renew
+_.reserve
+_.reject
+_.dead_letter
+_.read_consumer
+_.due
+_.durable
+_.restart_recovery
+_.horizontal_consumers
+_.guarantees
 
 # Typed event fields selected by the diagnostics projection through dataclass
 # reflection, plus an ASGI middleware callback registered by FastAPI's decorator.
