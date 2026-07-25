@@ -96,6 +96,11 @@ def test_task_declaration_rejects_invalid_schema_version(version: int) -> None:
             return None
 
 
+def test_task_identity_rejects_non_string_name() -> None:
+    with pytest.raises(TaskDeclarationError, match="dotted Python identifier"):
+        wybra.tasks.TaskIdentity(name=123)  # type: ignore[arg-type]
+
+
 def test_task_registry_rejects_duplicate_identity() -> None:
     registry = TaskRegistry()
 

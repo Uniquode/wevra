@@ -72,7 +72,9 @@ _TERMINAL_STATES: Final = frozenset(
     }
 )
 DEFAULT_TASK_HISTORY_LIMIT: Final = 100
+DEFAULT_TASK_REPLAY_LIMIT: Final = 1000
 DEFAULT_TASK_STATUS_RETENTION_SECONDS: Final = 3600.0
+type _TaskEventKey = tuple[object, ...]
 
 
 @dataclass(frozen=True, slots=True, init=False, eq=False)
@@ -194,10 +196,15 @@ class TaskStatus:
 class TaskStatusProjection:
     retention_seconds: float = DEFAULT_TASK_STATUS_RETENTION_SECONDS
     history_limit: int = DEFAULT_TASK_HISTORY_LIMIT
+    replay_limit: int | None = None
     _clock: Callable[[], float] = field(default=time.time, repr=False)
     _statuses: dict[UUID, TaskStatus] = field(default_factory=dict)
     _history: dict[UUID, deque[TaskLifecycleEvent]] = field(default_factory=dict)
-    _applied_events: dict[UUID, set[TaskLifecycleEvent]] = field(
+    _applied_event_keys: dict[UUID, set[_TaskEventKey]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _applied_event_order: dict[UUID, deque[_TaskEventKey]] = field(
         default_factory=dict,
         repr=False,
     )
@@ -216,6 +223,19 @@ class TaskStatusProjection:
             or self.history_limit < 1
         ):
             raise ValueError("Task lifecycle history limit must be a positive integer.")
+        replay_limit = self.replay_limit
+        if replay_limit is None:
+            replay_limit = max(DEFAULT_TASK_REPLAY_LIMIT, self.history_limit)
+        if (
+            isinstance(replay_limit, bool)
+            or not isinstance(replay_limit, int)
+            or replay_limit < self.history_limit
+        ):
+            raise ValueError(
+                "Task lifecycle replay limit must be an integer greater than "
+                "or equal to the history limit."
+            )
+        self.replay_limit = replay_limit
 
     def apply(self, event: TaskLifecycleEvent) -> TaskStatus:
         if (
@@ -228,11 +248,12 @@ class TaskStatusProjection:
             )
         self._prune_expired(self._clock())
         current = self._statuses.get(event.task_id)
-        applied_events = self._applied_events.get(event.task_id)
+        event_key = _event_key(event)
+        applied_event_keys = self._applied_event_keys.get(event.task_id)
         if (
             current is not None
-            and applied_events is not None
-            and event in applied_events
+            and applied_event_keys is not None
+            and event_key in applied_event_keys
         ):
             return current
         current_state = current.state if current is not None else None
@@ -273,7 +294,7 @@ class TaskStatusProjection:
             event.task_id,
             deque(maxlen=self.history_limit),
         ).append(event)
-        self._applied_events.setdefault(event.task_id, set()).add(event)
+        self._record_applied_event(event.task_id, event_key)
         return status
 
     def status(self, task_id: UUID) -> TaskStatus | None:
@@ -294,7 +315,43 @@ class TaskStatusProjection:
         for task_id in expired:
             self._statuses.pop(task_id, None)
             self._history.pop(task_id, None)
-            self._applied_events.pop(task_id, None)
+            self._applied_event_keys.pop(task_id, None)
+            self._applied_event_order.pop(task_id, None)
+
+    def _record_applied_event(
+        self,
+        task_id: UUID,
+        event_key: _TaskEventKey,
+    ) -> None:
+        replay_limit = self.replay_limit
+        if replay_limit is None:  # pragma: no cover - resolved during initialisation
+            raise TaskLifecycleError("Task lifecycle replay limit is unavailable.")
+        event_keys = self._applied_event_keys.setdefault(task_id, set())
+        event_order = self._applied_event_order.setdefault(task_id, deque())
+        if len(event_order) >= replay_limit:
+            event_keys.discard(event_order.popleft())
+        event_keys.add(event_key)
+        event_order.append(event_key)
+
+
+def _event_key(event: TaskLifecycleEvent) -> _TaskEventKey:
+    progress = (
+        event.progress._encoded if isinstance(event.progress, _TaskProgress) else None
+    )
+    return (
+        event.kind,
+        event.task_id,
+        event.task_name,
+        event.schema_version,
+        event.queue,
+        event.correlation_id,
+        event.causation_id,
+        event.attempt,
+        event.worker_id,
+        progress,
+        event.error_type,
+        event.occurred_at,
+    )
 
 
 def _validate_identity(

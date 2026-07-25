@@ -31,6 +31,8 @@ class TaskIdentity:
     version: int = 1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.name, str):
+            raise TaskDeclarationError("Task name must be a dotted Python identifier.")
         name = self.name.strip()
         if not TASK_NAME_PATTERN.fullmatch(name):
             raise TaskDeclarationError("Task name must be a dotted Python identifier.")

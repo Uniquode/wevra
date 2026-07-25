@@ -275,6 +275,36 @@ def test_status_projection_ignores_exact_replay_after_history_eviction() -> None
     ] == [4, 5, 6]
 
 
+def test_status_projection_bounds_replay_tracking() -> None:
+    projection = TaskStatusProjection(history_limit=2, replay_limit=3)
+    submitted = TaskLifecycleEvent.new(
+        kind=TaskLifecycleKind.SUBMITTED,
+        task_name="tests.example",
+        schema_version=1,
+        queue="default",
+    )
+    projection.apply(submitted)
+    projection.apply(
+        replace(
+            submitted,
+            kind=TaskLifecycleKind.STARTED,
+            occurred_at=submitted.occurred_at + 1,
+        )
+    )
+    for index in range(2, 6):
+        projection.apply(
+            replace(
+                submitted,
+                kind=TaskLifecycleKind.PROGRESS,
+                occurred_at=submitted.occurred_at + index,
+                progress={"index": index},
+            )
+        )
+
+    assert len(projection._applied_event_keys[submitted.task_id]) == 3
+    assert len(projection._applied_event_order[submitted.task_id]) == 3
+
+
 def test_lifecycle_progress_is_json_safe_immutable_and_secret_safe() -> None:
     projection = TaskStatusProjection()
     submitted = TaskLifecycleEvent.new(
@@ -415,6 +445,38 @@ async def test_immediate_submission_exposes_successful_lifecycle() -> None:
         TaskLifecycleKind.STARTED,
         TaskLifecycleKind.SUCCEEDED,
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("configured_worker_id", "expected_worker_id"),
+    ((None, "immediate"), ("inline-a", "inline-a")),
+)
+async def test_immediate_submission_uses_effective_worker_identity(
+    configured_worker_id: str | None,
+    expected_worker_id: str,
+) -> None:
+    registry = TaskRegistry()
+    observed_worker_id: str | None = None
+
+    @task(name="tests.worker_identity", registry=registry)
+    async def inspect_worker() -> None:
+        nonlocal observed_worker_id
+        context = current_task_context()
+        assert context is not None
+        observed_worker_id = context.worker_id
+
+    capability = ImmediateTasksCapability(TasksSettings(worker_id=configured_worker_id))
+
+    handle = await capability.submit(inspect_worker, inspect_worker.payload())
+    lifecycle = await capability.lifecycle(handle.task_id)
+
+    assert observed_worker_id == expected_worker_id
+    assert all(
+        event.worker_id == expected_worker_id
+        for event in lifecycle
+        if event.kind is not TaskLifecycleKind.SUBMITTED
+    )
 
 
 @pytest.mark.anyio

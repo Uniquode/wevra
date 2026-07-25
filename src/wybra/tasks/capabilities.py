@@ -109,6 +109,7 @@ class ImmediateTasksCapability:
         payload = definition.validate_payload(payload)
         selected = options or TaskSubmissionOptions()
         queue = selected.queue or self.settings.default_queue
+        worker_id = self.settings.worker_id or "immediate"
         parent = current_task_context()
         submitted = TaskLifecycleEvent.new(
             kind=TaskLifecycleKind.SUBMITTED,
@@ -125,7 +126,7 @@ class ImmediateTasksCapability:
                 submitted,
                 TaskLifecycleKind.STARTED,
                 attempt=attempt,
-                worker_id="immediate",
+                worker_id=worker_id,
             )
             self._projection.apply(started)
             context = TaskExecutionContext(
@@ -137,7 +138,7 @@ class ImmediateTasksCapability:
                 causation_id=submitted.causation_id,
                 idempotency_key=selected.idempotency_key,
                 queue=queue,
-                worker_id="immediate",
+                worker_id=worker_id,
             )
             try:
                 await definition.execute(payload, context)
@@ -148,6 +149,7 @@ class ImmediateTasksCapability:
                             submitted,
                             TaskLifecycleKind.RETRY_SCHEDULED,
                             attempt=attempt,
+                            worker_id=worker_id,
                             error_type=type(exc).__name__,
                         )
                     )
@@ -160,6 +162,7 @@ class ImmediateTasksCapability:
                         submitted,
                         TaskLifecycleKind.FAILED,
                         attempt=attempt,
+                        worker_id=worker_id,
                         error_type=type(exc).__name__,
                     )
                 )
@@ -168,6 +171,7 @@ class ImmediateTasksCapability:
                         submitted,
                         TaskLifecycleKind.DEAD_LETTERED,
                         attempt=attempt,
+                        worker_id=worker_id,
                         error_type=type(exc).__name__,
                     )
                 )
@@ -178,6 +182,7 @@ class ImmediateTasksCapability:
                         submitted,
                         TaskLifecycleKind.SUCCEEDED,
                         attempt=attempt,
+                        worker_id=worker_id,
                     )
                 )
                 break
