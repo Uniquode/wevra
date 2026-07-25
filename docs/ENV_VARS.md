@@ -62,6 +62,15 @@ Configured secret-source keys may also point at environment variables:
 | `DATABASE_URL` | Runtime database URL override. When set, it overrides configured database connection settings. |
 | `MIGRATIONS_ROOT` | Overrides the configured migrations root used by database tooling. |
 
+## Cache
+
+| Name | Description |
+| --- | --- |
+| `WYBRA_CACHE_BACKEND` | Overrides the backend for the root `[cache]` instance named `default`. |
+| `WYBRA_CACHE_URL` | Overrides the Redis URL for the root `[cache]` instance. |
+| `WYBRA_CACHE__<NAME>__BACKEND` | Overrides the backend for the existing `[cache.<name>]` instance only. The cache name is upper-cased. |
+| `WYBRA_CACHE__<NAME>__URL` | Overrides the Redis URL for the existing `[cache.<name>]` instance only. The cache name is upper-cased. |
+
 ## Authentication
 
 | Name | Description |

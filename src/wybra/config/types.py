@@ -8,6 +8,7 @@ from typing import Any, Literal, Protocol
 
 ConfigDiagnosticSeverity = Literal["error", "warning", "info"]
 type ConfigTransform = Callable[[Any], Any]
+type ConfigNameValidator = Callable[[str], None]
 type EnvOverride = str | tuple[str, ...]
 
 
@@ -130,11 +131,71 @@ def _field_map(fields: tuple[ConfigField, ...]) -> dict[str, ConfigField]:
 
 
 @dataclass(frozen=True, slots=True)
+class RepeatedConfigSection:
+    """Apply one field schema to configured ``prefix.<name>`` sections."""
+
+    group: ConfigGroup
+    environment_prefix: str | None = None
+    environment_fields: frozenset[str] = frozenset()
+    name_validator: ConfigNameValidator | None = None
+
+    def __init__(
+        self,
+        *,
+        group: ConfigGroup,
+        environment_prefix: str | None = None,
+        environment_fields: tuple[str, ...] = (),
+        name_validator: ConfigNameValidator | None = None,
+    ) -> None:
+        if not isinstance(group, ConfigGroup):
+            raise ConfigDefinitionError(
+                "RepeatedConfigSection group must be a ConfigGroup."
+            )
+        prefix = environment_prefix.strip() if environment_prefix is not None else None
+        if environment_prefix is not None:
+            if not prefix:
+                raise ConfigDefinitionError(
+                    "RepeatedConfigSection environment prefix must not be blank."
+                )
+            if environment_prefix != prefix:
+                raise ConfigDefinitionError(
+                    "RepeatedConfigSection environment prefix must not contain "
+                    "surrounding whitespace."
+                )
+        fields = frozenset(environment_fields)
+        unknown_fields = fields - group.field_names
+        if unknown_fields:
+            raise ConfigDefinitionError(
+                "RepeatedConfigSection environment fields are not declared: "
+                + ", ".join(sorted(unknown_fields))
+            )
+        if name_validator is not None and not callable(name_validator):
+            raise ConfigDefinitionError(
+                "RepeatedConfigSection name validator must be callable."
+            )
+        object.__setattr__(self, "group", group)
+        object.__setattr__(self, "environment_prefix", prefix)
+        object.__setattr__(self, "environment_fields", fields)
+        object.__setattr__(self, "name_validator", name_validator)
+
+
+@dataclass(frozen=True, slots=True)
 class ConfigDef:
     sections: Mapping[str, ConfigGroup]
+    repeated_sections: Mapping[str, RepeatedConfigSection]
 
-    def __init__(self, sections: Mapping[str, ConfigGroup]) -> None:
+    def __init__(
+        self,
+        sections: Mapping[str, ConfigGroup],
+        *,
+        repeated_sections: Mapping[str, RepeatedConfigSection] | None = None,
+    ) -> None:
         object.__setattr__(self, "sections", MappingProxyType(dict(sections)))
+        object.__setattr__(
+            self,
+            "repeated_sections",
+            MappingProxyType(dict(repeated_sections or {})),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +233,7 @@ class ConfigSource(Protocol):
 
 def merge_config_defs(definitions: tuple[ConfigDef, ...]) -> ConfigDef:
     sections: dict[str, ConfigGroup] = {}
+    repeated_sections: dict[str, RepeatedConfigSection] = {}
     for definition in definitions:
         for section_name, section in definition.sections.items():
             existing = sections.get(section_name)
@@ -181,7 +243,16 @@ def merge_config_defs(definitions: tuple[ConfigDef, ...]) -> ConfigDef:
 
             merged_fields = _merge_fields(section_name, existing, section)
             sections[section_name] = ConfigGroup(fields=merged_fields)
-    return ConfigDef(sections)
+        for section_name, repeated in definition.repeated_sections.items():
+            existing_repeated = repeated_sections.get(section_name)
+            if existing_repeated is None:
+                repeated_sections[section_name] = repeated
+                continue
+            if existing_repeated != repeated:
+                raise ConfigDefinitionError(
+                    f"Conflicting repeated section definition for {section_name}."
+                )
+    return ConfigDef(sections, repeated_sections=repeated_sections)
 
 
 def _merge_fields(

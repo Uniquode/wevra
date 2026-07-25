@@ -11,18 +11,32 @@ from fastapi import FastAPI
 from jinja2 import Environment
 from jinja2.exceptions import TemplateRuntimeError
 
-from wybra.cache import CacheCapability, CacheSettings, InMemoryCache, RedisCache
-from wybra.config import MappingConfigSource
-from wybra.core.exceptions import ConfigurationError
-from wybra.events._core import (
-    EVT_CACHE,
-    Event,
-    EventsCapability,
+from wybra.cache import (
+    CacheBackend,
+    CacheCapability,
+    CacheNotFoundError,
+    CachesCapability,
+    CacheSettings,
+    CachesSettings,
+    InMemoryCache,
+    RedisCache,
+    build_caches,
+    setup_site,
 )
+from wybra.config import (
+    ConfigService,
+    ConfigSourceError,
+    FileConfigSource,
+    MappingConfigSource,
+)
+from wybra.core.exceptions import ConfigurationError
+from wybra.events import Event, EventsCapability, event_scope
 from wybra.events.cache import CacheOperationCompletedEvent, CacheOperationFailedEvent
 from wybra.site import Site, start
 from wybra.template import DefaultTemplateCapability, TemplateCapability
 from wybra.template.cache import configure_cache_extension
+
+EVT_CACHE = event_scope("cache")
 
 
 async def _cache_provider(cache: CacheCapability) -> CacheCapability:
@@ -50,8 +64,251 @@ class TestCacheSettings:
     def test_defaults_to_memory_backend(self) -> None:
         settings = CacheSettings.load_settings({"cache": {}})
 
+        assert settings.name == "default"
         assert settings.backend == "memory"
         assert settings.url is None
+
+    def test_loads_independent_default_and_named_caches(self) -> None:
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "redis",
+                    "url": "redis://default-secret@cache/0",
+                },
+                "cache.session": {"backend": "memory"},
+                "cache.tasks": {
+                    "backend": "redis",
+                    "url": "redis://task-secret@cache/2",
+                },
+            }
+        )
+
+        assert settings.require("default").backend == "redis"
+        assert settings.require("session") == CacheSettings(name="session")
+        assert settings.require("tasks").url == "redis://task-secret@cache/2"
+
+    def test_loads_default_and_named_caches_from_application_toml(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config_path = tmp_path / "app.toml"
+        config_path.write_text(
+            """
+[app]
+modules = ["wybra.cache"]
+
+[app.templates]
+auto_reload = true
+cache_size = 0
+
+[app.assets]
+url_path = "/static/"
+
+[cache]
+backend = "redis"
+url = "redis://cache/0"
+
+[cache.session]
+backend = "memory"
+
+["cache.tasks"]
+backend = "memory"
+""".strip(),
+            encoding="utf-8",
+        )
+        ConfigService.set_runtime_environment(
+            {
+                "WYBRA_CACHE__SESSION__BACKEND": "redis",
+                "WYBRA_CACHE__SESSION__URL": "redis://cache/1",
+            }
+        )
+
+        config = ConfigService([FileConfigSource(config_path, project_root=tmp_path)])
+        settings = CachesSettings.load_settings(config)
+
+        assert [(item.name, item.backend) for item in settings.instances] == [
+            ("default", "redis"),
+            ("session", "redis"),
+            ("tasks", "memory"),
+        ]
+        assert settings.require("default").url == "redis://cache/0"
+        assert settings.require("session").url == "redis://cache/1"
+        assert config.config.sources["cache.session.backend"] == "environment"
+        assert config.config.sources["cache.session.url"] == "environment"
+
+    def test_rejects_ambiguous_nested_and_quoted_cache_tables(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config_path = tmp_path / "app.toml"
+        config_path.write_text(
+            """
+[app]
+modules = ["wybra.cache"]
+
+[app.templates]
+auto_reload = true
+cache_size = 0
+
+[app.assets]
+url_path = "/static/"
+
+[cache.session]
+backend = "memory"
+
+["cache.session"]
+backend = "redis"
+url = "redis://cache/1"
+""".strip(),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(
+            ConfigSourceError,
+            match="both nested and quoted dotted cache tables",
+        ):
+            ConfigService([FileConfigSource(config_path, project_root=tmp_path)])
+
+    @pytest.mark.parametrize(
+        "section",
+        (
+            "cache.default",
+            "cache.bad-name",
+            "cache.deeply.nested",
+            "cache.",
+            "cache. session ",
+        ),
+    )
+    def test_rejects_invalid_or_reserved_named_cache_sections(
+        self, section: str
+    ) -> None:
+        with pytest.raises(ConfigurationError, match="cache name"):
+            CachesSettings.load_settings({"cache": {}, section: {}})
+
+    def test_rejects_backend_fields_irrelevant_to_memory_cache(self) -> None:
+        with pytest.raises(
+            ConfigurationError,
+            match=r"cache\.session\.url.+memory",
+        ):
+            CachesSettings.load_settings(
+                {
+                    "cache": {},
+                    "cache.session": {
+                        "backend": "memory",
+                        "url": "redis://cache/1",
+                    },
+                }
+            )
+
+    def test_applies_named_environment_override_only_to_target_cache(self) -> None:
+        ConfigService.set_runtime_environment(
+            {
+                "WYBRA_CACHE__SESSION__BACKEND": "redis",
+                "WYBRA_CACHE__SESSION__URL": "redis://session-secret@cache/1",
+            }
+        )
+        config = ConfigService(
+            [
+                MappingConfigSource(
+                    {
+                        "cache": {},
+                        "cache.session": {"backend": "memory"},
+                        "cache.tasks": {"backend": "memory"},
+                    }
+                )
+            ],
+            config_defs=(CacheSettings.module_config,),
+            discover_module_config=False,
+        )
+
+        settings = CachesSettings.load_settings(config)
+
+        assert config.get_config("cache.session") == {
+            "backend": "redis",
+            "url": "redis://session-secret@cache/1",
+        }
+        assert config.config.sources["cache.session.backend"] == "environment"
+        assert config.config.sources["cache.session.url"] == "environment"
+        assert settings.require("session").backend == "redis"
+        assert settings.require("session").url == "redis://session-secret@cache/1"
+        assert settings.require("tasks") == CacheSettings(name="tasks")
+
+    def test_configuration_diagnostics_are_secret_safe(self) -> None:
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "redis",
+                    "url": "redis://user:password@cache.internal/4",
+                },
+                "cache.session": {"backend": "memory"},
+            }
+        )
+
+        diagnostics = settings.diagnostics()
+
+        assert [(item.name, item.backend) for item in diagnostics] == [
+            ("default", "redis"),
+            ("session", "memory"),
+        ]
+        assert diagnostics[0].partition != diagnostics[1].partition
+        assert diagnostics[0].features == ()
+        rendered = repr(diagnostics)
+        assert "password" not in rendered
+        assert "redis://" not in rendered
+
+    def test_partition_diagnostics_do_not_depend_on_redis_credentials(self) -> None:
+        first = CacheSettings(
+            backend="redis",
+            url="redis://first:secret@cache.internal/4",
+        )
+        second = CacheSettings(
+            backend="redis",
+            url="redis://second:rotated@cache.internal/4",
+        )
+
+        assert first.partition == second.partition
+
+    def test_partition_diagnostics_distinguish_effective_redis_partitions(
+        self,
+    ) -> None:
+        query_first = CacheSettings(
+            backend="redis",
+            url="redis://cache.internal?db=1",
+        )
+        query_second = CacheSettings(
+            backend="redis",
+            url="redis://cache.internal?db=2",
+        )
+        unix_first = CacheSettings(
+            backend="redis",
+            url="unix:///tmp/first.sock?db=0",
+        )
+        unix_second = CacheSettings(
+            backend="redis",
+            url="unix:///tmp/second.sock?db=0",
+        )
+
+        assert query_first.partition != query_second.partition
+        assert unix_first.partition != unix_second.partition
+
+    def test_partition_diagnostics_canonicalise_implicit_localhost(self) -> None:
+        implicit = CacheSettings(backend="redis", url="redis:///4")
+        explicit = CacheSettings(
+            backend="redis",
+            url="redis://localhost:6379/4",
+        )
+
+        assert implicit.partition == explicit.partition
+
+    def test_rejects_duplicate_settings_names(self) -> None:
+        with pytest.raises(ConfigurationError, match="duplicates: session"):
+            CachesSettings(
+                instances=(
+                    CacheSettings(),
+                    CacheSettings(name="session"),
+                    CacheSettings(name="session"),
+                )
+            )
 
 
 class TestInMemoryCache:
@@ -451,16 +708,336 @@ class TestRedisCache:
 
 class TestCacheModule:
     @pytest.mark.anyio
-    async def test_module_registers_cache_capability(self) -> None:
+    async def test_module_registers_default_and_named_cache_capabilities(self) -> None:
+        site = await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache",)},
+                    "cache": {},
+                    "cache.session": {"backend": "memory"},
+                }
+            ),
+        )
+
+        caches = site.require_capability(CachesCapability)
+        default = caches.require("default")
+        session = caches.require("session", consumer="sessions")
+
+        assert isinstance(default.values, CacheCapability)
+        assert site.require_capability(CacheCapability) is default.values
+        assert caches.require("session") is session
+        assert caches.optional("missing") is None
+        assert caches.optional(" session ") is None
+        with pytest.raises(CacheNotFoundError, match="Invalid cache name"):
+            caches.require(" session ")
+        await default.values.set("test", "shared-key", b"default", ttl=60)
+        assert await session.values.get("test", "shared-key") is None
+        await site.close()
+
+    @pytest.mark.anyio
+    async def test_missing_named_cache_error_identifies_name_and_consumer(self) -> None:
         site = await start(
             FastAPI(),
             config_source=MappingConfigSource(
                 {"app": {"modules": ("wybra.cache",)}, "cache": {}}
             ),
         )
+        caches = site.require_capability(CachesCapability)
 
-        assert isinstance(site.require_capability(CacheCapability), CacheCapability)
+        with pytest.raises(
+            CacheNotFoundError,
+            match=r"missing.+sessions",
+        ):
+            caches.require("missing", consumer="sessions")
+
         await site.close()
+
+    @pytest.mark.anyio
+    async def test_registry_closes_each_named_backend_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clients: list[SimpleNamespace] = []
+
+        def from_url(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            client = SimpleNamespace(close_count=0)
+
+            async def aclose() -> None:
+                client.close_count += 1
+
+            client.aclose = aclose
+            clients.append(client)
+            return client
+
+        monkeypatch.setattr(
+            "wybra.cache.capabilities.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(from_url=from_url),
+            ),
+        )
+        site = await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache",)},
+                    "cache": {"backend": "redis", "url": "redis://cache/0"},
+                    "cache.session": {
+                        "backend": "redis",
+                        "url": "redis://cache/1",
+                    },
+                }
+            ),
+        )
+
+        await site.close()
+
+        assert [client.close_count for client in clients] == [1, 1]
+
+    @pytest.mark.anyio
+    async def test_registry_closes_started_backends_after_startup_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = SimpleNamespace(close_count=0)
+        calls = 0
+
+        async def aclose() -> None:
+            first.close_count += 1
+
+        first.aclose = aclose
+
+        def from_url(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return first
+            raise RuntimeError("second cache failed")
+
+        monkeypatch.setattr(
+            "wybra.cache.capabilities.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(from_url=from_url),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="module hook failed"):
+            await start(
+                FastAPI(),
+                config_source=MappingConfigSource(
+                    {
+                        "app": {"modules": ("wybra.cache",)},
+                        "cache": {"backend": "redis", "url": "redis://cache/0"},
+                        "cache.session": {
+                            "backend": "redis",
+                            "url": "redis://cache/1",
+                        },
+                    }
+                ),
+            )
+
+        assert first.close_count == 1
+
+    @pytest.mark.anyio
+    async def test_registry_closes_backend_rejected_by_baseline_validation(
+        self,
+    ) -> None:
+        settings = CachesSettings.load_settings({"cache": {}})
+        close_count = 0
+
+        async def close() -> None:
+            nonlocal close_count
+            close_count += 1
+
+        async def factory(_settings: CacheSettings) -> CacheBackend:
+            return CacheBackend(SimpleNamespace(), close)
+
+        with pytest.raises(ConfigurationError, match="mandatory cache baseline"):
+            await build_caches(settings, factories={"memory": factory})
+
+        assert close_count == 1
+
+    @pytest.mark.anyio
+    async def test_backend_configuration_error_identifies_named_cache(self) -> None:
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {},
+                "cache.session": {
+                    "backend": "redis",
+                    "url": "http://cache/1",
+                },
+            }
+        )
+
+        async def memory_factory(_settings: CacheSettings) -> CacheBackend:
+            return CacheBackend(InMemoryCache())
+
+        async def redis_factory(_settings: CacheSettings) -> CacheBackend:
+            raise ValueError("Redis URL has an unsupported scheme")
+
+        with pytest.raises(
+            ConfigurationError,
+            match=r"Cache 'session' backend 'redis' configuration failed",
+        ):
+            await build_caches(
+                settings,
+                factories={
+                    "memory": memory_factory,
+                    "redis": redis_factory,
+                },
+            )
+
+    @pytest.mark.anyio
+    async def test_module_registration_failure_closes_new_registry_backends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clients: list[SimpleNamespace] = []
+
+        def from_url(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            client = SimpleNamespace(close_count=0)
+
+            async def aclose() -> None:
+                client.close_count += 1
+
+            client.aclose = aclose
+            clients.append(client)
+            return client
+
+        monkeypatch.setattr(
+            "wybra.cache.capabilities.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(from_url=from_url),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="already provided"):
+            await start(
+                FastAPI(),
+                config_source=MappingConfigSource(
+                    {
+                        "app": {"modules": ("wybra.cache", "wybra.cache")},
+                        "cache": {"backend": "redis", "url": "redis://cache/0"},
+                    }
+                ),
+            )
+
+        assert [client.close_count for client in clients] == [1, 1]
+
+    @pytest.mark.anyio
+    async def test_registration_rollback_preserves_cancellation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class CancellingCaches:
+            def require(self, _name: str) -> SimpleNamespace:
+                return SimpleNamespace(values=InMemoryCache())
+
+            async def close(self) -> None:
+                raise asyncio.CancelledError
+
+        class FailingSite:
+            config = {"cache": {}}
+            registration_count = 0
+
+            def provide_capability(
+                self,
+                _capability_type: object,
+                _value: object,
+            ) -> None:
+                self.registration_count += 1
+                if self.registration_count == 2:
+                    raise RuntimeError("registration failed")
+
+        async def build_cancelling_caches(
+            _settings: CachesSettings,
+        ) -> CancellingCaches:
+            return CancellingCaches()
+
+        monkeypatch.setattr(
+            "wybra.cache.setup.build_caches",
+            build_cancelling_caches,
+        )
+
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await setup_site(FailingSite())
+
+        assert isinstance(captured.value.__cause__, RuntimeError)
+
+    @pytest.mark.anyio
+    async def test_registry_attempts_every_close_when_one_backend_fails(self) -> None:
+        settings = CachesSettings.load_settings(
+            {"cache": {}, "cache.session": {"backend": "memory"}}
+        )
+        close_calls: list[str] = []
+
+        async def factory(settings: CacheSettings) -> CacheBackend:
+            async def close() -> None:
+                close_calls.append(settings.name)
+                if settings.name == "session":
+                    raise RuntimeError("close failed")
+
+            return CacheBackend(InMemoryCache(), close)
+
+        caches = await build_caches(settings, factories={"memory": factory})
+
+        with pytest.raises(BaseExceptionGroup, match="shutdown failed"):
+            await caches.close()
+
+        assert close_calls == ["session", "default"]
+
+    @pytest.mark.anyio
+    async def test_registry_preserves_cancellation_after_closing_every_backend(
+        self,
+    ) -> None:
+        settings = CachesSettings.load_settings(
+            {"cache": {}, "cache.session": {"backend": "memory"}}
+        )
+        close_calls: list[str] = []
+
+        async def factory(settings: CacheSettings) -> CacheBackend:
+            async def close() -> None:
+                close_calls.append(settings.name)
+                if settings.name == "session":
+                    raise asyncio.CancelledError
+
+            return CacheBackend(InMemoryCache(), close)
+
+        caches = await build_caches(settings, factories={"memory": factory})
+
+        with pytest.raises(asyncio.CancelledError):
+            await caches.close()
+
+        assert close_calls == ["session", "default"]
+
+    @pytest.mark.anyio
+    async def test_registry_closes_shared_lifecycle_owner_once(self) -> None:
+        settings = CachesSettings.load_settings(
+            {"cache": {}, "cache.session": {"backend": "memory"}}
+        )
+        close_count = 0
+        owner = object()
+
+        async def close() -> None:
+            nonlocal close_count
+            close_count += 1
+
+        async def factory(_settings: CacheSettings) -> CacheBackend:
+            return CacheBackend(
+                InMemoryCache(),
+                close,
+                lifecycle_owner=owner,
+            )
+
+        caches = await build_caches(settings, factories={"memory": factory})
+
+        await caches.close()
+
+        assert close_count == 1
+
+    @pytest.mark.anyio
+    async def test_empty_factory_mapping_disables_builtin_factories(self) -> None:
+        settings = CachesSettings.load_settings({"cache": {}})
+
+        with pytest.raises(ConfigurationError, match="No cache backend factory"):
+            await build_caches(settings, factories={})
 
 
 class TestTemplateFragmentCache:

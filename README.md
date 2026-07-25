@@ -31,8 +31,8 @@ Repository: <https://github.com/Uniquode/wybra>
   URL resolution, collection, and validation.
 - `wybra.template`: template settings, source discovery, rendering capability,
   context construction, and template validation.
-- `wybra.cache`: optional process-local or Redis-backed byte cache capability,
-  including Jinja template-fragment caching.
+- `wybra.cache`: optional named process-local or Redis-backed byte cache
+  registry, including Jinja template-fragment caching.
 - `wybra.forms`: form settings, CSRF protection, request form parsing, form
   safety helpers, form response finalisation, and forms validation.
 - `wybra.security`: web-facing security policy, COOP/security headers, CORS

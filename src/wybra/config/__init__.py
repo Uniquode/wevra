@@ -30,6 +30,7 @@ from wybra.config.types import (
     ConfigError,
     ConfigField,
     ConfigGroup,
+    ConfigNameValidator,
     ConfigSource,
     ConfigSourceError,
     ConfigSourceLocation,
@@ -37,6 +38,7 @@ from wybra.config.types import (
     ConfigSourceResult,
     ConfigTransform,
     LoadedConfig,
+    RepeatedConfigSection,
 )
 
 __all__ = (
@@ -49,6 +51,7 @@ __all__ = (
     "ConfigError",
     "ConfigField",
     "ConfigGroup",
+    "ConfigNameValidator",
     "ConfigService",
     "ConfigSource",
     "ConfigSourceError",
@@ -63,6 +66,7 @@ __all__ = (
     "LoadedConfig",
     "load_configured_settings",
     "MappingConfigSource",
+    "RepeatedConfigSection",
     "SettingsConfigSource",
     "discover_module_config_defs",
     "to_bool",

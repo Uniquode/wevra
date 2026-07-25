@@ -22,6 +22,7 @@ from wybra.config import (
     EnvironmentConfigSource,
     FileConfigSource,
     MappingConfigSource,
+    RepeatedConfigSection,
     to_bool,
     to_path,
 )
@@ -112,6 +113,12 @@ def test_raw_config_sections_flattens_runtime_module_subsections() -> None:
                 "crypto": {"source": "keychain"},
                 "keychain": {"appname": "wybra"},
             },
+            "cache": {
+                "backend": "redis",
+                "url": "redis://cache/0",
+                "session": {"backend": "memory"},
+            },
+            "cache.tasks": {"backend": "memory"},
         }
     )
 
@@ -125,6 +132,12 @@ def test_raw_config_sections_flattens_runtime_module_subsections() -> None:
     assert sections["auth.providers"] == {"google": {"secrets": "keychain"}}
     assert sections["secrets.crypto"] == {"source": "keychain"}
     assert sections["secrets.keychain"] == {"appname": "wybra"}
+    assert sections["cache"] == {
+        "backend": "redis",
+        "url": "redis://cache/0",
+    }
+    assert sections["cache.session"] == {"backend": "memory"}
+    assert sections["cache.tasks"] == {"backend": "memory"}
 
 
 def test_load_app_config_preserves_auth_policy_and_flattens_auth_providers(
@@ -463,6 +476,127 @@ def test_config_def_applies_raw_defaults_and_env_overrides() -> None:
     }
     assert service.config.sources["app.assets.url_path"] == "default"
     assert service.config.sources["app.assets.root"] == "environment"
+
+
+def test_repeated_config_section_applies_defaults_transforms_and_environment() -> None:
+    group = ConfigGroup(
+        fields=(
+            ConfigField(name="enabled", default=False, transform=to_bool),
+            ConfigField(name="label", default="worker"),
+        )
+    )
+    config_def = ConfigDef(
+        {},
+        repeated_sections={
+            "service": RepeatedConfigSection(
+                group=group,
+                environment_prefix="APP_SERVICE",
+                environment_fields=("enabled",),
+            )
+        },
+    )
+    ConfigService.set_runtime_environment({"APP_SERVICE__EMAIL__ENABLED": "yes"})
+
+    service = ConfigService(
+        [
+            MappingConfigSource(
+                {
+                    "service.email": {},
+                    "service.tasks": {"enabled": "false"},
+                }
+            )
+        ],
+        config_defs=(config_def,),
+    )
+
+    assert service.get_config("service.email") == {
+        "enabled": True,
+        "label": "worker",
+    }
+    assert service.get_config("service.tasks") == {
+        "enabled": False,
+        "label": "worker",
+    }
+    assert service.config.sources["service.email.enabled"] == "environment"
+    assert service.config.sources["service.email.label"] == "default"
+    assert service.config.sources["service.tasks.enabled"] == "mapping"
+
+
+def test_repeated_config_section_validates_instance_name() -> None:
+    def validate_name(name: str) -> None:
+        if name != "valid":
+            raise ValueError("name must be 'valid'.")
+
+    config_def = ConfigDef(
+        {},
+        repeated_sections={
+            "service": RepeatedConfigSection(
+                group=ConfigGroup(),
+                name_validator=validate_name,
+            )
+        },
+    )
+
+    with pytest.raises(
+        ConfigSourceError,
+        match=r"Config section 'service\.invalid' is invalid: name must be 'valid'",
+    ):
+        ConfigService(
+            [MappingConfigSource({"service.invalid": {}})],
+            config_defs=(config_def,),
+        )
+
+
+def test_exact_and_more_specific_sections_precede_repeated_prefixes() -> None:
+    config_def = ConfigDef(
+        {
+            "service.special": ConfigGroup(
+                fields=(
+                    ConfigField(
+                        name="value",
+                        transform=lambda value: f"exact:{value}",
+                    ),
+                ),
+            )
+        },
+        repeated_sections={
+            "service": RepeatedConfigSection(
+                group=ConfigGroup(
+                    fields=(
+                        ConfigField(
+                            name="value",
+                            transform=lambda value: f"general:{value}",
+                        ),
+                    ),
+                ),
+            ),
+            "service.region": RepeatedConfigSection(
+                group=ConfigGroup(
+                    fields=(
+                        ConfigField(
+                            name="value",
+                            transform=lambda value: f"regional:{value}",
+                        ),
+                    ),
+                ),
+            ),
+        },
+    )
+
+    service = ConfigService(
+        [
+            MappingConfigSource(
+                {
+                    "service.special": {"value": "fixed"},
+                    "service.region.email": {"value": "dynamic"},
+                }
+            )
+        ],
+        config_defs=(config_def,),
+    )
+
+    assert service.get_config("service.special") == {"value": "exact:fixed"}
+    assert service.get_config("service.region.email") == {"value": "regional:dynamic"}
 
 
 def test_config_def_field_without_transform_preserves_raw_value() -> None:

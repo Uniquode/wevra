@@ -290,6 +290,24 @@ def raw_config_sections(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
         for nested_name, nested_value in auth_data.items():
             if isinstance(nested_value, Mapping):
                 sections[f"auth.{nested_name}"] = dict(nested_value)
+    cache_data = data.get("cache")
+    if isinstance(cache_data, Mapping):
+        sections["cache"] = {
+            key: value
+            for key, value in cache_data.items()
+            if not isinstance(value, Mapping)
+        }
+        for nested_name, nested_value in cache_data.items():
+            if isinstance(nested_value, Mapping):
+                sections[f"cache.{nested_name}"] = dict(nested_value)
+    for section_name, section_value in data.items():
+        if section_name.startswith("cache.") and isinstance(section_value, Mapping):
+            if section_name in sections:
+                raise CompositionError(
+                    f"App config defines [{section_name}] through both nested and "
+                    "quoted dotted cache tables."
+                )
+            sections[section_name] = dict(section_value)
     log_data = data.get("log")
     if isinstance(log_data, Mapping):
         sections["log"] = dict(log_data)
