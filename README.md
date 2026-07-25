@@ -45,6 +45,9 @@ Repository: <https://github.com/Uniquode/wybra>
   handling, and native migration command support.
 - `wybra.scopes`: provider-neutral declarative scope metadata, access decisions,
   protected-view enforcement, visibility, discovery, and catalogue validation.
+- `wybra.tasks`: provider-neutral async task declarations, validated payloads,
+  direct execution, optional submission capability, retries, lifecycle status,
+  and the infrastructure-free immediate backend.
 - `wybra.secrets`: runtime secret lookup from consumer-selected sources,
   including environment variables, AWS Secrets Manager, OS keychains, and Vault.
 - `wybra.tools`: generic project command adapters and validation target
@@ -76,6 +79,10 @@ fragment-caching guidance.
 
 See [`docs/SCOPES.md`](docs/SCOPES.md) for declarative model, view, and endpoint
 scope policy, optional auth integration, discovery, and catalogue validation.
+
+See [`docs/TASKS.md`](docs/TASKS.md) for task declarations, direct and
+on-demand execution, retries, idempotency, status feedback, and the current
+availability of durable background and scheduled execution.
 
 The framework project does not contain host application settings, `app.toml`,
 or change-management artifacts. Host-facing commands resolve the configured
