@@ -4,7 +4,7 @@ from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypeVar, cast, runtime_checkable
 
 from wybra.cache.capabilities import (
     DEFAULT_CACHE_FILL_TIMEOUT_SECONDS,
@@ -13,6 +13,12 @@ from wybra.cache.capabilities import (
     RedisCache,
 )
 from wybra.cache.config import to_cache_name
+from wybra.cache.feature_models import (
+    CacheFeatureMetadata,
+    CacheFeatureRegistration,
+    CacheFeatureUnavailableError,
+)
+from wybra.cache.memory_features import InMemoryCacheFeatures
 from wybra.cache.settings import (
     CacheConfigurationDiagnostic,
     CacheSettings,
@@ -21,6 +27,7 @@ from wybra.cache.settings import (
 from wybra.core.exceptions import ConfigurationError
 
 type CacheBackendCloser = Callable[[], Awaitable[None]]
+FeatureT = TypeVar("FeatureT")
 
 
 class CacheNotFoundError(LookupError):
@@ -34,6 +41,46 @@ class CacheInstance:
     backend: str
     partition: str
     features: tuple[str, ...] = ()
+    feature_metadata: tuple[CacheFeatureMetadata, ...] = ()
+    _feature_implementations: Mapping[type[object], object] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "_feature_implementations",
+            MappingProxyType(dict(self._feature_implementations)),
+        )
+        metadata_names = tuple(metadata.name for metadata in self.feature_metadata)
+        if self.features != metadata_names:
+            raise ValueError(
+                "Cache instance feature names must match its feature metadata."
+            )
+
+    def optional(self, feature: type[FeatureT]) -> FeatureT | None:
+        implementation = self._feature_implementations.get(feature)
+        return cast(FeatureT | None, implementation)
+
+    def require(
+        self,
+        feature: type[FeatureT],
+        *,
+        consumer: str | None = None,
+    ) -> FeatureT:
+        implementation = self.optional(feature)
+        if implementation is not None:
+            return implementation
+        feature_name = getattr(feature, "__name__", repr(feature))
+        message = (
+            f"Cache {self.name!r} using backend {self.backend!r} does not provide "
+            f"required feature {feature_name!r}"
+        )
+        if consumer is not None:
+            message += f" for consumer {consumer!r}"
+        raise CacheFeatureUnavailableError(message + ".")
 
 
 @runtime_checkable
@@ -57,6 +104,10 @@ class CacheBackend:
     values: CacheCapability
     close: CacheBackendCloser | None = field(default=None, repr=False)
     lifecycle_owner: object | None = field(default=None, repr=False)
+    features: tuple[CacheFeatureRegistration, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "features", tuple(self.features))
 
 
 class CacheBackendFactory(Protocol):
@@ -181,11 +232,18 @@ async def build_caches(
                     "cache baseline."
                 )
             values = _CacheValues(backend.values)
+            feature_implementations, feature_metadata = _registered_features(
+                instance_settings,
+                backend.features,
+            )
             instances[instance_settings.name] = CacheInstance(
                 name=instance_settings.name,
                 values=values,
                 backend=instance_settings.backend,
                 partition=instance_settings.partition,
+                features=tuple(metadata.name for metadata in feature_metadata),
+                feature_metadata=feature_metadata,
+                _feature_implementations=feature_implementations,
             )
     except BaseException as startup_error:
         cleanup_errors = await _close_all(tuple(closers))
@@ -198,13 +256,66 @@ async def build_caches(
     return DefaultCachesCapability(MappingProxyType(instances), tuple(closers))
 
 
+def _registered_features(
+    settings: CacheSettings,
+    registrations: tuple[CacheFeatureRegistration, ...],
+) -> tuple[
+    Mapping[type[object], object],
+    tuple[CacheFeatureMetadata, ...],
+]:
+    implementations: dict[type[object], object] = {}
+    metadata_by_name: dict[str, CacheFeatureMetadata] = {}
+    for registration in registrations:
+        if registration.protocol in implementations:
+            raise ConfigurationError(
+                f"Cache {settings.name!r} backend {settings.backend!r} registered "
+                f"feature protocol {registration.protocol.__name__!r} more than once."
+            )
+        if registration.metadata.name in metadata_by_name:
+            raise ConfigurationError(
+                f"Cache {settings.name!r} backend {settings.backend!r} registered "
+                f"feature name {registration.metadata.name!r} more than once."
+            )
+        try:
+            implementation_matches = isinstance(
+                registration.implementation,
+                registration.protocol,
+            )
+        except TypeError as exc:
+            raise ConfigurationError(
+                f"Cache feature protocol {registration.protocol.__name__!r} must "
+                "support runtime structural validation."
+            ) from exc
+        if not implementation_matches:
+            raise ConfigurationError(
+                f"Cache {settings.name!r} backend {settings.backend!r} advertised "
+                f"feature {registration.metadata.name!r} with an implementation "
+                f"that does not satisfy {registration.protocol.__name__!r}."
+            )
+        implementations[registration.protocol] = registration.implementation
+        metadata_by_name[registration.metadata.name] = registration.metadata
+    ordered_metadata = tuple(
+        metadata_by_name[name] for name in sorted(metadata_by_name)
+    )
+    return MappingProxyType(implementations), ordered_metadata
+
+
 async def _memory_backend(settings: CacheSettings) -> CacheBackend:
     del settings
-    return CacheBackend(InMemoryCache())
+    features = InMemoryCacheFeatures()
+    return CacheBackend(
+        InMemoryCache(),
+        close=features.close,
+        lifecycle_owner=features,
+        features=features.registrations(),
+    )
 
 
 async def _redis_backend(settings: CacheSettings) -> CacheBackend:
-    assert settings.url is not None
+    if settings.url is None:
+        raise ConfigurationError(
+            f"{settings.name!r} cache URL is required for the Redis backend."
+        )
     cache = RedisCache(settings.url)
     return CacheBackend(cache, cache.close, lifecycle_owner=cache)
 
@@ -258,6 +369,7 @@ _DEFAULT_FACTORIES: Mapping[str, CacheBackendFactory] = {
 __all__ = (
     "CacheBackend",
     "CacheBackendFactory",
+    "CacheFeatureUnavailableError",
     "CacheInstance",
     "CacheNotFoundError",
     "CachesCapability",

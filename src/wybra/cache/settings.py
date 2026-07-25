@@ -60,7 +60,10 @@ class CacheSettings(BaseSettings):
     def partition(self) -> str:
         if self.backend == "memory":
             return f"process:{self.name}"
-        assert self.url is not None
+        if self.url is None:
+            raise ConfigurationError(
+                f"{_section_name(self.name)}.url is required when backend is 'redis'."
+            )
         return _redis_partition(self.url)
 
 
