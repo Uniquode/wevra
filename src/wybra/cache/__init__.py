@@ -6,11 +6,20 @@ from importlib import import_module
 from typing import Any
 
 _EXPORT_MODULES = {
+    "CacheBackend": "wybra.cache.registry",
+    "CacheBackendFactory": "wybra.cache.registry",
     "CacheCapability": "wybra.cache.capabilities",
+    "CacheConfigurationDiagnostic": "wybra.cache.settings",
     "CacheFactory": "wybra.cache.capabilities",
+    "CacheInstance": "wybra.cache.registry",
+    "CacheNotFoundError": "wybra.cache.registry",
     "CacheSettings": "wybra.cache.settings",
+    "CachesCapability": "wybra.cache.registry",
+    "CachesSettings": "wybra.cache.settings",
+    "DefaultCachesCapability": "wybra.cache.registry",
     "InMemoryCache": "wybra.cache.capabilities",
     "RedisCache": "wybra.cache.capabilities",
+    "build_caches": "wybra.cache.registry",
     "module_config": "wybra.cache.config",
     "setup_site": "wybra.cache.setup",
 }
