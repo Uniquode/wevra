@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from typing import Final
 
-from wybra.config import ConfigDef, ConfigField, ConfigGroup
+from wybra.config import ConfigDef, ConfigField, ConfigGroup, to_bool
 from wybra.config.transforms import (
     to_non_blank_string,
     to_optional_non_blank_string,
@@ -42,6 +42,11 @@ module_config: Final = ConfigDef(
     {
         TASKS_CONFIG_SECTION: ConfigGroup(
             fields=(
+                ConfigField(
+                    name="enabled",
+                    default=True,
+                    transform=to_bool,
+                ),
                 ConfigField(
                     name="backend",
                     default=DEFAULT_TASK_BACKEND,

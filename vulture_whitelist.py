@@ -38,6 +38,7 @@ _.start_site
 _.get_site
 _.setup_site
 _.to_json
+_.report_progress
 _.finalised
 _.unavailable
 _.template_context_middleware

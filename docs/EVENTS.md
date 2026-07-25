@@ -102,6 +102,8 @@ graceful drain.
 - `account`, `credential`: account lifecycle separately from authentication
   and credential changes.
 - `session`, `security`: session lifecycle plus policy and denial outcomes.
+- `task`: background task submission, execution, progress, retry, and terminal
+  lifecycle observations.
 - `site`: module hooks, capability registration/resolution, startup, and
   shutdown.
 - `events` and `events.errors`: event delivery diagnostics and handler

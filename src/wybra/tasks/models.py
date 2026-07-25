@@ -3,14 +3,18 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Final
 from uuid import UUID
 
+from wybra.tasks.lifecycle import TaskProgressError
+from wybra.utils.safety import safe_json_metadata
+
 TASK_NAME_PATTERN: Final = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
 )
+type TaskProgressReporter = Callable[[Mapping[str, object]], Awaitable[None]]
 
 
 class TaskDeclarationError(ValueError):
@@ -134,6 +138,23 @@ class TaskExecutionContext:
     idempotency_key: str | None = None
     queue: str | None = None
     worker_id: str | None = None
+    progress_reporter: TaskProgressReporter | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    async def report_progress(self, progress: Mapping[str, object]) -> None:
+        """Report provider-neutral progress when lifecycle tracking is active."""
+
+        try:
+            safe_progress = safe_json_metadata(progress)
+        except (TypeError, ValueError) as exc:
+            raise TaskProgressError(
+                "Task progress must be JSON-compatible and within safe limits."
+            ) from exc
+        if self.progress_reporter is not None:
+            await self.progress_reporter(safe_progress)
 
 
 def _finite_number(value: object, label: str) -> float:

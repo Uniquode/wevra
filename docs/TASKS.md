@@ -47,13 +47,13 @@ That is the complete minimum configuration. The `[tasks]` section and every
 directive within it are optional. When omitted, the module uses the immediate
 backend with its built-in defaults.
 
-There is no `[tasks].enabled` directive. Presence of `"wybra.tasks"` in
-`[app].modules` is the capability switch:
+`"wybra.tasks"` in `[app].modules` makes the module available, and
+`[tasks].enabled` controls whether it registers a concrete capability:
 
-- include `"wybra.tasks"` to provide a concrete `TasksCapability`, allowing
-  capability proxies to resolve it;
-- omit `"wybra.tasks"` to provide no concrete capability. A proxy can still be
-  created, but it resolves as unavailable.
+- include `"wybra.tasks"` with the default `enabled = true` to provide a
+  concrete `TasksCapability`, allowing capability proxies to resolve it;
+- set `enabled = false`, or omit `"wybra.tasks"`, to provide no concrete
+  capability. A proxy can still be created, but it resolves as unavailable.
 
 Omitting only the `[tasks]` section does not disable submission when the module
 is still configured; it selects the immediate defaults. Enabling the module
@@ -64,6 +64,7 @@ Configure `[tasks]` only when overriding those defaults:
 
 ```toml
 [tasks]
+enabled = true
 backend = "immediate"
 default_queue = "default"
 max_attempts = 3
@@ -77,7 +78,8 @@ status_retention_seconds = 3600
 `backend = "immediate"` is the default and currently the only available
 backend. The module registers `TasksCapability` during site composition.
 Without `wybra.tasks` in `[app].modules`, the capability is absent but declared
-tasks remain directly executable.
+tasks remain directly executable. The same is true when the module is present
+with `enabled = false`.
 
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
@@ -236,6 +238,46 @@ configured provider accepts the submission path and then fails, the error
 propagates. Wybra never silently runs the task directly after a submission
 failure because doing so could duplicate side effects.
 
+## Report progress
+
+Submitted task handlers report progress through their current execution
+context:
+
+```python
+from wybra.tasks import current_task_context, task
+
+
+@task(name="example.search.rebuild_batches")
+async def rebuild_batches(batch_ids: list[str]) -> None:
+    context = current_task_context()
+    if context is None:
+        raise RuntimeError("Task execution context is unavailable.")
+
+    total = len(batch_ids)
+    for completed, batch_id in enumerate(batch_ids, start=1):
+        await rebuild_batch(batch_id)
+        await context.report_progress(
+            {
+                "completed": completed,
+                "total": total,
+                "phase": "rebuilding",
+            }
+        )
+```
+
+Progress is an immutable, bounded JSON mapping. Sensitive key names such as
+`password`, `credential`, `secret`, `session`, and `token` are recursively
+redacted before status, lifecycle history, logs, or local events can observe
+them. Non-JSON or oversized metadata raises `TaskProgressError`, a
+`TaskLifecycleError` subtype. This metadata failure is terminal and is not
+retried, even when the task or site retry policy allows further attempts.
+Strings longer than the safe metadata limit are rejected rather than truncated.
+
+The same task can call `report_progress()` during direct `run()` execution.
+Wybra still validates and redacts the supplied metadata so direct development
+exposes payload errors consistently, but discards the result because direct
+execution has no lifecycle or queryable status.
+
 ## Receive status and lifecycle feedback
 
 Submission returns a provider-neutral `TaskHandle`. Query its current status,
@@ -281,7 +323,11 @@ states = [event.kind.value for event in events]
 Progress metadata is canonicalised as JSON-compatible data and exposed through
 an immutable mapping. Mutating the dictionary originally supplied by a
 provider, or a nested value read from the mapping, cannot alter retained status
-or history without a new lifecycle event.
+or history without a new lifecycle event. A retained progress reporter also
+cannot update a completed task; the lifecycle state machine rejects the late
+transition. Progress belongs to one execution attempt and is cleared when a
+retry attempt starts, so status never presents stale progress from the failed
+attempt as current.
 
 Lifecycle kinds cover:
 
@@ -302,13 +348,54 @@ Status and lifecycle observations exclude task arguments and exception
 messages. Failure status records the safe exception type, such as
 `ConnectionError`, in `error_type`.
 
-The current public API exposes status and lifecycle queries. A handler-facing
-progress-reporting helper and optional mirroring into the process-local events
-capability are still pending; do not construct lifecycle events directly from
-application handlers.
+Each accepted transition also emits a fixed-message structured log containing
+safe task identity, correlation, causation, attempt, queue, worker, transition,
+and error-type fields. Arguments, exception messages, and progress values are
+not interpolated into routine log messages.
 
 Immediate status is process-local and retained in memory. It is not shared
 between web instances and disappears when the process exits.
+
+## Observe lifecycle events locally
+
+Enable Wybra's process-local event delivery when application code needs
+asynchronous lifecycle observations:
+
+```toml
+[wybra.events]
+enabled = true
+```
+
+Subscribe during application setup with the public `task` selector:
+
+```python
+from wybra.events import EventsCapability
+from wybra.site import Site
+from wybra.tasks import TASK_EVENT_SCOPE, TaskLifecycleObservationEvent
+
+
+async def observe_task(event) -> None:
+    if not isinstance(event, TaskLifecycleObservationEvent):
+        return
+    print(event.task_name, event.kind.value, event.task_id)
+
+
+async def setup_site(site: Site) -> None:
+    events = site.require_capability(EventsCapability)
+    await events.subscribe(TASK_EVENT_SCOPE, observe_task)
+```
+
+Transition-specific scopes include `task.submitted`, `task.started`,
+`task.progress`, `task.retry_scheduled`, `task.succeeded`, `task.failed`, and
+`task.dead_lettered`. Mirrored observations contain the same canonical safe
+metadata as lifecycle status, but no arguments, exception messages, or return
+values.
+
+Local event delivery is observational only. Publication queues work without
+waiting for handlers, and a disabled or failing local event sink cannot alter
+task execution, retries, or status. Use task status and lifecycle queries as
+the immediate backend's source of truth; do not use local event delivery as a
+durable task queue.
 
 ## Handle failures and retries
 
@@ -402,6 +489,24 @@ The immediate backend will continue to reject deferred and recurring work. An
 in-process timer would not survive shutdown and would misrepresent the
 durability guarantee.
 
+Every `TasksCapability` provider exposes its supported operations through the
+required `features` member:
+
+```python
+from wybra.tasks import TaskFeature
+
+
+if tasks.features.supports(TaskFeature.DEFERRED):
+    ...
+
+tasks.features.require(TaskFeature.DEFERRED)
+```
+
+The immediate provider reports both `TaskFeature.DEFERRED` and
+`TaskFeature.RECURRING` as unavailable. `require()` raises
+`TaskFeatureUnavailableError` with an actionable provider-neutral message and
+does not create a timer or lifecycle record.
+
 ## Current limitations
 
 - Only the immediate backend is available.
@@ -409,7 +514,6 @@ durability guarantee.
 - Immediate status and lifecycle are process-local.
 - Deferred and recurring schedules are not available.
 - Worker and scheduler commands are not available.
-- Handler progress reporting and process-local lifecycle mirroring are pending.
 - Persisted task return values and cancellation are not part of the initial
   delivery.
 - A complete transactional outbox is deferred; future after-commit publication

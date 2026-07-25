@@ -1,18 +1,23 @@
 from __future__ import annotations
 
-import json
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
 from typing import Final
 from uuid import UUID, uuid7
 
+from wybra.utils.safety import SafeJsonMetadata, safe_json_metadata
+
 
 class TaskLifecycleError(RuntimeError):
     """Raised when a task lifecycle transition is invalid."""
+
+
+class TaskProgressError(TaskLifecycleError):
+    """Raised when task progress metadata is invalid."""
 
 
 class TaskLifecycleKind(StrEnum):
@@ -77,53 +82,6 @@ DEFAULT_TASK_STATUS_RETENTION_SECONDS: Final = 3600.0
 type _TaskEventKey = tuple[object, ...]
 
 
-@dataclass(frozen=True, slots=True, init=False, eq=False)
-class _TaskProgress(Mapping[str, object]):
-    _encoded: bytes = field(repr=False)
-
-    def __init__(self, values: Mapping[str, object]) -> None:
-        if not isinstance(values, Mapping) or any(
-            not isinstance(name, str) for name in values
-        ):
-            raise TaskLifecycleError(
-                "Task progress must be a mapping with string keys."
-            )
-        try:
-            encoded = json.dumps(
-                dict(values),
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        except (TypeError, ValueError) as exc:
-            raise TaskLifecycleError("Task progress must be JSON-compatible.") from exc
-        object.__setattr__(self, "_encoded", encoded.encode())
-
-    def __getitem__(self, key: str) -> object:
-        return self._decoded()[key]
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._decoded())
-
-    def __len__(self) -> int:
-        return len(self._decoded())
-
-    def __hash__(self) -> int:
-        return hash(self._encoded)
-
-    def __repr__(self) -> str:
-        return "<task progress>"
-
-    def _decoded(self) -> dict[str, object]:
-        decoded = json.loads(self._encoded)
-        if not isinstance(
-            decoded, dict
-        ):  # pragma: no cover - constructor guarantees it
-            raise TaskLifecycleError("Task progress must decode to a mapping.")
-        return decoded
-
-
 @dataclass(frozen=True, slots=True)
 class TaskLifecycleEvent:
     kind: TaskLifecycleKind
@@ -140,8 +98,15 @@ class TaskLifecycleEvent:
     occurred_at: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
-        if self.progress is not None and not isinstance(self.progress, _TaskProgress):
-            object.__setattr__(self, "progress", _TaskProgress(self.progress))
+        if self.progress is None or isinstance(self.progress, SafeJsonMetadata):
+            return
+        try:
+            progress = safe_json_metadata(self.progress)
+        except (TypeError, ValueError) as exc:
+            raise TaskProgressError(
+                "Task progress must be JSON-compatible and within safe limits."
+            ) from exc
+        object.__setattr__(self, "progress", progress)
 
     @classmethod
     def new(
@@ -284,9 +249,7 @@ class TaskStatusProjection:
             worker_id=event.worker_id
             if event.worker_id is not None
             else (current.worker_id if current is not None else None),
-            progress=event.progress
-            if event.progress is not None
-            else (current.progress if current is not None else None),
+            progress=_next_progress(current, event),
             error_type=event.error_type,
         )
         self._statuses[event.task_id] = status
@@ -336,7 +299,9 @@ class TaskStatusProjection:
 
 def _event_key(event: TaskLifecycleEvent) -> _TaskEventKey:
     progress = (
-        event.progress._encoded if isinstance(event.progress, _TaskProgress) else None
+        event.progress.to_json()
+        if isinstance(event.progress, SafeJsonMetadata)
+        else None
     )
     return (
         event.kind,
@@ -352,6 +317,23 @@ def _event_key(event: TaskLifecycleEvent) -> _TaskEventKey:
         event.error_type,
         event.occurred_at,
     )
+
+
+def _next_progress(
+    current: TaskStatus | None,
+    event: TaskLifecycleEvent,
+) -> Mapping[str, object] | None:
+    if event.progress is not None:
+        return event.progress
+    if current is None:
+        return None
+    if (
+        current.state is TaskState.RETRY_SCHEDULED
+        and event.kind is TaskLifecycleKind.STARTED
+        and event.attempt > current.attempt
+    ):
+        return None
+    return current.progress
 
 
 def _validate_identity(
@@ -398,6 +380,7 @@ __all__ = (
     "TaskLifecycleError",
     "TaskLifecycleEvent",
     "TaskLifecycleKind",
+    "TaskProgressError",
     "TaskState",
     "TaskStatus",
     "TaskStatusProjection",

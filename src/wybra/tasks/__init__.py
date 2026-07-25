@@ -2,6 +2,9 @@
 
 from wybra.tasks.capabilities import (
     TaskDispatchPolicy,
+    TaskFeature,
+    TaskFeatures,
+    TaskFeatureUnavailableError,
     TaskHandle,
     TasksCapability,
     TaskSubmissionOptions,
@@ -10,10 +13,12 @@ from wybra.tasks.capabilities import (
 from wybra.tasks.config import module_config
 from wybra.tasks.context import current_task_context
 from wybra.tasks.declarations import TaskDefinition, task
+from wybra.tasks.events import TASK_EVENT_SCOPE, TaskLifecycleObservationEvent
 from wybra.tasks.lifecycle import (
     TaskLifecycleError,
     TaskLifecycleEvent,
     TaskLifecycleKind,
+    TaskProgressError,
     TaskState,
     TaskStatus,
 )
@@ -32,17 +37,23 @@ from wybra.tasks.setup import setup_site
 
 __all__ = (
     "RetryPolicy",
+    "TASK_EVENT_SCOPE",
     "TaskDispatchPolicy",
     "TaskDeclarationError",
     "TaskDefinition",
     "TaskExecutionContext",
+    "TaskFeature",
+    "TaskFeatures",
+    "TaskFeatureUnavailableError",
     "TaskHandle",
     "TaskIdentity",
     "TaskLifecycleError",
     "TaskLifecycleEvent",
     "TaskLifecycleKind",
+    "TaskLifecycleObservationEvent",
     "TaskPayload",
     "TaskPayloadError",
+    "TaskProgressError",
     "TaskRegistrationError",
     "TaskRegistry",
     "TaskState",

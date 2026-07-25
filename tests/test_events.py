@@ -43,7 +43,9 @@ def test_root_event_package_exposes_core_primitives_and_subscription_selectors()
         "EventsCapability",
         "available_event_scopes",
         "context",
+        "event_delivery_enabled",
         "event_scope",
+        "event_segment",
         "observe",
     )
 

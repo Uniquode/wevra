@@ -4,7 +4,9 @@ from wybra.events._core import (
     EventScope,
     available_event_scopes,
     context,
+    event_delivery_enabled,
     event_scope,
+    event_segment,
     observe,
 )
 
@@ -14,6 +16,8 @@ __all__ = (
     "EventsCapability",
     "available_event_scopes",
     "context",
+    "event_delivery_enabled",
     "event_scope",
+    "event_segment",
     "observe",
 )
