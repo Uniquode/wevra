@@ -12,27 +12,19 @@ from wybra.diagnostics.levels import (
     DiagnosticLevel,
     normalise_diagnostics_level,
 )
-from wybra.events._core import (
-    EVT_SQL,
-    EVT_TEMPLATE,
-    SQL_STATEMENT,
-    TEMPLATE_RENDER,
+from wybra.events import (
     EventScope,
+    event_scope,
+)
+from wybra.utils.safety import (
+    MAX_SAFE_STRING_LENGTH,
+    is_sensitive_attribute_name,
+    truncate_safe_string,
 )
 
-SENSITIVE_ATTRIBUTE_PARTS: Final = (
-    "authorisation",
-    "authorization",
-    "cookie",
-    "credential",
-    "csrf",
-    "password",
-    "secret",
-    "session",
-    "token",
-)
-MAX_STRING_ATTRIBUTE_LENGTH: Final = 500
 MAX_CONTEXT_DESCRIPTION_LENGTH: Final = 200
+_SQL_STATEMENT_TOPIC: Final = event_scope("sql.statement")
+_TEMPLATE_RENDER_TOPIC: Final = event_scope("template.render")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +187,7 @@ class RequestDiagnostics:
                 attributes["inserted_id"] = inserted_id
             self.record_topic(
                 level,
-                EVT_SQL(SQL_STATEMENT),
+                _SQL_STATEMENT_TOPIC,
                 attributes=attributes,
                 duration_seconds=duration,
                 result=result,
@@ -213,7 +205,7 @@ class RequestDiagnostics:
         self.template_total_duration_seconds += duration
         self.record_topic(
             "trace",
-            EVT_TEMPLATE(TEMPLATE_RENDER),
+            _TEMPLATE_RENDER_TOPIC,
             attributes={"template": template_name},
             duration_seconds=duration,
             result=result,
@@ -317,25 +309,21 @@ def _safe_attributes(attributes: Mapping[str, object]) -> dict[str, object]:
     safe: dict[str, object] = {}
     for key, value in attributes.items():
         key_name = str(key)
-        if _is_sensitive_attribute_name(key_name):
+        if is_sensitive_attribute_name(key_name):
             safe[key_name] = "[redacted]"
         else:
             safe[key_name] = _safe_value(value)
     return safe
 
 
-def _is_sensitive_attribute_name(key: str) -> bool:
-    lowered = key.lower()
-    return any(part in lowered for part in SENSITIVE_ATTRIBUTE_PARTS)
-
-
 def _safe_value(value: object) -> object:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, str):
-        if len(value) <= MAX_STRING_ATTRIBUTE_LENGTH:
-            return value
-        return f"{value[:MAX_STRING_ATTRIBUTE_LENGTH]}..."
+        return truncate_safe_string(
+            value,
+            maximum_length=MAX_SAFE_STRING_LENGTH,
+        )
     return f"<{type(value).__name__}>"
 
 

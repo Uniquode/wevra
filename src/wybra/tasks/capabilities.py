@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import logging
+from asyncio import CancelledError, current_task
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import log
@@ -10,12 +12,15 @@ from uuid import UUID
 
 import anyio
 
+from wybra.events import EventsCapability, event_delivery_enabled
 from wybra.tasks.context import current_task_context
 from wybra.tasks.declarations import TaskDefinition
+from wybra.tasks.events import TaskLifecycleObservationEvent
 from wybra.tasks.lifecycle import (
     DEFAULT_TASK_HISTORY_LIMIT,
     TaskLifecycleEvent,
     TaskLifecycleKind,
+    TaskProgressError,
     TaskStatus,
     TaskStatusProjection,
 )
@@ -27,11 +32,45 @@ from wybra.tasks.models import (
 )
 from wybra.tasks.settings import TasksSettings
 
+logger = logging.getLogger(__name__)
+
 
 class TaskDispatchPolicy(StrEnum):
     DIRECT = "direct"
     BACKGROUND = "background"
     PREFER_BACKGROUND = "prefer_background"
+
+
+class TaskFeature(StrEnum):
+    DEFERRED = "deferred"
+    RECURRING = "recurring"
+
+
+class TaskFeatureUnavailableError(RuntimeError):
+    """Raised when the selected task provider cannot perform an operation."""
+
+
+@dataclass(frozen=True, slots=True)
+class TaskFeatures:
+    deferred: bool = False
+    recurring: bool = False
+
+    def supports(self, feature: TaskFeature | str) -> bool:
+        selected = TaskFeature(feature)
+        if selected is TaskFeature.DEFERRED:
+            return self.deferred
+        if selected is TaskFeature.RECURRING:
+            return self.recurring
+        raise ValueError(f"Unsupported task feature: {feature!r}.")
+
+    def require(self, feature: TaskFeature | str) -> None:
+        selected = TaskFeature(feature)
+        if self.supports(selected):
+            return
+        raise TaskFeatureUnavailableError(
+            f"Task feature {selected.value!r} is unavailable from the configured "
+            "provider; select a provider that supports this operation."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +106,8 @@ class TaskHandle:
 
 @runtime_checkable
 class TasksCapability(Protocol):
+    features: TaskFeatures
+
     async def submit(
         self,
         definition: TaskDefinition,
@@ -86,6 +127,8 @@ class TasksCapability(Protocol):
 @dataclass(slots=True)
 class ImmediateTasksCapability:
     settings: TasksSettings
+    features: TaskFeatures = field(default_factory=TaskFeatures, init=False)
+    events: EventsCapability | None = field(default=None, repr=False, compare=False)
     _random: Callable[[], float] = field(default=random, repr=False)
     _sleep: Callable[[float], Awaitable[object]] = field(
         default=anyio.sleep,
@@ -119,7 +162,7 @@ class ImmediateTasksCapability:
             correlation_id=parent.correlation_id if parent is not None else None,
             causation_id=parent.task_id if parent is not None else None,
         )
-        self._projection.apply(submitted)
+        await self._record_event(submitted)
         retry = _effective_retry(definition.retry, self.settings.retry_policy)
         for attempt in range(1, retry.max_attempts + 1):
             started = _next_event(
@@ -128,7 +171,7 @@ class ImmediateTasksCapability:
                 attempt=attempt,
                 worker_id=worker_id,
             )
-            self._projection.apply(started)
+            await self._record_event(started)
             context = TaskExecutionContext(
                 task_id=submitted.task_id,
                 task_name=submitted.task_name,
@@ -139,12 +182,25 @@ class ImmediateTasksCapability:
                 idempotency_key=selected.idempotency_key,
                 queue=queue,
                 worker_id=worker_id,
+                progress_reporter=self._progress_reporter(
+                    submitted,
+                    attempt=attempt,
+                    worker_id=worker_id,
+                ),
             )
             try:
                 await definition.execute(payload, context)
+            except TaskProgressError as exc:
+                await self._record_terminal_failure(
+                    submitted,
+                    attempt=attempt,
+                    worker_id=worker_id,
+                    error_type=type(exc).__name__,
+                )
+                break
             except Exception as exc:
                 if attempt < retry.max_attempts:
-                    self._projection.apply(
+                    await self._record_event(
                         _next_event(
                             submitted,
                             TaskLifecycleKind.RETRY_SCHEDULED,
@@ -157,27 +213,15 @@ class ImmediateTasksCapability:
                         _retry_delay(retry, attempt, random_value=self._random())
                     )
                     continue
-                self._projection.apply(
-                    _next_event(
-                        submitted,
-                        TaskLifecycleKind.FAILED,
-                        attempt=attempt,
-                        worker_id=worker_id,
-                        error_type=type(exc).__name__,
-                    )
-                )
-                self._projection.apply(
-                    _next_event(
-                        submitted,
-                        TaskLifecycleKind.DEAD_LETTERED,
-                        attempt=attempt,
-                        worker_id=worker_id,
-                        error_type=type(exc).__name__,
-                    )
+                await self._record_terminal_failure(
+                    submitted,
+                    attempt=attempt,
+                    worker_id=worker_id,
+                    error_type=type(exc).__name__,
                 )
                 break
             else:
-                self._projection.apply(
+                await self._record_event(
                     _next_event(
                         submitted,
                         TaskLifecycleKind.SUCCEEDED,
@@ -200,6 +244,114 @@ class ImmediateTasksCapability:
         task_id: UUID,
     ) -> tuple[TaskLifecycleEvent, ...]:
         return self._projection.lifecycle(task_id)
+
+    async def _record_event(self, event: TaskLifecycleEvent) -> None:
+        self._projection.apply(event)
+        self._log_lifecycle_event(event)
+        events = self.events
+        if events is not None and event_delivery_enabled(events):
+            try:
+                observation = TaskLifecycleObservationEvent.from_lifecycle(event)
+                await events.publish(observation)
+            except CancelledError as exc:
+                if _external_cancellation_requested():
+                    raise
+                self._warn_event_publication_failure(event, exc)
+            except Exception as exc:
+                self._warn_event_publication_failure(event, exc)
+
+    @staticmethod
+    def _log_lifecycle_event(event: TaskLifecycleEvent) -> None:
+        try:
+            logger.info(
+                "task lifecycle transition",
+                extra={
+                    "wybra_task": {
+                        "kind": event.kind.value,
+                        "task_id": str(event.task_id),
+                        "task_name": event.task_name,
+                        "schema_version": event.schema_version,
+                        "queue": event.queue,
+                        "correlation_id": str(event.correlation_id),
+                        "causation_id": (
+                            str(event.causation_id)
+                            if event.causation_id is not None
+                            else None
+                        ),
+                        "attempt": event.attempt,
+                        "worker_id": event.worker_id,
+                        "error_type": event.error_type,
+                    }
+                },
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _warn_event_publication_failure(
+        event: TaskLifecycleEvent,
+        exc: BaseException,
+    ) -> None:
+        try:
+            logger.warning(
+                "task lifecycle event publication failed",
+                extra={
+                    "wybra_task": {
+                        "kind": event.kind.value,
+                        "task_id": str(event.task_id),
+                        "error_type": type(exc).__name__,
+                    }
+                },
+            )
+        except Exception:
+            pass
+
+    async def _record_terminal_failure(
+        self,
+        origin: TaskLifecycleEvent,
+        *,
+        attempt: int,
+        worker_id: str,
+        error_type: str,
+    ) -> None:
+        await self._record_event(
+            _next_event(
+                origin,
+                TaskLifecycleKind.FAILED,
+                attempt=attempt,
+                worker_id=worker_id,
+                error_type=error_type,
+            )
+        )
+        await self._record_event(
+            _next_event(
+                origin,
+                TaskLifecycleKind.DEAD_LETTERED,
+                attempt=attempt,
+                worker_id=worker_id,
+                error_type=error_type,
+            )
+        )
+
+    def _progress_reporter(
+        self,
+        origin: TaskLifecycleEvent,
+        *,
+        attempt: int,
+        worker_id: str,
+    ) -> Callable[[Mapping[str, object]], Awaitable[None]]:
+        async def report(progress: Mapping[str, object]) -> None:
+            await self._record_event(
+                _next_event(
+                    origin,
+                    TaskLifecycleKind.PROGRESS,
+                    attempt=attempt,
+                    worker_id=worker_id,
+                    progress=progress,
+                )
+            )
+
+        return report
 
     async def close(self) -> None:
         return None
@@ -289,12 +441,18 @@ def _reject_direct_submission_options(
         )
 
 
+def _external_cancellation_requested() -> bool:
+    task = current_task()
+    return task is not None and task.cancelling() > 0
+
+
 def _next_event(
     origin: TaskLifecycleEvent,
     kind: TaskLifecycleKind,
     *,
     attempt: int,
     worker_id: str | None = None,
+    progress: Mapping[str, object] | None = None,
     error_type: str | None = None,
 ) -> TaskLifecycleEvent:
     return TaskLifecycleEvent.new(
@@ -307,6 +465,7 @@ def _next_event(
         causation_id=origin.causation_id,
         attempt=attempt,
         worker_id=worker_id,
+        progress=progress,
         error_type=error_type,
     )
 
@@ -314,6 +473,9 @@ def _next_event(
 __all__ = (
     "ImmediateTasksCapability",
     "TaskDispatchPolicy",
+    "TaskFeature",
+    "TaskFeatures",
+    "TaskFeatureUnavailableError",
     "TaskHandle",
     "TaskSubmissionOptions",
     "TasksCapability",

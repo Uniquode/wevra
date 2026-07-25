@@ -19,12 +19,14 @@ from wybra.tasks import (
 def test_task_package_exposes_public_declaration_contracts() -> None:
     assert {
         "RetryPolicy",
+        "TASK_EVENT_SCOPE",
         "TaskDeclarationError",
         "TaskDefinition",
         "TaskExecutionContext",
         "TaskIdentity",
         "TaskPayload",
         "TaskPayloadError",
+        "TaskProgressError",
         "TaskRegistrationError",
         "TaskRegistry",
         "current_task_context",

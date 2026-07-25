@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from typing import Final
+from uuid import UUID
 
 from wybra.diagnostics.context import record_sql_operation, record_topic
-from wybra.events._core import (
+from wybra.events import (
     Event,
     EventsCapability,
     EventScope,
@@ -116,6 +117,18 @@ _EVENT_ATTRIBUTE_NAMES: Final = {
     ),
     "DatabaseTransactionEvent": ("connection_name", "transaction_kind", "outcome"),
     "DatabaseSavepointEvent": ("connection_name", "outcome"),
+    "TaskLifecycleObservationEvent": (
+        "kind",
+        "task_id",
+        "task_name",
+        "schema_version",
+        "queue",
+        "correlation_id",
+        "causation_id",
+        "attempt",
+        "worker_id",
+        "error_type",
+    ),
 }
 
 
@@ -159,7 +172,9 @@ def _event_attributes(event: Event) -> dict[str, str | int | float | bool | None
         attributes["event_context_request_id"] = str(event.context.request_id)
     for attribute_name in _EVENT_ATTRIBUTE_NAMES.get(type(event).__name__, ()):
         value = getattr(event, attribute_name, None)
-        if isinstance(value, str | int | float | bool) or value is None:
+        if isinstance(value, UUID):
+            attributes[attribute_name] = str(value)
+        elif isinstance(value, str | int | float | bool) or value is None:
             attributes[attribute_name] = value
     return attributes
 

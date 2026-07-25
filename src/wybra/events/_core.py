@@ -840,6 +840,7 @@ EVT_SITE: Final = event_scope("site")
 EVT_REQUEST: Final = event_scope("request")
 EVT_ROUTE: Final = event_scope("route")
 EVT_VIEW: Final = event_scope("view")
+EVT_TASK: Final = event_scope("task")
 DEFAULT_EVENT_SCOPES: Final = (EVT_SQL, EVT_TEMPLATE, EVT_EVENTS_ERRORS)
 _ROOT_SCOPE_NAMES: Final = frozenset(
     scope.segments[0]
@@ -858,6 +859,7 @@ _ROOT_SCOPE_NAMES: Final = frozenset(
         EVT_REQUEST,
         EVT_ROUTE,
         EVT_VIEW,
+        EVT_TASK,
     )
 )
 _SCOPE_DESCRIPTIONS: Final = {
@@ -876,6 +878,7 @@ _SCOPE_DESCRIPTIONS: Final = {
     EVT_REQUEST: "HTTP request lifecycle observations.",
     EVT_ROUTE: "Resolved HTTP route dispatch observations.",
     EVT_VIEW: "Class-based view execution observations.",
+    EVT_TASK: "Background task lifecycle observations.",
 }
 
 
@@ -929,6 +932,7 @@ __all__ = (
     "events_enabled",
     "EVT_SQL",
     "EVT_TEMPLATE",
+    "EVT_TASK",
     "EVT_VIEW",
     "BEGIN",
     "CACHE_DELETE",

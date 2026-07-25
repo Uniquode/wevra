@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from math import isfinite
 from typing import ClassVar
 
-from wybra.config import BaseSettings, ConfigDef
+from wybra.config import BaseSettings, ConfigDef, to_bool
 from wybra.core.exceptions import ConfigurationError
 from wybra.tasks.config import (
     DEFAULT_TASK_BACKEND,
@@ -23,6 +23,7 @@ class TasksSettings(BaseSettings):
     module_config: ClassVar[ConfigDef] = module_config
     config_section: ClassVar[str | None] = TASKS_CONFIG_SECTION
 
+    enabled: bool = True
     backend: str = DEFAULT_TASK_BACKEND
     default_queue: str = DEFAULT_TASK_QUEUE
     max_attempts: int = 1
@@ -38,6 +39,7 @@ class TasksSettings(BaseSettings):
 
     def __post_init__(self) -> None:
         try:
+            enabled = to_bool(self.enabled)
             backend = to_task_backend(self.backend)
             if (
                 not isinstance(self.default_queue, str)
@@ -75,6 +77,7 @@ class TasksSettings(BaseSettings):
             broker_url = _optional_string(self.broker_url, "broker_url")
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"tasks: {exc}") from exc
+        object.__setattr__(self, "enabled", enabled)
         object.__setattr__(self, "backend", backend)
         object.__setattr__(self, "default_queue", default_queue)
         object.__setattr__(self, "max_attempts", retry.max_attempts)

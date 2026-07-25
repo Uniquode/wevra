@@ -76,6 +76,7 @@ def test_debug_websocket_lists_scopes_and_returns_filtered_snapshot() -> None:
         "events.errors",
         "request",
         "site",
+        "task",
         "route",
         "view",
     }

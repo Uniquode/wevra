@@ -1,9 +1,8 @@
 ## Overview
 
-<!-- Include the Linear issue as a bare markdown link, without Closes/Fixes/Relates wording. -->
-<!-- Example: [UT-123](https://linear.app/uniquode/issue/UT-123/example) -->
-
 <!-- Concise description of what this PR does and why. -->
+<!-- Do not add a Linear issue link: the UT-123 key in the branch name is enough
+     for Linear's GitHub app to detect the issue and post its own backlink. -->
 
 ## Changes
 
