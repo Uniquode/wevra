@@ -105,6 +105,31 @@ the selected name is not configured. Session diagnostics report only the cache
 name or legacy compatibility mode, never provider URLs or credentials. See
 [`SESSION.md`](SESSION.md) for legacy `cache_url` migration guidance.
 
+Cache-backed queued messages require `AtomicCacheCapability`. Select an
+isolated cache with `wybra.messages.cache_name`, or omit the setting to use
+`default`:
+
+```toml
+[app]
+modules = [
+  "wybra.cache",
+  "wybra.messages",
+]
+
+[cache.messages]
+backend = "memory"
+
+[wybra.messages]
+storage_backend = "cache"
+cache_name = "messages"
+```
+
+Messages startup fails when the cache module, selected name, or required atomic
+feature is unavailable. The current in-memory provider supplies the feature;
+the named Redis provider gains it in the Redis advanced-feature slice. See
+[`MESSAGES.md`](MESSAGES.md) for legacy `cache_url` migration guidance and the
+queued-alert key change.
+
 Every cache operation requires an owner and a logical key. Owners must be
 non-blank and cannot contain `:`; the owner prefixes the backend key and keeps
 independent cache domains separate. Cache entries always have an explicit,

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Self, cast
 from urllib.parse import urlparse
 
+from wybra.cache import DEFAULT_CACHE_NAME, MAX_CACHE_FEATURE_PAYLOAD_BYTES
 from wybra.config import BaseSettings, ConfigDef, ConfigService
 from wybra.core.exceptions import ConfigurationError
 from wybra.messages.config import (
@@ -17,11 +18,15 @@ from wybra.messages.config import (
     MessageStorageBackend,
     module_config,
     to_non_blank_string,
+    to_optional_cache_name,
     to_optional_non_blank_string,
     to_positive_float,
     to_positive_int,
     to_storage_backend,
 )
+
+NAMED_CACHE_QUEUE_ITEM_OVERHEAD_BYTES = 256
+WORST_CASE_JSON_BYTES_PER_CHARACTER = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +38,7 @@ class MessagesSettings(BaseSettings):
     queue_depth: int | str = DEFAULT_QUEUE_DEPTH
     message_max_length: int | str = DEFAULT_MESSAGE_MAX_LENGTH
     message_ttl_seconds: float | str = DEFAULT_MESSAGE_TTL_SECONDS
+    cache_name: str | None = None
     cache_url: str | None = None
     cache_key_prefix: str = DEFAULT_CACHE_KEY_PREFIX
     database_connection_name: str = DEFAULT_DATABASE_CONNECTION_NAME
@@ -65,6 +71,11 @@ class MessagesSettings(BaseSettings):
             self.message_ttl_seconds,
             "message_ttl_seconds",
         )
+        cache_name = _configuration_value(
+            to_optional_cache_name,
+            self.cache_name,
+            "cache_name",
+        )
         cache_url = _configuration_value(
             to_optional_non_blank_string,
             self.cache_url,
@@ -80,18 +91,21 @@ class MessagesSettings(BaseSettings):
             self.database_connection_name,
             "database_connection_name",
         )
-        if storage_backend is MessageStorageBackend.CACHE:
-            if cache_url is None:
-                raise ConfigurationError(
-                    "wybra.messages.cache_url is required when "
-                    "storage_backend is 'cache'."
-                )
+        if cache_name is not None and cache_url is not None:
+            raise ConfigurationError(
+                "wybra.messages.cache_name and wybra.messages.cache_url "
+                "cannot both be configured."
+            )
+        if storage_backend is MessageStorageBackend.CACHE and cache_url is not None:
             _validate_cache_url(cache_url)
+        if storage_backend is MessageStorageBackend.CACHE and cache_url is None:
+            _validate_named_cache_queue_size(queue_depth, message_max_length)
 
         object.__setattr__(self, "storage_backend", storage_backend)
         object.__setattr__(self, "queue_depth", queue_depth)
         object.__setattr__(self, "message_max_length", message_max_length)
         object.__setattr__(self, "message_ttl_seconds", message_ttl_seconds)
+        object.__setattr__(self, "cache_name", cache_name)
         object.__setattr__(self, "cache_url", cache_url)
         object.__setattr__(self, "cache_key_prefix", cache_key_prefix)
         object.__setattr__(
@@ -116,6 +130,10 @@ class MessagesSettings(BaseSettings):
     def resolved_message_ttl_seconds(self) -> float:
         return cast(float, self.message_ttl_seconds)
 
+    @property
+    def resolved_cache_name(self) -> str:
+        return DEFAULT_CACHE_NAME if self.cache_name is None else self.cache_name
+
 
 def _configuration_value[ValueT](
     normalise: Any,
@@ -135,6 +153,23 @@ def _validate_cache_url(value: str) -> None:
     raise ConfigurationError(
         "wybra.messages.cache_url must use memory://, redis://, or rediss://."
     )
+
+
+def _validate_named_cache_queue_size(
+    queue_depth: int,
+    message_max_length: int,
+) -> None:
+    maximum_item_bytes = (
+        message_max_length * WORST_CASE_JSON_BYTES_PER_CHARACTER
+        + NAMED_CACHE_QUEUE_ITEM_OVERHEAD_BYTES
+    )
+    maximum_queue_bytes = 2 + queue_depth * maximum_item_bytes
+    if maximum_queue_bytes > MAX_CACHE_FEATURE_PAYLOAD_BYTES:
+        raise ConfigurationError(
+            "Named cache-backed messages can exceed the atomic cache payload "
+            f"limit of {MAX_CACHE_FEATURE_PAYLOAD_BYTES} bytes; reduce "
+            "wybra.messages.queue_depth or wybra.messages.message_max_length."
+        )
 
 
 __all__ = ("MessagesSettings",)

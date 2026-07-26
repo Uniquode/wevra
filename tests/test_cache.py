@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +22,7 @@ from wybra.cache import (
     InMemoryCache,
     RedisCache,
     build_caches,
+    cache_provider_configured,
     setup_site,
 )
 from wybra.config import (
@@ -37,6 +39,19 @@ from wybra.template import DefaultTemplateCapability, TemplateCapability
 from wybra.template.cache import configure_cache_extension
 
 EVT_CACHE = event_scope("cache")
+
+
+def test_cache_provider_discovery_accepts_one_shot_iterables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery_module = importlib.import_module("wybra.cache.discovery")
+    monkeypatch.setattr(
+        discovery_module,
+        "import_module",
+        lambda _module_name: SimpleNamespace(provides_cache_capability=True),
+    )
+
+    assert cache_provider_configured(iter(("custom.cache",))) is True
 
 
 async def _cache_provider(cache: CacheCapability) -> CacheCapability:

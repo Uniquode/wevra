@@ -3,6 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Final
 
+from wybra.cache import to_cache_name
 from wybra.config import ConfigDef, ConfigField, ConfigGroup
 from wybra.config.transforms import (
     to_non_blank_string,
@@ -16,6 +17,7 @@ ENV_MESSAGES_STORAGE_BACKEND: Final = "MESSAGES_STORAGE_BACKEND"
 ENV_MESSAGES_QUEUE_DEPTH: Final = "MESSAGES_QUEUE_DEPTH"
 ENV_MESSAGES_MESSAGE_MAX_LENGTH: Final = "MESSAGES_MESSAGE_MAX_LENGTH"
 ENV_MESSAGES_TTL_SECONDS: Final = "MESSAGES_TTL_SECONDS"
+ENV_MESSAGES_CACHE_NAME: Final = "MESSAGES_CACHE_NAME"
 ENV_MESSAGES_CACHE_URL: Final = "MESSAGES_CACHE_URL"
 ENV_MESSAGES_CACHE_KEY_PREFIX: Final = "MESSAGES_CACHE_KEY_PREFIX"
 ENV_MESSAGES_DATABASE_CONNECTION: Final = "MESSAGES_DATABASE_CONNECTION"
@@ -49,6 +51,12 @@ def to_storage_backend(value: object) -> MessageStorageBackend:
         ) from exc
 
 
+def to_optional_cache_name(value: object) -> str | None:
+    if value is None:
+        return None
+    return to_cache_name(value)
+
+
 module_config: Final = ConfigDef(
     {
         MESSAGES_CONFIG_SECTION: ConfigGroup(
@@ -76,6 +84,12 @@ module_config: Final = ConfigDef(
                     default=DEFAULT_MESSAGE_TTL_SECONDS,
                     env=ENV_MESSAGES_TTL_SECONDS,
                     transform=to_positive_float,
+                ),
+                ConfigField(
+                    name="cache_name",
+                    default=None,
+                    env=ENV_MESSAGES_CACHE_NAME,
+                    transform=to_optional_cache_name,
                 ),
                 ConfigField(
                     name="cache_url",
@@ -108,6 +122,7 @@ __all__ = (
     "DEFAULT_MESSAGE_TTL_SECONDS",
     "DEFAULT_QUEUE_DEPTH",
     "ENV_MESSAGES_CACHE_KEY_PREFIX",
+    "ENV_MESSAGES_CACHE_NAME",
     "ENV_MESSAGES_CACHE_URL",
     "ENV_MESSAGES_DATABASE_CONNECTION",
     "ENV_MESSAGES_MESSAGE_MAX_LENGTH",
@@ -119,6 +134,7 @@ __all__ = (
     "module_config",
     "storage_backend_choices",
     "to_non_blank_string",
+    "to_optional_cache_name",
     "to_optional_non_blank_string",
     "to_positive_float",
     "to_positive_int",

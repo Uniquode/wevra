@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from importlib import import_module
 from typing import Protocol
 
-from wybra.cache import CachesSettings
+from wybra.cache import CachesSettings, cache_provider_configured
 from wybra.config import ConfigService
 from wybra.core.exceptions import ConfigurationError
 from wybra.core.runtime import DEFAULT_DEPLOYMENT_ENVIRONMENT
@@ -113,7 +112,7 @@ def _record_named_cache_check(
     errors: list[str],
 ) -> None:
     description = f"cache session storage uses named cache: cache={cache_name}"
-    if not _cache_provider_configured(_configured_modules(config)):
+    if not cache_provider_configured(_configured_modules(config)):
         record_check(
             checks,
             errors,
@@ -155,22 +154,6 @@ def _configured_modules(config: ConfigService) -> tuple[str, ...]:
     ):
         return tuple(modules)
     return ()
-
-
-def _cache_provider_configured(modules: tuple[str, ...]) -> bool:
-    if "wybra.cache" in modules:
-        return True
-    return any(
-        _module_provides_cache_capability(module_name) for module_name in modules
-    )
-
-
-def _module_provides_cache_capability(module_name: str) -> bool:
-    try:
-        module = import_module(module_name)
-    except ImportError:
-        return False
-    return getattr(module, "provides_cache_capability", False) is True
 
 
 validation_targets = {"sessions": validate_sessions}

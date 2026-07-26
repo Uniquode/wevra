@@ -3,15 +3,25 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import uuid
+import warnings
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from pathlib import Path
+from typing import Any, ClassVar, Protocol, cast
 from urllib.parse import urlparse
 
 from fastapi import Request
 from tortoise.expressions import Q
 
+from wybra.cache import (
+    AtomicCacheCapability,
+    CacheFeatureError,
+    CacheFeatureUnavailableError,
+    CacheNotFoundError,
+    CachesCapability,
+)
 from wybra.db import DatabaseCapability
 from wybra.db.capabilities import tortoise_transaction
 from wybra.messages.config import MessageStorageBackend
@@ -24,13 +34,19 @@ from wybra.messages.exceptions import (
 from wybra.messages.models import MessageAlert
 from wybra.messages.records import AlertPayload, AlertRecord
 from wybra.messages.settings import MessagesSettings
-from wybra.site import Site, SiteCapabilityProxy
+from wybra.site import Site, SiteCapabilityError, SiteCapabilityProxy
+
+logger = logging.getLogger(__name__)
 
 SESSION_ALERTS_KEY = "_wybra_messages_alerts"
 SESSION_QUEUE_ID_KEY = "_wybra_messages_queue_id"
 REQUEST_PEEKED_ALERTS_ATTRIBUTE = "wybra_messages_peeked_alerts"
+REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE = "wybra_messages_peeked_cache_payloads"
 REQUEST_ALERTS_RENDERED_ATTRIBUTE = "wybra_messages_alerts_rendered"
 REQUEST_ALERTS_ACKNOWLEDGED_ATTRIBUTE = "wybra_messages_alerts_acknowledged"
+DEFAULT_ATOMIC_QUEUE_CONFLICT_ATTEMPTS = 8
+QUEUE_ENTRY_ID_KEY = "_wybra_queue_entry_id"
+WYBRA_WARNING_SKIP_PREFIXES = (str(Path(__file__).resolve().parents[1]),)
 
 
 class MessagesStorage(Protocol):
@@ -63,7 +79,13 @@ class CacheQueueBackend(Protocol):
 
     async def peek(self, queue_key: str) -> tuple[AlertPayload, ...]: ...
 
-    async def acknowledge(self, queue_key: str) -> None: ...
+    async def acknowledge(
+        self,
+        queue_key: str,
+        *,
+        observed: Sequence[Mapping[str, object]] | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None: ...
 
     async def pop(self, queue_key: str) -> tuple[AlertPayload, ...]: ...
 
@@ -130,6 +152,7 @@ class CacheMessagesStorage:
             alert,
             alert.created_at + self.settings.resolved_message_ttl_seconds,
         )
+        payload[QUEUE_ENTRY_ID_KEY] = uuid.uuid4().hex
         await self.backend.append(
             server_side_queue_key(
                 request,
@@ -147,8 +170,14 @@ class CacheMessagesStorage:
         )
         if queue_key is None:
             return ()
+        raw_payloads = await self.backend.peek(queue_key)
+        setattr(
+            request.state,
+            REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE,
+            raw_payloads,
+        )
         payloads = _valid_payloads(
-            await self.backend.peek(queue_key),
+            raw_payloads,
             max_message_length=self.settings.resolved_message_max_length,
             now=now,
         )
@@ -163,12 +192,39 @@ class CacheMessagesStorage:
             prefix=self.settings.cache_key_prefix,
         )
         if queue_key is not None:
-            await self.backend.acknowledge(queue_key)
+            observed = getattr(
+                request.state,
+                REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE,
+                None,
+            )
+            if observed is None:
+                observed = await self.backend.peek(queue_key)
+            await self.backend.acknowledge(
+                queue_key,
+                observed=observed,
+                ttl_seconds=self.settings.resolved_message_ttl_seconds,
+            )
+            if hasattr(request.state, REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE):
+                delattr(request.state, REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE)
 
     async def pop(self, request: Request, *, now: float) -> tuple[AlertRecord, ...]:
-        alerts = await self.peek(request, now=now)
-        await self.acknowledge(request, now=now)
-        return alerts
+        queue_key = optional_server_side_queue_key(
+            request,
+            prefix=self.settings.cache_key_prefix,
+        )
+        if queue_key is None:
+            return ()
+        raw_payloads = await self.backend.pop(queue_key)
+        if hasattr(request.state, REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE):
+            delattr(request.state, REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE)
+        return _records_from_payloads(
+            _valid_payloads(
+                raw_payloads,
+                max_message_length=self.settings.resolved_message_max_length,
+                now=now,
+            ),
+            max_message_length=self.settings.resolved_message_max_length,
+        )
 
     async def cleanup_session_data(self, session_data: Mapping[str, Any]) -> None:
         queue_key = server_side_queue_key_from_session_data(
@@ -214,9 +270,26 @@ class InMemoryCacheQueueBackend:
         async with self._lock:
             return tuple(self._queues.get(queue_key, ()))
 
-    async def acknowledge(self, queue_key: str) -> None:
+    async def acknowledge(
+        self,
+        queue_key: str,
+        *,
+        observed: Sequence[Mapping[str, object]] | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        del ttl_seconds
         async with self._lock:
-            self._queues.pop(queue_key, None)
+            if observed is None:
+                self._queues.pop(queue_key, None)
+                return
+            current = self._queues.get(queue_key)
+            if current is None:
+                return
+            remaining = _remaining_after_acknowledgement(current, observed)
+            if remaining:
+                self._queues[queue_key] = remaining
+            else:
+                self._queues.pop(queue_key, None)
 
     async def validate(self) -> None:
         return None
@@ -224,6 +297,159 @@ class InMemoryCacheQueueBackend:
     async def close(self) -> None:
         async with self._lock:
             self._queues.clear()
+
+
+@dataclass(frozen=True, slots=True)
+class NamedCacheQueueBackend:
+    atomic: AtomicCacheCapability = field(repr=False)
+    max_conflict_attempts: int = DEFAULT_ATOMIC_QUEUE_CONFLICT_ATTEMPTS
+    owner: ClassVar[str] = "messages"
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_conflict_attempts, bool)
+            or not isinstance(self.max_conflict_attempts, int)
+            or self.max_conflict_attempts <= 0
+        ):
+            raise ValueError("Atomic queue conflict attempts must be positive.")
+
+    async def append(
+        self,
+        queue_key: str,
+        payload: AlertPayload,
+        *,
+        queue_depth: int,
+        ttl_seconds: float,
+    ) -> None:
+        try:
+            for _attempt in range(self.max_conflict_attempts):
+                current = await self.atomic.get(self.owner, queue_key)
+                queue = [] if current is None else _payloads_from_json(current.value)
+                queue.append(payload)
+                encoded = _queue_payload(queue[-queue_depth:])
+                if current is None:
+                    created = await self.atomic.create(
+                        self.owner,
+                        queue_key,
+                        encoded,
+                        ttl=ttl_seconds,
+                    )
+                    if created is not None:
+                        return
+                    continue
+                swapped = await self.atomic.compare_and_swap(
+                    self.owner,
+                    queue_key,
+                    current.revision,
+                    encoded,
+                    ttl=ttl_seconds,
+                )
+                if swapped is not None:
+                    return
+        except (CacheFeatureError, TypeError, ValueError) as exc:
+            raise MessageStorageError(
+                "Named messages cache rejected a queue update."
+            ) from exc
+        raise MessageStorageError(
+            "Atomic messages queue update exceeded its contention limit."
+        )
+
+    async def peek(self, queue_key: str) -> tuple[AlertPayload, ...]:
+        current = await self.atomic.get(self.owner, queue_key)
+        if current is None:
+            return ()
+        return tuple(_payloads_from_json(current.value))
+
+    async def acknowledge(
+        self,
+        queue_key: str,
+        *,
+        observed: Sequence[Mapping[str, object]] | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        if observed is None:
+            await self._delete(queue_key, return_payloads=False)
+            return
+        if ttl_seconds is None:
+            raise MessageStorageError(
+                "Snapshot acknowledgement requires the messages queue TTL."
+            )
+        await self._acknowledge_observed(
+            queue_key,
+            observed=observed,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def pop(self, queue_key: str) -> tuple[AlertPayload, ...]:
+        return await self._delete(queue_key, return_payloads=True)
+
+    async def validate(self) -> None:
+        try:
+            await self.atomic.get(self.owner, "__validation__")
+        except Exception as exc:
+            raise MessageStorageError(
+                "Named messages cache atomic feature is unavailable."
+            ) from exc
+
+    async def close(self) -> None:
+        return None
+
+    async def _delete(
+        self,
+        queue_key: str,
+        *,
+        return_payloads: bool,
+    ) -> tuple[AlertPayload, ...]:
+        for _attempt in range(self.max_conflict_attempts):
+            current = await self.atomic.get(self.owner, queue_key)
+            if current is None:
+                return ()
+            payloads = tuple(_payloads_from_json(current.value))
+            if await self.atomic.compare_and_delete(
+                self.owner,
+                queue_key,
+                current.revision,
+            ):
+                return payloads if return_payloads else ()
+        raise MessageStorageError(
+            "Atomic messages queue deletion exceeded its contention limit."
+        )
+
+    async def _acknowledge_observed(
+        self,
+        queue_key: str,
+        *,
+        observed: Sequence[Mapping[str, object]],
+        ttl_seconds: float,
+    ) -> None:
+        for _attempt in range(self.max_conflict_attempts):
+            current = await self.atomic.get(self.owner, queue_key)
+            if current is None:
+                return
+            payloads = _payloads_from_json(current.value)
+            remaining = _remaining_after_acknowledgement(payloads, observed)
+            if remaining == payloads:
+                return
+            if not remaining:
+                if await self.atomic.compare_and_delete(
+                    self.owner,
+                    queue_key,
+                    current.revision,
+                ):
+                    return
+                continue
+            swapped = await self.atomic.compare_and_swap(
+                self.owner,
+                queue_key,
+                current.revision,
+                _queue_payload(remaining),
+                ttl=ttl_seconds,
+            )
+            if swapped is not None:
+                return
+        raise MessageStorageError(
+            "Atomic messages queue acknowledgement exceeded its contention limit."
+        )
 
 
 _REDIS_APPEND_QUEUE_SCRIPT = """
@@ -293,7 +519,14 @@ class RedisCacheQueueBackend:
     async def peek(self, queue_key: str) -> tuple[AlertPayload, ...]:
         return tuple(_payloads_from_json(await self._redis_client().get(queue_key)))
 
-    async def acknowledge(self, queue_key: str) -> None:
+    async def acknowledge(
+        self,
+        queue_key: str,
+        *,
+        observed: Sequence[Mapping[str, object]] | None = None,
+        ttl_seconds: float | None = None,
+    ) -> None:
+        del observed, ttl_seconds
         await self._redis_client().delete(queue_key)
 
     async def validate(self) -> None:
@@ -444,13 +677,64 @@ class DatabaseMessagesStorage:
 
 
 def storage_from_settings(site: Site, settings: MessagesSettings) -> MessagesStorage:
+    if settings.resolved_storage_backend is not MessageStorageBackend.CACHE:
+        ignored_cache_settings = [
+            setting
+            for setting, value in (
+                ("cache_name", settings.cache_name),
+                ("cache_url", settings.cache_url),
+            )
+            if value is not None
+        ]
+        if ignored_cache_settings:
+            logger.warning(
+                "wybra.messages.%s %s ignored unless storage_backend is 'cache'.",
+                " and wybra.messages.".join(ignored_cache_settings),
+                "are" if len(ignored_cache_settings) > 1 else "is",
+            )
     if settings.resolved_storage_backend is MessageStorageBackend.SESSION:
         return SessionMessagesStorage(settings)
     if settings.resolved_storage_backend is MessageStorageBackend.CACHE:
-        assert settings.cache_url is not None
+        if settings.cache_url is not None:
+            deprecation_message = (
+                "wybra.messages.cache_url is deprecated; configure wybra.cache "
+                "and select it with wybra.messages.cache_name instead."
+            )
+            warnings.warn(
+                deprecation_message,
+                DeprecationWarning,
+                skip_file_prefixes=WYBRA_WARNING_SKIP_PREFIXES,
+            )
+            logger.warning(deprecation_message)
+            return CacheMessagesStorage(
+                settings=settings,
+                backend=cache_backend_from_url(settings.cache_url),
+            )
+        try:
+            caches = site.require_capability(CachesCapability)
+        except SiteCapabilityError as exc:
+            raise MessagesConfigurationError(
+                "Cache-backed messages require the wybra.cache module."
+            ) from exc
+        try:
+            cache = caches.require(
+                settings.resolved_cache_name,
+                consumer="queued request messages",
+            )
+        except CacheNotFoundError as exc:
+            raise MessagesConfigurationError(
+                f"Messages cache {settings.resolved_cache_name!r} is unavailable: {exc}"
+            ) from exc
+        try:
+            atomic = cache.require(
+                AtomicCacheCapability,
+                consumer="queued request messages",
+            )
+        except CacheFeatureUnavailableError as exc:
+            raise MessagesConfigurationError(str(exc)) from exc
         return CacheMessagesStorage(
             settings=settings,
-            backend=cache_backend_from_url(settings.cache_url),
+            backend=NamedCacheQueueBackend(atomic),
         )
     if settings.resolved_storage_backend is MessageStorageBackend.DATABASE:
         return DatabaseMessagesStorage(
@@ -561,7 +845,10 @@ def _payloads_from_json(value: object) -> list[AlertPayload]:
     if value is None:
         return []
     if isinstance(value, bytes):
-        value = value.decode("utf-8")
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return []
     if not isinstance(value, str):
         return []
     try:
@@ -573,7 +860,55 @@ def _payloads_from_json(value: object) -> list[AlertPayload]:
     return [cast(AlertPayload, item) for item in decoded if isinstance(item, dict)]
 
 
+def _remaining_after_acknowledgement(
+    current: Sequence[Mapping[str, object]],
+    observed: Sequence[Mapping[str, object]],
+) -> list[AlertPayload]:
+    observed_ids = {
+        entry_id
+        for payload in observed
+        if isinstance(entry_id := payload.get(QUEUE_ENTRY_ID_KEY), str)
+    }
+    remaining = [
+        dict(payload)
+        for payload in current
+        if payload.get(QUEUE_ENTRY_ID_KEY) not in observed_ids
+    ]
+    observed_without_ids = [
+        dict(payload) for payload in observed if QUEUE_ENTRY_ID_KEY not in payload
+    ]
+    if not observed_without_ids:
+        return remaining
+    overlap = _acknowledged_prefix_length(remaining, observed_without_ids)
+    return remaining[overlap:]
+
+
+def _acknowledged_prefix_length(
+    current: Sequence[Mapping[str, object]],
+    observed: Sequence[Mapping[str, object]],
+) -> int:
+    maximum_overlap = min(len(current), len(observed))
+    for overlap in range(maximum_overlap, 0, -1):
+        if list(current[:overlap]) == list(observed[-overlap:]):
+            return overlap
+    return 0
+
+
+def _queue_payload(payloads: Sequence[Mapping[str, object]]) -> bytes:
+    try:
+        return json.dumps(
+            tuple(dict(payload) for payload in payloads),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise MessageStorageError(
+            "Queued alert payloads must be JSON serialisable."
+        ) from exc
+
+
 __all__ = (
+    "DEFAULT_ATOMIC_QUEUE_CONFLICT_ATTEMPTS",
     "REQUEST_ALERTS_RENDERED_ATTRIBUTE",
     "REQUEST_ALERTS_ACKNOWLEDGED_ATTRIBUTE",
     "REQUEST_PEEKED_ALERTS_ATTRIBUTE",
@@ -584,6 +919,7 @@ __all__ = (
     "DatabaseMessagesStorage",
     "InMemoryCacheQueueBackend",
     "MessagesStorage",
+    "NamedCacheQueueBackend",
     "RedisCacheQueueBackend",
     "SessionMessagesStorage",
     "cache_backend_from_url",
