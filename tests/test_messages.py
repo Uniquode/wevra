@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -9,7 +10,18 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-from wybra.config import ConfigService, MappingConfigSource
+from wybra.cache import (
+    AtomicCacheCapability,
+    AtomicCacheValue,
+    CacheRevision,
+    CachesCapability,
+    InMemoryAtomicCache,
+)
+from wybra.cache import (
+    module_config as cache_module_config,
+)
+from wybra.config import ConfigService, ConfigSourceError, MappingConfigSource
+from wybra.core.exceptions import ConfigurationError
 from wybra.core.resources import PackageResourceSource
 from wybra.db import DatabaseCapability
 from wybra.db.capabilities import tortoise_transaction
@@ -25,6 +37,7 @@ from wybra.messages import (
     InvalidAlertError,
     MessageQueueUnavailableError,
     MessagesCapability,
+    MessagesConfigurationError,
     MessagesSettings,
     MessageStorageBackend,
     MessageStorageError,
@@ -34,10 +47,13 @@ from wybra.messages.context import messages_context
 from wybra.messages.models import MessageAlert
 from wybra.messages.records import AlertRecord
 from wybra.messages.storage import (
+    QUEUE_ENTRY_ID_KEY,
     REQUEST_ALERTS_RENDERED_ATTRIBUTE,
     SESSION_ALERTS_KEY,
     SESSION_QUEUE_ID_KEY,
+    CacheMessagesStorage,
     DatabaseMessagesStorage,
+    NamedCacheQueueBackend,
     RedisCacheQueueBackend,
     SessionMessagesStorage,
     storage_from_settings,
@@ -51,18 +67,57 @@ from wybra.sessions import (
     SessionRecord,
     create_session_id,
 )
-from wybra.site import Site, start
+from wybra.site import Site, SiteCapabilityError, start
 from wybra.template.capabilities import DefaultTemplateCapability
 from wybra.template.context import TemplateContext
 from wybra.testing import create_test_site, migrated_test_database
 from wybra.tools.validation.registry import discover_validation_targets
 
 
-def _settings(values: dict[str, object] | None = None) -> MessagesSettings:
-    return MessagesSettings.load_settings(
-        {
-            "wybra.messages": {} if values is None else values,
-        }
+def _settings(
+    values: dict[str, object] | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+) -> MessagesSettings:
+    ConfigService.set_runtime_environment({} if environ is None else environ)
+    config = ConfigService(
+        [
+            MappingConfigSource(
+                {
+                    "wybra.messages": {} if values is None else values,
+                }
+            )
+        ],
+        config_defs=(module_config,),
+        discover_module_config=False,
+    )
+    return MessagesSettings.load_settings(config)
+
+
+def _cache_validation_settings(
+    *,
+    modules: tuple[str, ...],
+    cache_name: str | None = None,
+    cache_url: str | None = None,
+    named_caches: dict[str, dict[str, object]] | None = None,
+) -> SimpleNamespace:
+    message_values: dict[str, object] = {"storage_backend": "cache"}
+    if cache_name is not None:
+        message_values["cache_name"] = cache_name
+    if cache_url is not None:
+        message_values["cache_url"] = cache_url
+    values: dict[str, dict[str, object]] = {
+        "cache": {},
+        "wybra.messages": message_values,
+    }
+    values.update(named_caches or {})
+    return SimpleNamespace(
+        modules=modules,
+        config=ConfigService(
+            [MappingConfigSource(values)],
+            config_defs=(cache_module_config, module_config),
+            discover_module_config=False,
+        ),
     )
 
 
@@ -135,6 +190,69 @@ def test_messages_settings_defaults_to_session_storage() -> None:
 
     assert settings.storage_backend is MessageStorageBackend.SESSION
     assert settings.queue_depth == 20
+
+
+def test_cache_messages_settings_default_to_named_default_cache() -> None:
+    settings = _settings({"storage_backend": "cache"})
+
+    assert settings.cache_name is None
+    assert settings.resolved_cache_name == "default"
+    assert settings.cache_url is None
+
+
+def test_cache_messages_settings_accept_explicit_cache_name() -> None:
+    settings = _settings(
+        {"storage_backend": "cache", "cache_name": "messages"},
+    )
+
+    assert settings.cache_name == "messages"
+    assert settings.resolved_cache_name == "messages"
+
+
+def test_cache_messages_settings_support_cache_name_environment_override() -> None:
+    settings = _settings(
+        {"storage_backend": "cache"},
+        environ={"MESSAGES_CACHE_NAME": "messages"},
+    )
+
+    assert settings.cache_name == "messages"
+    assert settings.resolved_cache_name == "messages"
+
+
+def test_cache_messages_settings_reject_invalid_cache_name() -> None:
+    with pytest.raises(ConfigSourceError, match="cache_name"):
+        _settings({"storage_backend": "cache", "cache_name": "Message Cache"})
+
+
+def test_messages_settings_reject_ambiguous_cache_selection() -> None:
+    with pytest.raises(ConfigurationError, match="cache_name.*cache_url"):
+        _settings(
+            {
+                "storage_backend": "cache",
+                "cache_name": "default",
+                "cache_url": "memory://alerts",
+            }
+        )
+
+
+def test_cache_messages_settings_preserve_legacy_url_compatibility() -> None:
+    settings = _settings(
+        {"storage_backend": "cache", "cache_url": "memory://alerts"},
+    )
+
+    assert settings.cache_name is None
+    assert settings.cache_url == "memory://alerts"
+
+
+def test_named_cache_messages_settings_reject_oversized_queue_bound() -> None:
+    with pytest.raises(ConfigurationError, match="atomic cache payload limit"):
+        _settings(
+            {
+                "storage_backend": "cache",
+                "queue_depth": 1,
+                "message_max_length": 1_100_000,
+            }
+        )
 
 
 def test_alert_record_validates_severity_and_message() -> None:
@@ -244,10 +362,11 @@ async def test_queue_depth_discards_oldest_session_alerts() -> None:
 @pytest.mark.anyio
 async def test_memory_cache_storage_persists_and_pops_alerts() -> None:
     settings = _settings({"storage_backend": "cache", "cache_url": "memory://alerts"})
-    storage = storage_from_settings(
-        Site(FastAPI(), ConfigService([], discover_module_config=False)),
-        settings,
-    )
+    with pytest.warns(DeprecationWarning, match="cache_name"):
+        storage = storage_from_settings(
+            Site(FastAPI(), ConfigService([], discover_module_config=False)),
+            settings,
+        )
     capability = DefaultMessagesCapability(settings, storage)
     session: dict[str, object] = {}
     first_request = _request(session)
@@ -260,6 +379,509 @@ async def test_memory_cache_storage_persists_and_pops_alerts() -> None:
 
     assert [alert.message for alert in alerts] == ["Cached"]
     assert empty_alerts == ()
+
+
+@pytest.mark.anyio
+async def test_legacy_messages_cache_url_warns_without_exposing_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning_messages: list[str] = []
+    storage_module = importlib.import_module("wybra.messages.storage")
+
+    def record_warning(message: str, *args: object) -> None:
+        warning_messages.append(message % args)
+
+    monkeypatch.setattr(storage_module.logger, "warning", record_warning)
+    legacy_url = "redis://user:secret@cache.internal/1"
+    settings = _settings({"storage_backend": "cache", "cache_url": legacy_url})
+
+    with pytest.warns(DeprecationWarning, match="cache_name"):
+        storage = storage_from_settings(
+            Site(FastAPI(), ConfigService([], discover_module_config=False)),
+            settings,
+        )
+
+    try:
+        assert isinstance(storage, CacheMessagesStorage)
+        assert any("cache_url is deprecated" in message for message in warning_messages)
+        assert legacy_url not in repr(warning_messages)
+        assert "secret" not in repr(warning_messages)
+    finally:
+        await storage.close()
+
+
+def test_non_cache_messages_warn_about_ignored_cache_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning_messages: list[str] = []
+    storage_module = importlib.import_module("wybra.messages.storage")
+
+    def record_warning(message: str, *args: object) -> None:
+        warning_messages.append(message % args)
+
+    monkeypatch.setattr(storage_module.logger, "warning", record_warning)
+
+    storage = storage_from_settings(
+        Site(FastAPI(), ConfigService([], discover_module_config=False)),
+        _settings({"storage_backend": "session", "cache_name": "messages"}),
+    )
+
+    assert isinstance(storage, SessionMessagesStorage)
+    assert any("cache_name is ignored" in message for message in warning_messages)
+
+
+@pytest.mark.anyio
+async def test_named_default_cache_messages_start_and_persist_alerts() -> None:
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.cache", "wybra.messages")},
+                "cache": {},
+                "wybra.messages": {"storage_backend": "cache"},
+            }
+        ),
+        environ={},
+    )
+
+    try:
+        capability = site.require_capability(MessagesCapability)
+        assert isinstance(capability, DefaultMessagesCapability)
+        assert isinstance(capability.storage, CacheMessagesStorage)
+        assert isinstance(capability.storage.backend, NamedCacheQueueBackend)
+
+        session: dict[str, object] = {}
+        await capability.success(_request(session), "Cached")
+
+        alerts = await capability.consume_alerts(_request(session))
+        assert [alert.message for alert in alerts] == ["Cached"]
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_named_cache_messages_start_before_cache_module() -> None:
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.messages", "wybra.cache")},
+                "cache": {},
+                "wybra.messages": {"storage_backend": "cache"},
+            }
+        ),
+        environ={},
+    )
+
+    try:
+        capability = site.require_capability(MessagesCapability)
+        assert isinstance(capability, DefaultMessagesCapability)
+        assert isinstance(capability.storage, CacheMessagesStorage)
+        assert isinstance(capability.storage.backend, NamedCacheQueueBackend)
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_named_messages_cache_isolated_from_default_cache() -> None:
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.cache", "wybra.messages")},
+                "cache": {},
+                "cache.messages": {"backend": "memory"},
+                "wybra.messages": {
+                    "storage_backend": "cache",
+                    "cache_name": "messages",
+                },
+            }
+        ),
+        environ={},
+    )
+
+    try:
+        capability = site.require_capability(MessagesCapability)
+        caches = site.require_capability(CachesCapability)
+        session: dict[str, object] = {}
+        await capability.success(_request(session), "Isolated")
+        queue_id = session[SESSION_QUEUE_ID_KEY]
+        assert isinstance(queue_id, str)
+        queue_key = f"wybra:messages:{queue_id}"
+
+        default_atomic = caches.require("default").require(AtomicCacheCapability)
+        messages_atomic = caches.require("messages").require(AtomicCacheCapability)
+        assert await default_atomic.get("messages", queue_key) is None
+        assert await messages_atomic.get("messages", queue_key) is not None
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_named_cache_acknowledgement_preserves_concurrent_append() -> None:
+    settings = _settings({"storage_backend": "cache"})
+    storage = CacheMessagesStorage(
+        settings,
+        NamedCacheQueueBackend(InMemoryAtomicCache()),
+    )
+    session: dict[str, object] = {}
+    rendered_request = _request(session)
+    concurrent_request = _request(session)
+
+    await storage.enqueue(
+        rendered_request,
+        AlertRecord.create(
+            SUCCESS_ALERT,
+            "Rendered",
+            max_message_length=settings.resolved_message_max_length,
+        ),
+    )
+    rendered = await storage.peek(rendered_request, now=0)
+    await storage.enqueue(
+        concurrent_request,
+        AlertRecord.create(
+            WARNING_ALERT,
+            "Queued concurrently",
+            max_message_length=settings.resolved_message_max_length,
+        ),
+    )
+    await storage.acknowledge(rendered_request, now=0)
+
+    remaining = await storage.peek(concurrent_request, now=0)
+
+    assert [alert.message for alert in rendered] == ["Rendered"]
+    assert [alert.message for alert in remaining] == ["Queued concurrently"]
+
+
+@pytest.mark.anyio
+async def test_cache_acknowledgement_snapshots_before_removing_alerts() -> None:
+    settings = _settings({"storage_backend": "cache"})
+    atomic_backend = NamedCacheQueueBackend(InMemoryAtomicCache())
+    queue_key = f"{settings.cache_key_prefix}queue"
+    concurrent_payload = {
+        QUEUE_ENTRY_ID_KEY: "concurrent",
+        "severity": WARNING_ALERT,
+        "message": "Queued concurrently",
+        "created_at": 2.0,
+        "expires_at": 60.0,
+    }
+
+    class InterleavingBackend:
+        async def peek(self, selected_queue_key: str) -> tuple[dict[str, object], ...]:
+            observed = await atomic_backend.peek(selected_queue_key)
+            await atomic_backend.append(
+                selected_queue_key,
+                concurrent_payload,
+                queue_depth=settings.resolved_queue_depth,
+                ttl_seconds=settings.resolved_message_ttl_seconds,
+            )
+            return observed
+
+        async def acknowledge(
+            self,
+            selected_queue_key: str,
+            *,
+            observed: tuple[dict[str, object], ...] | None = None,
+            ttl_seconds: float | None = None,
+        ) -> None:
+            await atomic_backend.acknowledge(
+                selected_queue_key,
+                observed=observed,
+                ttl_seconds=ttl_seconds,
+            )
+
+    await atomic_backend.append(
+        queue_key,
+        {
+            QUEUE_ENTRY_ID_KEY: "observed",
+            "severity": SUCCESS_ALERT,
+            "message": "Observed",
+            "created_at": 1.0,
+            "expires_at": 60.0,
+        },
+        queue_depth=settings.resolved_queue_depth,
+        ttl_seconds=settings.resolved_message_ttl_seconds,
+    )
+    storage = CacheMessagesStorage(settings, InterleavingBackend())
+
+    await storage.acknowledge(
+        _request({SESSION_QUEUE_ID_KEY: "queue"}),
+        now=0,
+    )
+
+    remaining = await atomic_backend.peek(queue_key)
+    assert [payload["message"] for payload in remaining] == ["Queued concurrently"]
+
+
+@pytest.mark.anyio
+async def test_cache_messages_storage_uses_backend_atomic_pop() -> None:
+    settings = _settings({"storage_backend": "cache"})
+    payload = {
+        "severity": SUCCESS_ALERT,
+        "message": "Popped",
+        "created_at": 1.0,
+        "expires_at": 60.0,
+    }
+
+    class PopOnlyBackend:
+        async def pop(self, queue_key: str) -> tuple[dict[str, object], ...]:
+            assert queue_key.startswith(settings.cache_key_prefix)
+            return (payload,)
+
+        async def peek(self, queue_key: str) -> tuple[dict[str, object], ...]:
+            raise AssertionError(f"Unexpected non-atomic peek for {queue_key}.")
+
+    storage = CacheMessagesStorage(settings, PopOnlyBackend())
+    alerts = await storage.pop(
+        _request({SESSION_QUEUE_ID_KEY: "queue"}),
+        now=2.0,
+    )
+
+    assert [alert.message for alert in alerts] == ["Popped"]
+
+
+@pytest.mark.anyio
+async def test_named_cache_messages_reject_missing_cache_module() -> None:
+    with pytest.raises(SiteCapabilityError) as exc_info:
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.messages",)},
+                    "wybra.messages": {"storage_backend": "cache"},
+                }
+            ),
+            environ={},
+        )
+    assert isinstance(exc_info.value.__cause__, MessagesConfigurationError)
+    assert "wybra.cache" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.anyio
+async def test_named_cache_messages_reject_missing_named_cache() -> None:
+    with pytest.raises(SiteCapabilityError) as exc_info:
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.messages")},
+                    "cache": {},
+                    "wybra.messages": {
+                        "storage_backend": "cache",
+                        "cache_name": "missing",
+                    },
+                }
+            ),
+            environ={},
+        )
+    assert isinstance(exc_info.value.__cause__, MessagesConfigurationError)
+    assert "missing" in str(exc_info.value.__cause__)
+    assert "queued request messages" in str(exc_info.value.__cause__)
+
+
+@pytest.mark.anyio
+async def test_named_cache_messages_reject_cache_without_atomic_feature() -> None:
+    with pytest.raises(SiteCapabilityError) as exc_info:
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.messages")},
+                    "cache": {
+                        "backend": "redis",
+                        "url": "redis://cache.example/0",
+                    },
+                    "wybra.messages": {"storage_backend": "cache"},
+                }
+            ),
+            environ={},
+        )
+    assert isinstance(exc_info.value.__cause__, MessagesConfigurationError)
+    error = str(exc_info.value.__cause__)
+    assert "default" in error
+    assert "AtomicCacheCapability" in error
+    assert "queued request messages" in error
+
+
+@pytest.mark.anyio
+async def test_named_atomic_cache_queue_preserves_depth_peek_and_pop() -> None:
+    atomic = InMemoryAtomicCache()
+    backend = NamedCacheQueueBackend(atomic)
+    first = {"severity": SUCCESS_ALERT, "message": "One", "created_at": 1.0}
+    second = {"severity": WARNING_ALERT, "message": "Two", "created_at": 2.0}
+    third = {"severity": ERROR_ALERT, "message": "Three", "created_at": 3.0}
+
+    await backend.append("alerts", first, queue_depth=2, ttl_seconds=60)
+    await backend.append("alerts", second, queue_depth=2, ttl_seconds=60)
+    await backend.append("alerts", third, queue_depth=2, ttl_seconds=60)
+
+    assert await backend.peek("alerts") == (second, third)
+    assert await backend.peek("alerts") == (second, third)
+    assert await backend.pop("alerts") == (second, third)
+    assert await backend.peek("alerts") == ()
+
+
+@pytest.mark.anyio
+async def test_named_atomic_cache_queue_uses_owner_prefix_and_ttl() -> None:
+    now = 1.0
+    atomic = InMemoryAtomicCache(clock=lambda: now)
+    backend = NamedCacheQueueBackend(atomic)
+    payload = {"severity": SUCCESS_ALERT, "message": "Saved", "created_at": 1.0}
+
+    await backend.append(
+        "wybra:messages:queue",
+        payload,
+        queue_depth=2,
+        ttl_seconds=2,
+    )
+
+    assert await atomic.get("messages", "wybra:messages:queue") is not None
+    now = 4.0
+    assert await backend.peek("wybra:messages:queue") == ()
+
+
+@pytest.mark.anyio
+async def test_named_atomic_cache_queue_close_does_not_close_shared_feature() -> None:
+    atomic = InMemoryAtomicCache()
+    backend = NamedCacheQueueBackend(atomic)
+    payload = {"severity": SUCCESS_ALERT, "message": "Saved", "created_at": 1.0}
+
+    await backend.append("alerts", payload, queue_depth=2, ttl_seconds=60)
+    await backend.close()
+
+    assert await backend.peek("alerts") == (payload,)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("conflict_operation", ("create", "swap", "delete"))
+async def test_named_atomic_cache_queue_retries_revision_conflicts(
+    conflict_operation: str,
+) -> None:
+    atomic = InMemoryAtomicCache()
+    existing = {"severity": SUCCESS_ALERT, "message": "Existing", "created_at": 1.0}
+    appended = {"severity": WARNING_ALERT, "message": "Appended", "created_at": 2.0}
+    if conflict_operation != "create":
+        await atomic.create(
+            "messages",
+            "alerts",
+            json.dumps((existing,)).encode(),
+            ttl=60,
+        )
+
+    class ConflictOnceAtomic:
+        conflicted = False
+
+        async def get(self, owner: str, key: str) -> AtomicCacheValue | None:
+            return await atomic.get(owner, key)
+
+        async def create(
+            self,
+            owner: str,
+            key: str,
+            value: bytes,
+            *,
+            ttl: float,
+        ) -> AtomicCacheValue | None:
+            if conflict_operation == "create" and not self.conflicted:
+                self.conflicted = True
+                return None
+            return await atomic.create(owner, key, value, ttl=ttl)
+
+        async def compare_and_swap(
+            self,
+            owner: str,
+            key: str,
+            expected: CacheRevision,
+            value: bytes,
+            *,
+            ttl: float,
+        ) -> AtomicCacheValue | None:
+            if conflict_operation == "swap" and not self.conflicted:
+                self.conflicted = True
+                return None
+            return await atomic.compare_and_swap(
+                owner,
+                key,
+                expected,
+                value,
+                ttl=ttl,
+            )
+
+        async def compare_and_delete(
+            self,
+            owner: str,
+            key: str,
+            expected: CacheRevision,
+        ) -> bool:
+            if conflict_operation == "delete" and not self.conflicted:
+                self.conflicted = True
+                return False
+            return await atomic.compare_and_delete(owner, key, expected)
+
+    backend = NamedCacheQueueBackend(ConflictOnceAtomic())
+
+    if conflict_operation == "delete":
+        assert await backend.pop("alerts") == (existing,)
+    else:
+        await backend.append("alerts", appended, queue_depth=2, ttl_seconds=60)
+        expected = (
+            (appended,) if conflict_operation == "create" else (existing, appended)
+        )
+        assert await backend.peek("alerts") == expected
+
+
+@pytest.mark.anyio
+async def test_named_atomic_cache_queue_bounds_contention_retries() -> None:
+    class ContendedAtomic:
+        create_calls = 0
+
+        async def get(self, owner: str, key: str) -> None:
+            return None
+
+        async def create(
+            self,
+            owner: str,
+            key: str,
+            value: bytes,
+            *,
+            ttl: float,
+        ) -> None:
+            self.create_calls += 1
+            return None
+
+    atomic = ContendedAtomic()
+    backend = NamedCacheQueueBackend(atomic, max_conflict_attempts=2)
+
+    with pytest.raises(MessageStorageError, match="contention limit"):
+        await backend.append(
+            "alerts",
+            {"severity": SUCCESS_ALERT, "message": "Saved", "created_at": 1.0},
+            queue_depth=2,
+            ttl_seconds=60,
+        )
+
+    assert atomic.create_calls == 2
+
+
+@pytest.mark.anyio
+async def test_named_atomic_cache_queue_reports_readiness_failure() -> None:
+    class UnavailableAtomic:
+        async def get(self, owner: str, key: str) -> None:
+            raise OSError("unavailable")
+
+    backend = NamedCacheQueueBackend(UnavailableAtomic())
+
+    with pytest.raises(MessageStorageError, match="unavailable"):
+        await backend.validate()
+
+
+@pytest.mark.anyio
+async def test_named_atomic_cache_queue_ignores_malformed_utf8() -> None:
+    atomic = InMemoryAtomicCache()
+    await atomic.create("messages", "alerts", b"\xff", ttl=60)
+    backend = NamedCacheQueueBackend(atomic)
+
+    assert await backend.peek("alerts") == ()
 
 
 @pytest.mark.anyio
@@ -636,3 +1258,58 @@ def test_validate_alerts_checks_settings_and_resources() -> None:
     result = validate_alerts(settings)
 
     assert result.is_ok
+
+
+def test_validate_alerts_accepts_named_atomic_cache_selection() -> None:
+    settings = _cache_validation_settings(
+        modules=("wybra.cache", "wybra.messages"),
+        cache_name="messages",
+        named_caches={"cache.messages": {"backend": "memory"}},
+    )
+
+    result = validate_alerts(settings)
+
+    assert result.is_ok
+    assert any(
+        "cache=messages" in check.description
+        and "AtomicCacheCapability" in check.description
+        and "verified at startup" in check.description
+        for check in result.checks
+    )
+
+
+def test_validate_alerts_rejects_missing_cache_module() -> None:
+    result = validate_alerts(_cache_validation_settings(modules=("wybra.messages",)))
+
+    assert result.is_ok is False
+    assert any("wybra.cache" in error for error in result.errors)
+
+
+def test_validate_alerts_rejects_missing_named_cache() -> None:
+    result = validate_alerts(
+        _cache_validation_settings(
+            modules=("wybra.cache", "wybra.messages"),
+            cache_name="missing",
+        )
+    )
+
+    assert result.is_ok is False
+    assert any("missing" in error for error in result.errors)
+    assert any("queued request messages" in error for error in result.errors)
+
+
+def test_validate_alerts_reports_legacy_cache_without_exposing_url() -> None:
+    legacy_url = "redis://user:secret@cache.internal/1"
+
+    result = validate_alerts(
+        _cache_validation_settings(
+            modules=("wybra.messages",),
+            cache_url=legacy_url,
+        )
+    )
+
+    rendered = repr(result)
+    assert result.is_ok
+    assert "legacy" in rendered
+    assert legacy_url not in rendered
+    assert "secret" not in rendered

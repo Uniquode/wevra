@@ -21,18 +21,19 @@ MESSAGES_CLEANUP_INTERVAL_SECONDS = 60 * 60
 
 async def setup_site(site: Site) -> None:
     settings = MessagesSettings.load_settings(site.config)
-    capability = DefaultMessagesCapability(
-        settings=settings,
-        storage=storage_from_settings(site, settings),
-    )
     site.app.state.messages_settings = settings
-    site.provide_capability(MessagesCapability, capability)
-    session_cleanup_registry_from_site(site).register(capability.cleanup_session_data)
     register_messages_middleware(site)
 
 
 async def post_setup_site(site: Site) -> None:
-    await site.require_capability(MessagesCapability).validate()
+    settings = site.app.state.messages_settings
+    capability = DefaultMessagesCapability(
+        settings=settings,
+        storage=storage_from_settings(site, settings),
+    )
+    site.provide_capability(MessagesCapability, capability)
+    session_cleanup_registry_from_site(site).register(capability.cleanup_session_data)
+    await capability.validate()
 
 
 def register_messages_middleware(site: Site) -> None:

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from wybra.cache import CachesSettings, cache_provider_configured
+from wybra.config import ConfigService
+from wybra.core.exceptions import ConfigurationError
 from wybra.core.resources import PackageResourceSource, first_existing_resource
 from wybra.messages.config import MessageStorageBackend
 from wybra.messages.settings import MessagesSettings
@@ -13,6 +16,8 @@ ALERT_STYLESHEET = "styles/messages.css"
 
 
 class MessagesValidationSettings(Protocol):
+    config: ConfigService
+
     @property
     def modules(self) -> tuple[str, ...]: ...
 
@@ -85,13 +90,67 @@ def _record_settings_check(
             error="Database-backed messages require wybra.db in configured modules.",
         )
     if messages_settings.resolved_storage_backend is MessageStorageBackend.CACHE:
+        if messages_settings.cache_url is not None:
+            record_check(
+                checks,
+                errors,
+                passed=True,
+                description="cache messages storage uses deprecated legacy cache URL",
+            )
+        else:
+            _record_named_cache_check(
+                config,
+                settings.modules,
+                messages_settings.resolved_cache_name,
+                checks,
+                errors,
+            )
+
+
+def _record_named_cache_check(
+    config: ConfigService,
+    modules: tuple[str, ...],
+    cache_name: str,
+    checks: list[ValidationCheck],
+    errors: list[str],
+) -> None:
+    description = (
+        "cache messages storage selects named cache: "
+        f"cache={cache_name}, required_feature=AtomicCacheCapability "
+        "(verified at startup)"
+    )
+    if not cache_provider_configured(modules):
         record_check(
             checks,
             errors,
-            passed=messages_settings.cache_url is not None,
-            description="cache messages storage has cache URL",
-            error="Cache-backed messages require wybra.messages.cache_url.",
+            passed=False,
+            description=description,
+            error=(
+                "Cache-backed messages require a configured cache capability "
+                "such as wybra.cache."
+            ),
         )
+        return
+    try:
+        CachesSettings.load_settings(config).require(cache_name)
+    except ConfigurationError as exc:
+        record_check(
+            checks,
+            errors,
+            passed=False,
+            description=description,
+            error=(
+                f"Cache {cache_name!r} for consumer 'queued request messages' "
+                f"is invalid: {exc}"
+            ),
+        )
+        return
+    record_check(
+        checks,
+        errors,
+        passed=True,
+        description=description,
+    )
 
 
 def _record_context_provider_check(

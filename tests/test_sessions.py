@@ -626,7 +626,7 @@ def test_sessions_validation_accepts_configured_named_cache() -> None:
 def test_sessions_validation_retries_cache_provider_import_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    validation_module = importlib.import_module("wybra.sessions.validation")
+    discovery_module = importlib.import_module("wybra.cache.discovery")
     import_attempts = 0
 
     def import_cache_provider(_module_name: str) -> object:
@@ -636,7 +636,7 @@ def test_sessions_validation_retries_cache_provider_import_after_failure(
             raise ImportError("optional dependency unavailable")
         return SimpleNamespace(provides_cache_capability=True)
 
-    monkeypatch.setattr(validation_module, "import_module", import_cache_provider)
+    monkeypatch.setattr(discovery_module, "import_module", import_cache_provider)
     settings = SimpleNamespace(
         config=_cache_session_validation_config(modules=("custom.cache",)),
         deployment_environment="local",

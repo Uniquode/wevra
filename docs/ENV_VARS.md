@@ -116,7 +116,8 @@ Configured secret-source keys may also point at environment variables:
 | `MESSAGES_QUEUE_DEPTH` | Overrides the maximum queued message count per queue. |
 | `MESSAGES_MESSAGE_MAX_LENGTH` | Overrides the maximum length of an individual message. |
 | `MESSAGES_TTL_SECONDS` | Overrides queued message time-to-live in seconds. |
-| `MESSAGES_CACHE_URL` | Overrides the cache/Redis URL for cache-backed messages. |
+| `MESSAGES_CACHE_NAME` | Selects the named Wybra cache for cache-backed messages; defaults to `default`. |
+| `MESSAGES_CACHE_URL` | Deprecated direct cache/Redis URL for cache-backed messages. |
 | `MESSAGES_CACHE_KEY_PREFIX` | Overrides the cache key prefix for cache-backed messages. |
 | `MESSAGES_DATABASE_CONNECTION` | Overrides the database connection name for database-backed messages. |
 
