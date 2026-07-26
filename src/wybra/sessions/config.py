@@ -4,6 +4,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
+from wybra.cache import to_cache_name
 from wybra.config import ConfigDef, ConfigField, ConfigGroup
 from wybra.config.transforms import (
     to_non_blank_string,
@@ -21,6 +22,7 @@ ENV_SESSIONS_COOKIE_PATH: Final = "SESSIONS_COOKIE_PATH"
 ENV_SESSIONS_COOKIE_SECURE: Final = "SESSIONS_COOKIE_SECURE"
 ENV_SESSIONS_COOKIE_SAME_SITE: Final = "SESSIONS_COOKIE_SAME_SITE"
 ENV_SESSIONS_FILE_DIRECTORY: Final = "SESSIONS_FILE_DIRECTORY"
+ENV_SESSIONS_CACHE_NAME: Final = "SESSIONS_CACHE_NAME"
 ENV_SESSIONS_CACHE_URL: Final = "SESSIONS_CACHE_URL"
 ENV_SESSIONS_CACHE_KEY_PREFIX: Final = "SESSIONS_CACHE_KEY_PREFIX"
 ENV_SESSIONS_DATABASE_CONNECTION: Final = "SESSIONS_DATABASE_CONNECTION"
@@ -63,6 +65,12 @@ def to_optional_storage_backend(value: object) -> SessionStorageBackend | None:
         raise ValueError(
             f"sessions storage backend must be one of: {storage_backend_choices()}."
         ) from exc
+
+
+def to_optional_cache_name(value: object) -> str | None:
+    if value is None:
+        return None
+    return to_cache_name(value)
 
 
 def to_optional_bool(value: object) -> bool | None:
@@ -148,6 +156,12 @@ module_config: Final = ConfigDef(
                     transform=to_optional_path,
                 ),
                 ConfigField(
+                    name="cache_name",
+                    default=None,
+                    env=ENV_SESSIONS_CACHE_NAME,
+                    transform=to_optional_cache_name,
+                ),
+                ConfigField(
                     name="cache_url",
                     default=None,
                     env=ENV_SESSIONS_CACHE_URL,
@@ -194,6 +208,7 @@ __all__ = (
     "DEFAULT_SESSION_LIFETIME_SECONDS",
     "DEFAULT_SESSION_PAYLOAD_MAX_BYTES",
     "ENV_SESSIONS_CACHE_KEY_PREFIX",
+    "ENV_SESSIONS_CACHE_NAME",
     "ENV_SESSIONS_CACHE_URL",
     "ENV_SESSIONS_COOKIE_DOMAIN",
     "ENV_SESSIONS_COOKIE_NAME",
@@ -213,6 +228,7 @@ __all__ = (
     "to_cookie_same_site",
     "to_non_blank_string",
     "to_optional_bool",
+    "to_optional_cache_name",
     "to_optional_non_blank_string",
     "to_optional_path",
     "to_optional_storage_backend",

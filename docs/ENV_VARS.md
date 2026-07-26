@@ -101,7 +101,8 @@ Configured secret-source keys may also point at environment variables:
 | `SESSIONS_COOKIE_SECURE` | Boolean override for request-session cookie secure handling. |
 | `SESSIONS_COOKIE_SAME_SITE` | Overrides request-session cookie SameSite policy. |
 | `SESSIONS_FILE_DIRECTORY` | Overrides the file-session storage directory. |
-| `SESSIONS_CACHE_URL` | Overrides the cache/Redis URL for cache-backed sessions. |
+| `SESSIONS_CACHE_NAME` | Overrides the named Wybra cache selected for cache-backed sessions. |
+| `SESSIONS_CACHE_URL` | Deprecated compatibility override for the module-owned cache/Redis URL. |
 | `SESSIONS_CACHE_KEY_PREFIX` | Overrides the cache key prefix for cache-backed sessions. |
 | `SESSIONS_DATABASE_CONNECTION` | Overrides the database connection name for database-backed sessions. |
 | `SESSIONS_PAYLOAD_MAX_BYTES` | Overrides the maximum server-side session payload size. |

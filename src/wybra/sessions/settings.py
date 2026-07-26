@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, Self, cast
 from urllib.parse import urlparse
 
+from wybra.cache import DEFAULT_CACHE_NAME
 from wybra.config import BaseSettings, ConfigDef, ConfigService
 from wybra.core.exceptions import ConfigurationError
 from wybra.core.runtime import (
@@ -22,6 +23,7 @@ from wybra.sessions.config import (
     to_cookie_same_site,
     to_non_blank_string,
     to_optional_bool,
+    to_optional_cache_name,
     to_optional_non_blank_string,
     to_optional_path,
     to_optional_storage_backend,
@@ -43,6 +45,7 @@ class SessionsSettings(BaseSettings):
     cookie_secure: bool | str | None = None
     cookie_same_site: str = "lax"
     file_directory: Path | str | None = None
+    cache_name: str | None = None
     cache_url: str | None = None
     cache_key_prefix: str = "wybra:sessions:"
     database_connection_name: str = "default"
@@ -140,6 +143,11 @@ class SessionsSettings(BaseSettings):
             file_directory = DEFAULT_SESSION_FILE_DIRECTORY
         if not file_directory.is_absolute():
             file_directory = project_root / file_directory
+        cache_name = _configuration_value(
+            to_optional_cache_name,
+            self.cache_name,
+            "cache_name",
+        )
         cache_url = _configuration_value(
             to_optional_non_blank_string,
             self.cache_url,
@@ -166,13 +174,14 @@ class SessionsSettings(BaseSettings):
             "cookie_payload_max_bytes",
         )
 
+        if cache_name is not None and cache_url is not None:
+            raise ConfigurationError(
+                "wybra.sessions.cache_name and wybra.sessions.cache_url "
+                "cannot both be configured."
+            )
         if storage_backend is SessionStorageBackend.CACHE:
-            if cache_url is None:
-                raise ConfigurationError(
-                    "wybra.sessions.cache_url is required when storage_backend "
-                    "is 'cache'."
-                )
-            _validate_cache_url(cache_url)
+            if cache_url is not None:
+                _validate_cache_url(cache_url)
 
         object.__setattr__(self, "deployment_environment", deployment_environment)
         object.__setattr__(self, "storage_backend", storage_backend)
@@ -184,6 +193,7 @@ class SessionsSettings(BaseSettings):
         object.__setattr__(self, "cookie_same_site", cookie_same_site)
         object.__setattr__(self, "project_root", project_root)
         object.__setattr__(self, "file_directory", file_directory.resolve())
+        object.__setattr__(self, "cache_name", cache_name)
         object.__setattr__(self, "cache_url", cache_url)
         object.__setattr__(self, "cache_key_prefix", cache_key_prefix)
         object.__setattr__(self, "database_connection_name", database_connection_name)
@@ -209,6 +219,10 @@ class SessionsSettings(BaseSettings):
     @property
     def resolved_file_directory(self) -> Path:
         return cast(Path, self.file_directory)
+
+    @property
+    def resolved_cache_name(self) -> str:
+        return DEFAULT_CACHE_NAME if self.cache_name is None else self.cache_name
 
     @property
     def resolved_payload_max_bytes(self) -> int:

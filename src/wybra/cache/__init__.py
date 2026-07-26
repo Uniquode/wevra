@@ -27,6 +27,7 @@ _EXPORT_MODULES = {
     "CachePositionExpiredError": "wybra.cache.feature_models",
     "CacheRevision": "wybra.cache.feature_models",
     "CounterCacheValue": "wybra.cache.feature_models",
+    "DEFAULT_CACHE_NAME": "wybra.cache.config",
     "DefaultCachesCapability": "wybra.cache.registry",
     "FencingToken": "wybra.cache.feature_models",
     "InMemoryCache": "wybra.cache.capabilities",
@@ -55,6 +56,7 @@ _EXPORT_MODULES = {
     "build_caches": "wybra.cache.registry",
     "module_config": "wybra.cache.config",
     "setup_site": "wybra.cache.setup",
+    "to_cache_name": "wybra.cache.config",
 }
 
 provides_cache_capability = True
