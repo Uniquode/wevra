@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Protocol
 
+from wybra.cache import CachesSettings
 from wybra.config import ConfigService
+from wybra.core.exceptions import ConfigurationError
 from wybra.core.runtime import DEFAULT_DEPLOYMENT_ENVIRONMENT
 from wybra.sessions.config import SessionStorageBackend
 from wybra.sessions.ids import create_session_id, validate_session_id
@@ -67,13 +70,20 @@ def validate_sessions(settings: SessionsValidationSettings) -> ValidationResult:
             error="Memory session storage is only valid locally.",
         )
     if session_settings.resolved_storage_backend is SessionStorageBackend.CACHE:
-        record_check(
-            checks,
-            errors,
-            passed=session_settings.cache_url is not None,
-            description="cache session storage has cache URL",
-            error="Cache-backed sessions require wybra.sessions.cache_url.",
-        )
+        if session_settings.cache_url is not None:
+            record_check(
+                checks,
+                errors,
+                passed=True,
+                description="cache session storage uses deprecated legacy cache URL",
+            )
+        else:
+            _record_named_cache_check(
+                settings.config,
+                session_settings.resolved_cache_name,
+                checks,
+                errors,
+            )
     if session_settings.resolved_storage_backend is SessionStorageBackend.FILE:
         record_check(
             checks,
@@ -94,6 +104,73 @@ def _session_id_policy_valid() -> bool:
     except Exception:
         return False
     return True
+
+
+def _record_named_cache_check(
+    config: ConfigService,
+    cache_name: str,
+    checks: list[ValidationCheck],
+    errors: list[str],
+) -> None:
+    description = f"cache session storage uses named cache: cache={cache_name}"
+    if not _cache_provider_configured(_configured_modules(config)):
+        record_check(
+            checks,
+            errors,
+            passed=False,
+            description=description,
+            error=(
+                "Cache-backed sessions require a configured cache capability "
+                "such as wybra.cache."
+            ),
+        )
+        return
+    try:
+        CachesSettings.load_settings(config).require(cache_name)
+    except ConfigurationError as exc:
+        record_check(
+            checks,
+            errors,
+            passed=False,
+            description=description,
+            error=(
+                f"Cache {cache_name!r} for consumer 'request sessions' "
+                f"is invalid: {exc}"
+            ),
+        )
+        return
+    record_check(
+        checks,
+        errors,
+        passed=True,
+        description=description,
+    )
+
+
+def _configured_modules(config: ConfigService) -> tuple[str, ...]:
+    app_config = config.get_config("app") or {}
+    modules = app_config.get("modules", ())
+    if isinstance(modules, list | tuple) and all(
+        isinstance(module_name, str) for module_name in modules
+    ):
+        return tuple(modules)
+    return ()
+
+
+def _cache_provider_configured(modules: tuple[str, ...]) -> bool:
+    if "wybra.cache" in modules:
+        return True
+    return any(
+        _module_provides_cache_capability(module_name) for module_name in modules
+    )
+
+
+def _module_provides_cache_capability(module_name: str) -> bool:
+    try:
+        module = import_module(module_name)
+    except ImportError:
+        return False
+    return getattr(module, "provides_cache_capability", False) is True
 
 
 validation_targets = {"sessions": validate_sessions}

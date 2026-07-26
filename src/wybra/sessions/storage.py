@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import logging
 import uuid
+import warnings
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 
 from anyio import Path as AsyncPath
 
+from wybra.cache import CacheCapability, CacheNotFoundError, CachesCapability
 from wybra.core.environment import environment_get
 from wybra.core.runtime import LOCAL_ENVIRONMENT
 from wybra.db import DatabaseCapability
@@ -30,7 +33,9 @@ from wybra.sessions.exceptions import (
 )
 from wybra.sessions.models import SessionRecordModel
 from wybra.sessions.settings import SessionsSettings
-from wybra.site import Site, SiteCapabilityProxy
+from wybra.site import Site, SiteCapabilityError, SiteCapabilityProxy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +398,65 @@ class CacheSessionStorage:
 
 
 @dataclass(frozen=True, slots=True)
+class NamedCacheSessionStorage:
+    cache: CacheCapability = field(repr=False)
+    key_prefix: str
+    payload_max_bytes: int
+    cleanup_registry: SessionCleanupRegistry | None = None
+    owner: ClassVar[str] = "sessions"
+
+    async def load(self, session_id: str, *, now: float) -> SessionRecord | None:
+        raw_payload = await self.cache.get(self.owner, self._key(session_id))
+        record = _record_from_cache_value(raw_payload)
+        if record is None:
+            return None
+        if record.expired(now):
+            await self.delete(session_id)
+            return None
+        return record
+
+    async def save(self, session_id: str, record: SessionRecord) -> None:
+        payload = _record_json(record, max_bytes=self.payload_max_bytes).encode("utf-8")
+        ttl = record.expires_at - record.updated_at
+        if ttl <= 0:
+            raise SessionStorageError(
+                "Session record expiry must be later than its update time."
+            )
+        await self.cache.set(
+            self.owner,
+            self._key(session_id),
+            payload,
+            ttl=ttl,
+        )
+
+    async def delete(self, session_id: str) -> None:
+        key = self._key(session_id)
+        raw_payload = await self.cache.get(self.owner, key)
+        cleanup_data = _record_data_from_json(raw_payload)
+        await self.cache.delete(self.owner, key)
+        if cleanup_data is not None:
+            await _cleanup_session_data(self.cleanup_registry, cleanup_data)
+
+    async def validate(self) -> None:
+        try:
+            await self.cache.get(
+                self.owner,
+                self._key("__validation__"),
+            )
+        except Exception as exc:
+            raise SessionStorageError("Named session cache is unavailable.") from exc
+
+    async def cleanup(self, *, now: float) -> None:
+        del now
+
+    async def close(self) -> None:
+        return None
+
+    def _key(self, session_id: str) -> str:
+        return f"{self.key_prefix}{session_id}"
+
+
+@dataclass(frozen=True, slots=True)
 class DatabaseSessionStorage:
     database: SiteCapabilityProxy[DatabaseCapability]
     connection_name: str
@@ -494,6 +558,21 @@ def storage_from_settings(
     *,
     cleanup_registry: SessionCleanupRegistry | None = None,
 ) -> SessionStorage:
+    if settings.resolved_storage_backend is not SessionStorageBackend.CACHE:
+        ignored_cache_settings = [
+            setting
+            for setting, value in (
+                ("cache_name", settings.cache_name),
+                ("cache_url", settings.cache_url),
+            )
+            if value is not None
+        ]
+        if ignored_cache_settings:
+            logger.warning(
+                "wybra.sessions.%s %s ignored unless storage_backend is 'cache'.",
+                " and wybra.sessions.".join(ignored_cache_settings),
+                "are" if len(ignored_cache_settings) > 1 else "is",
+            )
     if settings.resolved_storage_backend is SessionStorageBackend.MEMORY:
         return MemorySessionStorage(
             payload_max_bytes=settings.resolved_payload_max_bytes,
@@ -512,9 +591,40 @@ def storage_from_settings(
             cleanup_registry=cleanup_registry,
         )
     if settings.resolved_storage_backend is SessionStorageBackend.CACHE:
-        assert settings.cache_url is not None
-        return CacheSessionStorage(
-            url=settings.cache_url,
+        if settings.cache_url is not None:
+            deprecation_message = (
+                "wybra.sessions.cache_url is deprecated; configure wybra.cache "
+                "and select it with wybra.sessions.cache_name instead."
+            )
+            warnings.warn(
+                deprecation_message,
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            logger.warning(deprecation_message)
+            return CacheSessionStorage(
+                url=settings.cache_url,
+                key_prefix=settings.cache_key_prefix,
+                payload_max_bytes=settings.resolved_payload_max_bytes,
+                cleanup_registry=cleanup_registry,
+            )
+        try:
+            caches = site.require_capability(CachesCapability)
+        except SiteCapabilityError as exc:
+            raise SessionsConfigurationError(
+                "Cache-backed sessions require the wybra.cache module."
+            ) from exc
+        try:
+            cache = caches.require(
+                settings.resolved_cache_name,
+                consumer="request sessions",
+            )
+        except CacheNotFoundError as exc:
+            raise SessionsConfigurationError(
+                f"Session cache {settings.resolved_cache_name!r} is unavailable: {exc}"
+            ) from exc
+        return NamedCacheSessionStorage(
+            cache=cache.values,
             key_prefix=settings.cache_key_prefix,
             payload_max_bytes=settings.resolved_payload_max_bytes,
             cleanup_registry=cleanup_registry,
@@ -550,11 +660,28 @@ def _has_configured_secret_key(environ: object | None) -> bool:
 
 def _record_data_from_json(value: object) -> dict[str, Any] | None:
     if isinstance(value, bytes):
-        value = value.decode("utf-8")
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
     if not isinstance(value, str):
         return None
     try:
         return dict(_record_from_json(value).data)
+    except SessionStorageError:
+        return None
+
+
+def _record_from_cache_value(value: object) -> SessionRecord | None:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    try:
+        return _record_from_json(value)
     except SessionStorageError:
         return None
 
@@ -701,6 +828,7 @@ __all__ = (
     "DatabaseSessionStorage",
     "FileSessionStorage",
     "MemorySessionStorage",
+    "NamedCacheSessionStorage",
     "SessionRecord",
     "SessionStorage",
     "storage_from_settings",

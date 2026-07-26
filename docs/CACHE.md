@@ -82,6 +82,29 @@ consumer when supplied. `caches.diagnostics()` reports each name, backend,
 safe partition identifier, and advertised feature names without exposing
 provider URLs or credentials.
 
+Cache-backed request sessions are a baseline consumer. Select an isolated
+instance with `wybra.sessions.cache_name`; omit the setting to use `default`:
+
+```toml
+[app]
+modules = [
+  "wybra.cache",
+]
+
+[cache.session]
+backend = "redis"
+url = "redis://localhost:6379/1"
+
+[wybra.sessions]
+storage_backend = "cache"
+cache_name = "session"
+```
+
+Session startup fails before serving requests when `wybra.cache` is absent or
+the selected name is not configured. Session diagnostics report only the cache
+name or legacy compatibility mode, never provider URLs or credentials. See
+[`SESSION.md`](SESSION.md) for legacy `cache_url` migration guidance.
+
 Every cache operation requires an owner and a logical key. Owners must be
 non-blank and cannot contain `:`; the owner prefixes the backend key and keeps
 independent cache domains separate. Cache entries always have an explicit,

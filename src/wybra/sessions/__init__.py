@@ -12,6 +12,7 @@ _EXPORT_MODULES = {
     "DatabaseSessionStorage": "wybra.sessions.storage",
     "FileSessionStorage": "wybra.sessions.storage",
     "MemorySessionStorage": "wybra.sessions.storage",
+    "NamedCacheSessionStorage": "wybra.sessions.storage",
     "RequestSession": "wybra.sessions.state",
     "SessionIdentifierError": "wybra.sessions.exceptions",
     "SessionMiddlewareContext": "wybra.sessions.middleware",
