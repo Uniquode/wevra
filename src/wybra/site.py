@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from importlib import import_module
@@ -61,6 +62,7 @@ ModuleLoader = Callable[[str], ModuleType]
 AppT = TypeVar("AppT", bound=FastAPI)
 SETUP_SITE_ATTRIBUTE = "setup_site"
 POST_SETUP_SITE_ATTRIBUTE = "post_setup_site"
+SETUP_FINALISATION_ATTRIBUTE = "setup_finalisation"
 T = TypeVar("T")
 
 
@@ -72,6 +74,15 @@ class _CapabilityProxyState(Enum):
 
 class SiteLifespan(Protocol[AppT]):
     def __call__(self, app: AppT) -> AbstractAsyncContextManager[None]: ...
+
+
+type SiteSetupFinaliser = Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredSetupFinaliser:
+    module_name: str
+    finaliser: SiteSetupFinaliser
 
 
 class SiteCapabilityError(RuntimeError):
@@ -93,6 +104,12 @@ class Site:
         init=False,
         repr=False,
     )
+    _setup_finalisers: deque[_DeferredSetupFinaliser] = field(
+        default_factory=deque,
+        init=False,
+        repr=False,
+    )
+    _setup_finaliser_module: str | None = field(default=None, init=False, repr=False)
 
     @property
     def modules(self) -> tuple[str, ...]:
@@ -126,6 +143,53 @@ class Site:
             )
         self._capabilities[capability_type] = value
         self._pending_capability_events.append(capability_type)
+
+    def defer_setup_finalisation(self, finaliser: SiteSetupFinaliser) -> None:
+        """Run an asynchronous finaliser after all module setup hooks."""
+        if not callable(finaliser) or not (
+            iscoroutinefunction(finaliser)
+            or iscoroutinefunction(type(finaliser).__call__)
+        ):
+            raise SiteCapabilityError(
+                structured_error(
+                    "Deferred setup finaliser is invalid",
+                    finaliser_type=type(finaliser).__name__,
+                    expected="async_callable",
+                )
+            )
+        module_name = self._setup_finaliser_module
+        if module_name is None:
+            raise SiteCapabilityError(
+                "Deferred setup finalisers may only be registered from setup_site."
+            )
+        self._setup_finalisers.append(_DeferredSetupFinaliser(module_name, finaliser))
+
+    async def _finalise_deferred_setup(self) -> None:
+        while self._setup_finalisers:
+            deferred = self._setup_finalisers.popleft()
+
+            async def run_finaliser(
+                _site: Site,
+                finaliser: SiteSetupFinaliser = deferred.finaliser,
+            ) -> None:
+                await finaliser()
+
+            await _run_module_hook(
+                self,
+                module_name=deferred.module_name,
+                attribute=SETUP_FINALISATION_ATTRIBUTE,
+                hook=run_finaliser,
+            )
+        await self._publish_pending_capability_events()
+
+    @contextmanager
+    def _registering_setup_finalisers(self, module_name: str) -> Iterator[None]:
+        previous_module = self._setup_finaliser_module
+        object.__setattr__(self, "_setup_finaliser_module", module_name)
+        try:
+            yield
+        finally:
+            object.__setattr__(self, "_setup_finaliser_module", previous_module)
 
     async def _publish_pending_capability_events(self) -> None:
         """Publish capability registration observations at async boundaries."""
@@ -693,6 +757,7 @@ async def _compose_site(site: Site, module_loader: ModuleLoader) -> None:
     """
 
     loaded_modules = await _setup_module_hooks(site, module_loader)
+    await site._finalise_deferred_setup()
     await _setup_core_sessions(site)
     _register_configured_routes(site)
     _validate_registered_route_dependencies(site)
@@ -790,12 +855,21 @@ async def _run_module_hook(
     _require_async_hook(module_name=module_name, attribute=attribute, hook=hook)
     async_hook = cast(Callable[[Site], Awaitable[None]], hook)
     try:
-        await _invoke_module_hook(
-            site,
-            module_name=module_name,
-            attribute=attribute,
-            hook=async_hook,
-        )
+        if attribute == SETUP_SITE_ATTRIBUTE:
+            with site._registering_setup_finalisers(module_name):
+                await _invoke_module_hook(
+                    site,
+                    module_name=module_name,
+                    attribute=attribute,
+                    hook=async_hook,
+                )
+        else:
+            await _invoke_module_hook(
+                site,
+                module_name=module_name,
+                attribute=attribute,
+                hook=async_hook,
+            )
     except BaseException as exc:
         if not isinstance(exc, Exception):
             raise

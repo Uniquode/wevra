@@ -24,10 +24,18 @@ modules = [
 [cache]
 backend = "redis"
 url = "redis://localhost:6379/0"
+namespace = "website_default"
 
 [cache.session]
 backend = "redis"
 url = "redis://localhost:6379/1"
+features = []
+
+[cache.messages]
+backend = "redis"
+url = "redis://localhost:6379/1"
+namespace = "website_messages"
+features = ["atomic"]
 
 [cache.transient]
 backend = "memory"
@@ -44,13 +52,124 @@ process-local, and its baseline key/value store removes expired values only
 when their keys are accessed. Use it for local development, deterministic
 tests, embedded single-process workers, or small bounded workloads; use Redis
 when baseline cache state must be shared across workers or instances. A memory
-cache cannot configure `url`; a Redis cache requires it.
+cache cannot configure `url`; a Redis cache requires either `url`, `url_source`,
+or the documented native environment URL override.
 
-The root section supports `WYBRA_CACHE_BACKEND` and `WYBRA_CACHE_URL`.
-Named overrides use
-`WYBRA_CACHE__<UPPER_CASE_NAME>__BACKEND` and
-`WYBRA_CACHE__<UPPER_CASE_NAME>__URL`. For example,
-`WYBRA_CACHE__SESSION__URL` changes only the `session` cache.
+Redis keys are isolated by `namespace`. It defaults to the cache name, so
+`[cache]` uses `default` and `[cache.messages]` uses `messages`. Set an
+explicit namespace when multiple applications share one Redis database.
+Namespaces are non-secret identifiers containing lower-case letters, numbers,
+and underscores.
+
+Omitting `features` enables every optional feature implemented by the selected
+backend. Set an explicit list to narrow the advertised capabilities; an empty
+list provides only the baseline byte cache. Configuration fails when a feature
+is duplicated, unknown, or not implemented by that backend.
+
+The root section supports `WYBRA_CACHE_BACKEND`, `WYBRA_CACHE_URL`,
+`WYBRA_CACHE_NAMESPACE`, and `WYBRA_CACHE_FEATURES`. Named overrides use
+`WYBRA_CACHE__<UPPER_CASE_NAME>__<FIELD>`. For example,
+`WYBRA_CACHE__MESSAGES__FEATURES=atomic` changes only the `messages` cache.
+Environment feature lists are comma-separated.
+A blank environment feature value is treated as unset; use `features = []` in
+configuration when a Redis cache must provide only the baseline byte-cache API.
+
+### Redis connection secrets
+
+For production Redis connections, configure both `wybra.secrets` and
+`wybra.cache`. Redis URLs and credentials are resolved during cache startup,
+after configured module setup has completed and before the cache instance is
+registered; their order in the modules list does not matter:
+
+```toml
+[app]
+modules = [
+  "wybra.secrets",
+  "wybra.cache",
+]
+```
+
+The normal environment configuration fields are the preferred way to supply a
+complete connection URL outside the configuration file:
+
+```sh
+export WYBRA_CACHE_URL='rediss://cache.internal:6380/0'
+export WYBRA_CACHE__SESSION__URL='rediss://cache.internal:6380/1'
+```
+
+These override the default `[cache]` and named `[cache.session]` URLs
+respectively. They do not require `url_source = "environment"` in the file.
+
+For an OS-keychain URL, configure `url_source = "keychain"`. The default cache
+then uses `cache/redis/url`; a named cache uses its own deterministic
+key, such as `cache/session/redis/url`:
+
+```toml
+[cache]
+backend = "redis"
+url_source = "keychain"
+
+[cache.session]
+backend = "redis"
+url_source = "keychain"
+```
+
+Set `url_key` only to intentionally override those derived keychain names. An
+explicit environment URL reference is also supported, but it must select a
+separate environment variable to avoid conflicting with the native cache URL
+override:
+
+```toml
+[cache.reporting]
+backend = "redis"
+url_source = "environment"
+url_key = "REPORTING_REDIS_URL"
+```
+
+`wybra-secret list` includes configured keychain references with cache-specific
+names such as `cache-url`, `cache-session-credentials`, and
+`cache-tasks-url`.
+
+An endpoint without userinfo is valid in configuration. Add a credential
+source when the endpoint and credentials have different deployment ownership:
+
+```toml
+[cache]
+backend = "redis"
+url = "rediss://cache.internal:6380/0"
+credentials_source = "keychain"
+
+[cache.session]
+backend = "redis"
+url = "rediss://cache.internal:6380/1"
+credentials_source = "environment"
+```
+
+The keychain credential default is `cache/redis/credentials`; the environment
+credential default is `WYBRA_REDIS_CREDENTIALS`. Both caches may deliberately
+use the same credential value. Set `credentials_key` to select a different
+credential entry for one cache. Credential values use `username:password`
+form; `:password` is also valid when Redis uses password-only authentication.
+Wybra URI-encodes both parts when it constructs the final connection URL. The
+endpoint must not itself contain credentials when `credentials_source` is
+configured.
+
+`url_source` cannot be combined with `url` or `credentials_source`: a resolved
+full URL is already a complete connection. If a configured secret source or
+key cannot be resolved, startup fails before serving requests and never falls
+back to a raw URL.
+
+A raw credential-bearing URL remains accepted only for backwards compatibility:
+
+```toml
+[cache]
+backend = "redis"
+url = "rediss://user:password@cache.internal:6380/0"
+```
+
+Treat this as a last resort: it places credentials in the configuration file.
+Wybra redacts it from cache settings, diagnostics, events, and startup errors,
+but it cannot make the configuration file itself safe.
 
 ## Resolving caches
 
@@ -79,8 +198,8 @@ payload = await session_cache.values.get("sessions", session_id)
 Repeated resolution returns the same site-scoped `CacheInstance`. A missing
 required cache raises `CacheNotFoundError` and identifies the requesting
 consumer when supplied. `caches.diagnostics()` reports each name, backend,
-safe partition identifier, and advertised feature names without exposing
-provider URLs or credentials.
+safe partition identifier, advertised feature names, and health state without
+exposing provider URLs or credentials.
 
 Cache-backed request sessions are a baseline consumer. Select an isolated
 instance with `wybra.sessions.cache_name`; omit the setting to use `default`:
@@ -117,7 +236,9 @@ modules = [
 ]
 
 [cache.messages]
-backend = "memory"
+backend = "redis"
+url = "redis://localhost:6379/2"
+features = ["atomic"]
 
 [wybra.messages]
 storage_backend = "cache"
@@ -125,8 +246,7 @@ cache_name = "messages"
 ```
 
 Messages startup fails when the cache module, selected name, or required atomic
-feature is unavailable. The current in-memory provider supplies the feature;
-the named Redis provider gains it in the Redis advanced-feature slice. See
+feature is unavailable. Both memory and Redis supply the feature. See
 [`MESSAGES.md`](MESSAGES.md) for legacy `cache_url` migration guidance and the
 queued-alert key change.
 
@@ -197,10 +317,67 @@ contract rather than growing state indefinitely.
 Feature payloads are opaque bytes and are limited to 1 MiB. Callers own
 serialisation, schema versioning, redaction, and domain validation.
 
+### Redis guarantees
+
+The Redis backend performs a health check during cache-registry startup and
+shares one async client across the named instance's baseline and optional
+features. Startup fails with installation guidance when `wybra[cache]` is not
+installed, or with a bounded diagnostic when Redis is unavailable.
+
+The baseline byte cache needs only a reachable Redis server when configured
+with `features = []`. Enabling `atomic` or `lease` additionally requires Redis
+scripting, append-only persistence, and an eviction policy other than
+`allkeys-*`. Wybra checks those prerequisites at startup before advertising the
+features, because their revisions and fencing tokens must survive ordinary key
+expiry and process restart. If the Redis service blocks `CONFIG GET`, Wybra
+logs a warning and continues only when its operational readiness checks pass;
+the operator then owns verification of persistence and eviction policy. Redis
+Cluster is not yet supported for these advanced features; use a standalone or
+compatible non-clustered deployment.
+
+Upgrading an existing Redis baseline cache with omitted `features` enables the
+implemented advanced features and therefore requires these prerequisites.
+Configure `features = []` to retain baseline-only behaviour while planning a
+Redis durability upgrade.
+
+Runtime diagnostics report `ready` after this startup check. They do not claim
+that a Redis connection or configuration remains healthy after startup; an
+operation reports a safe cache error if the provider later becomes unavailable.
+
+| Feature | Redis behaviour |
+| --- | --- |
+| Baseline byte cache | Shared expiring values, isolated by named namespace |
+| Atomic values and counters | Shared atomic create, compare-and-swap, compare-and-delete, and increment with persistent revisions |
+| Leases and fencing | Shared renewable leases with opaque holder tokens and persistent monotonic fencing tokens |
+| Work queues | Not yet implemented |
+| Streams | Not yet implemented |
+| Pub/sub | Not yet implemented |
+| Schedules | Not yet implemented |
+
+Redis atomic mutations and lease changes are provider-atomic. Revisions and
+fencing sequences survive individual entry expiry, deletion, and Wybra runtime
+restart according to the Redis provider's configured persistence window.
+`appendfsync always` is required where an unclean Redis crash must not lose a
+recent sequence update. Deleting sequence keys, `FLUSHDB`, and `FLUSHALL` are
+destructive operations that invalidate previously issued revisions and fencing
+tokens. Lease expiries use Redis server time, making coordination safe across
+horizontally scaled application instances. Redis feature metadata reports
+shared scope, durability, restart recovery, and horizontal-consumer support.
+
+Provider failures are translated to bounded cache feature errors without
+including URLs, credentials, physical keys, values, scripts, or lease tokens.
+Wybra logs the failed operation and exception type for operator diagnostics.
+The underlying Redis service still owns persistence and availability; deploy
+and back it up according to the application's durability requirements.
+
 ### Atomic values and leases
 
 Atomic values use revisions for compare-and-swap and compare-and-delete.
 Counters return both the resulting value and a new revision:
+
+Redis counters use Redis signed 64-bit integer arithmetic. Incrementing beyond
+that range fails with a bounded cache feature error; in-memory counters use
+Python integers and do not share that provider limit.
 
 ```python
 from wybra.cache import AtomicCacheCapability, LeaseCacheCapability
@@ -230,6 +407,18 @@ if lease is not None:
 
 An expired lease can be acquired by another holder with a newer fencing token.
 Renewing or releasing a stale token raises `CacheConflictError`.
+
+### Redis namespace migration
+
+Named Redis caches now prefix every baseline and advanced key with their
+resolved namespace. Existing values written by the earlier unnamespaced named
+Redis provider are not read or migrated automatically. Treat those entries as
+disposable cache state, expire old session keys according to policy, and plan
+for pending legacy queued messages to be cleared or drained before switching.
+
+Changing a configured namespace has the same effect as selecting a fresh cache
+partition. Keep it stable after deployment unless intentional invalidation is
+required.
 
 ### Work queues
 

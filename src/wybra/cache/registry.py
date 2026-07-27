@@ -3,6 +3,7 @@ from __future__ import annotations
 from asyncio import CancelledError
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from functools import partial
 from types import MappingProxyType
 from typing import Protocol, TypeVar, cast, runtime_checkable
 
@@ -19,6 +20,8 @@ from wybra.cache.feature_models import (
     CacheFeatureUnavailableError,
 )
 from wybra.cache.memory_features import InMemoryCacheFeatures
+from wybra.cache.redis_features import RedisCacheFeatures
+from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.cache.settings import (
     CacheConfigurationDiagnostic,
     CacheSettings,
@@ -186,6 +189,7 @@ class DefaultCachesCapability:
                 backend=instance.backend,
                 partition=instance.partition,
                 features=instance.features,
+                health="ready",
             )
             for instance in self._instances.values()
         )
@@ -203,6 +207,7 @@ async def build_caches(
     settings: CachesSettings,
     *,
     factories: Mapping[str, CacheBackendFactory] | None = None,
+    redis_urls: Mapping[str, str] | None = None,
 ) -> DefaultCachesCapability:
     backend_factories = _DEFAULT_FACTORIES if factories is None else factories
     instances: dict[str, CacheInstance] = {}
@@ -210,13 +215,32 @@ async def build_caches(
     lifecycle_owners: list[object] = []
     try:
         for instance_settings in settings.instances:
-            try:
-                factory = backend_factories[instance_settings.backend]
-            except KeyError as exc:
+            if (
+                instance_settings.backend == "redis"
+                and instance_settings.requires_secret_resolution
+                and (redis_urls is None or instance_settings.name not in redis_urls)
+            ):
                 raise ConfigurationError(
-                    f"No cache backend factory is registered for "
-                    f"{instance_settings.backend!r}."
-                ) from exc
+                    f"Cache {instance_settings.name!r} Redis connection material "
+                    "must be resolved before backend construction."
+                )
+            if factories is None and instance_settings.backend == "redis":
+                factory = partial(
+                    _redis_backend,
+                    url=(
+                        redis_urls.get(instance_settings.name)
+                        if redis_urls is not None
+                        else None
+                    ),
+                )
+            else:
+                try:
+                    factory = backend_factories[instance_settings.backend]
+                except KeyError as exc:
+                    raise ConfigurationError(
+                        f"No cache backend factory is registered for "
+                        f"{instance_settings.backend!r}."
+                    ) from exc
             try:
                 backend = await factory(instance_settings)
             except (ConfigurationError, ValueError) as exc:
@@ -266,6 +290,11 @@ def _registered_features(
     implementations: dict[type[object], object] = {}
     metadata_by_name: dict[str, CacheFeatureMetadata] = {}
     for registration in registrations:
+        if (
+            settings.features is not None
+            and registration.metadata.name not in settings.features
+        ):
+            continue
         if registration.protocol in implementations:
             raise ConfigurationError(
                 f"Cache {settings.name!r} backend {settings.backend!r} registered "
@@ -294,6 +323,13 @@ def _registered_features(
             )
         implementations[registration.protocol] = registration.implementation
         metadata_by_name[registration.metadata.name] = registration.metadata
+    if settings.features is not None:
+        unavailable = sorted(set(settings.features) - metadata_by_name.keys())
+        if unavailable:
+            raise ConfigurationError(
+                f"Cache {settings.name!r} backend {settings.backend!r} did not "
+                "register configured feature(s): " + ", ".join(unavailable) + "."
+            )
     ordered_metadata = tuple(
         metadata_by_name[name] for name in sorted(metadata_by_name)
     )
@@ -311,13 +347,47 @@ async def _memory_backend(settings: CacheSettings) -> CacheBackend:
     )
 
 
-async def _redis_backend(settings: CacheSettings) -> CacheBackend:
-    if settings.url is None:
+async def _redis_backend(
+    settings: CacheSettings,
+    *,
+    url: str | None = None,
+) -> CacheBackend:
+    if url is None and settings.requires_secret_resolution:
+        raise ConfigurationError(
+            f"{settings.name!r} cache Redis connection material must be resolved "
+            "before backend construction."
+        )
+    resolved_url = url or settings.url
+    if resolved_url is None:
         raise ConfigurationError(
             f"{settings.name!r} cache URL is required for the Redis backend."
         )
-    cache = RedisCache(settings.url)
-    return CacheBackend(cache, cache.close, lifecycle_owner=cache)
+    runtime = RedisCacheRuntime(resolved_url, settings.resolved_namespace)
+    features = RedisCacheFeatures(runtime)
+    selected_features = frozenset(
+        registration.metadata.name
+        for registration in features.registrations()
+        if settings.features is None or registration.metadata.name in settings.features
+    )
+    try:
+        await runtime.health_check()
+        await runtime.validate_features(selected_features)
+    except BaseException as startup_error:
+        try:
+            await runtime.close()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "Redis cache startup and cleanup failed.",
+                [startup_error, cleanup_error],
+            ) from startup_error
+        raise
+    cache = RedisCache.from_runtime(runtime)
+    return CacheBackend(
+        cache,
+        runtime.close,
+        lifecycle_owner=runtime,
+        features=features.registrations(),
+    )
 
 
 def _register_backend_closer(

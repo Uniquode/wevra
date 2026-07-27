@@ -11,6 +11,7 @@ class RequestSession(MutableMapping[str, Any]):
     session_id: str | None = None
     created_at: float | None = None
     expires_at: float | None = None
+    prospective_expires_at: float | None = None
     accessed: bool = False
     modified: bool = False
     cleared: bool = False

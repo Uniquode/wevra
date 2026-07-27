@@ -25,6 +25,8 @@ from wybra.cache import (
     cache_provider_configured,
     setup_site,
 )
+from wybra.cache.redis_connection import resolve_redis_urls
+from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.config import (
     ConfigService,
     ConfigSourceError,
@@ -34,7 +36,8 @@ from wybra.config import (
 from wybra.core.exceptions import ConfigurationError
 from wybra.events import Event, EventsCapability, event_scope
 from wybra.events.cache import CacheOperationCompletedEvent, CacheOperationFailedEvent
-from wybra.site import Site, start
+from wybra.secrets import DefaultSecretsCapability, EnvironmentSecretSourceDriver
+from wybra.site import Site, SiteCapabilityError, start
 from wybra.template import DefaultTemplateCapability, TemplateCapability
 from wybra.template.cache import configure_cache_extension
 
@@ -58,11 +61,19 @@ async def _cache_provider(cache: CacheCapability) -> CacheCapability:
     return cache
 
 
+async def _healthy_ping() -> bool:
+    return True
+
+
 def invalid_redis_cache_settings() -> CacheSettings:
     settings = object.__new__(CacheSettings)
     object.__setattr__(settings, "name", "default")
     object.__setattr__(settings, "backend", "redis")
     object.__setattr__(settings, "url", None)
+    object.__setattr__(settings, "url_source", None)
+    object.__setattr__(settings, "url_key", None)
+    object.__setattr__(settings, "credentials_source", None)
+    object.__setattr__(settings, "credentials_key", None)
     return settings
 
 
@@ -90,6 +101,9 @@ class TestCacheSettings:
         assert settings.name == "default"
         assert settings.backend == "memory"
         assert settings.url is None
+        assert settings.namespace is None
+        assert settings.resolved_namespace == "default"
+        assert settings.features is None
 
     def test_loads_independent_default_and_named_caches(self) -> None:
         settings = CachesSettings.load_settings(
@@ -223,10 +237,87 @@ url = "redis://cache/1"
                 }
             )
 
+    def test_resolves_redis_namespace_and_feature_selection(self) -> None:
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "redis",
+                    "url": "redis://cache/0",
+                },
+                "cache.messages": {
+                    "backend": "redis",
+                    "url": "redis://cache/0",
+                    "namespace": "website_messages",
+                    "features": ["atomic"],
+                },
+                "cache.baseline": {
+                    "backend": "redis",
+                    "url": "redis://cache/0",
+                    "features": [],
+                },
+            }
+        )
+
+        assert settings.require("default").resolved_namespace == "default"
+        assert settings.require("default").features is None
+        assert settings.require("messages").resolved_namespace == "website_messages"
+        assert settings.require("messages").features == ("atomic",)
+        assert settings.require("baseline").features == ()
+
+    def test_treats_blank_environment_feature_selection_as_unset(self) -> None:
+        ConfigService.set_runtime_environment({"WYBRA_CACHE_FEATURES": "   "})
+        config = ConfigService(
+            [
+                MappingConfigSource(
+                    {"cache": {"backend": "redis", "url": "redis://cache"}}
+                )
+            ],
+            config_defs=(CacheSettings.module_config,),
+            discover_module_config=False,
+        )
+
+        settings = CachesSettings.load_settings(config)
+
+        assert settings.require("default").features is None
+
+    @pytest.mark.parametrize(
+        ("field", "value", "match"),
+        (
+            ("namespace", "", "non-blank"),
+            ("namespace", "Redis://secret", "cache namespace"),
+            ("namespace", "contains:separator", "cache namespace"),
+            ("features", ["atomic", "atomic"], "duplicates"),
+            ("features", ["work-queue"], "not implemented"),
+            ("features", ["unknown"], "not implemented"),
+        ),
+    )
+    def test_rejects_invalid_redis_advanced_configuration(
+        self,
+        field: str,
+        value: object,
+        match: str,
+    ) -> None:
+        with pytest.raises(ConfigurationError, match=match):
+            CachesSettings.load_settings(
+                {
+                    "cache": {
+                        "backend": "redis",
+                        "url": "redis://cache/0",
+                        field: value,
+                    }
+                }
+            )
+
+    def test_rejects_namespace_for_memory_cache(self) -> None:
+        with pytest.raises(ConfigurationError, match=r"namespace.+memory"):
+            CachesSettings.load_settings({"cache": {"namespace": "memory_partition"}})
+
     def test_applies_named_environment_override_only_to_target_cache(self) -> None:
         ConfigService.set_runtime_environment(
             {
                 "WYBRA_CACHE__SESSION__BACKEND": "redis",
+                "WYBRA_CACHE__SESSION__FEATURES": "atomic",
+                "WYBRA_CACHE__SESSION__NAMESPACE": "website_sessions",
                 "WYBRA_CACHE__SESSION__URL": "redis://session-secret@cache/1",
             }
         )
@@ -248,12 +339,16 @@ url = "redis://cache/1"
 
         assert config.get_config("cache.session") == {
             "backend": "redis",
+            "features": ("atomic",),
+            "namespace": "website_sessions",
             "url": "redis://session-secret@cache/1",
         }
         assert config.config.sources["cache.session.backend"] == "environment"
         assert config.config.sources["cache.session.url"] == "environment"
         assert settings.require("session").backend == "redis"
         assert settings.require("session").url == "redis://session-secret@cache/1"
+        assert settings.require("session").features == ("atomic",)
+        assert settings.require("session").resolved_namespace == "website_sessions"
         assert settings.require("tasks") == CacheSettings(name="tasks")
 
     def test_configuration_diagnostics_are_secret_safe(self) -> None:
@@ -274,7 +369,16 @@ url = "redis://cache/1"
             ("session", "memory"),
         ]
         assert diagnostics[0].partition != diagnostics[1].partition
-        assert diagnostics[0].features == ()
+        assert diagnostics[0].features == ("atomic", "lease")
+        assert diagnostics[1].features == (
+            "atomic",
+            "lease",
+            "pub-sub",
+            "schedule",
+            "stream",
+            "work-queue",
+        )
+        assert diagnostics[0].health == "configured"
         rendered = repr(diagnostics)
         assert "password" not in rendered
         assert "redis://" not in rendered
@@ -322,6 +426,85 @@ url = "redis://cache/1"
         )
 
         assert implicit.partition == explicit.partition
+
+    def test_partition_diagnostics_include_the_redis_namespace(self) -> None:
+        first = CacheSettings(
+            backend="redis",
+            url="redis://cache.internal/4",
+            namespace="first",
+        )
+        second = CacheSettings(
+            backend="redis",
+            url="redis://cache.internal/4",
+            namespace="second",
+        )
+
+        assert first.partition != second.partition
+
+    def test_resolves_keychain_redis_url_references_per_cache_name(self) -> None:
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {"backend": "redis", "url_source": "keychain"},
+                "cache.session": {
+                    "backend": "redis",
+                    "url_source": "keychain",
+                },
+            }
+        )
+
+        assert settings.require("default").url_reference == (
+            "keychain",
+            "cache/redis/url",
+        )
+        assert settings.require("session").url_reference == (
+            "keychain",
+            "cache/session/redis/url",
+        )
+
+    def test_allows_a_credentialless_endpoint_with_shared_credentials(self) -> None:
+        settings = CacheSettings(
+            backend="redis",
+            url="rediss://cache.internal/4",
+            credentials_source="keychain",
+        )
+
+        assert settings.url == "rediss://cache.internal/4"
+        assert settings.credentials_reference == (
+            "keychain",
+            "cache/redis/credentials",
+        )
+
+    @pytest.mark.parametrize(
+        ("values", "match"),
+        (
+            (
+                {
+                    "backend": "redis",
+                    "url_source": "environment",
+                },
+                "url_key",
+            ),
+            (
+                {"backend": "redis", "url_key": "CACHE_URL"},
+                "requires cache.url_source",
+            ),
+            (
+                {
+                    "backend": "redis",
+                    "url": "redis://user:password@cache/0",
+                    "credentials_source": "keychain",
+                },
+                "must not contain credentials",
+            ),
+        ),
+    )
+    def test_rejects_ambiguous_redis_secret_configuration(
+        self,
+        values: dict[str, str],
+        match: str,
+    ) -> None:
+        with pytest.raises(ConfigurationError, match=match):
+            CacheSettings(**values)
 
     def test_partition_rechecks_the_redis_url_invariant(self) -> None:
         with pytest.raises(
@@ -686,6 +869,91 @@ class TestInMemoryCache:
 
 
 class TestRedisCache:
+    def test_redis_cache_representation_redacts_the_connection_url(self) -> None:
+        assert "secret" not in repr(RedisCache("redis://user:secret@cache/0"))
+
+    def test_resolves_environment_url_and_credentials_without_leaking_them(
+        self,
+    ) -> None:
+        secrets = DefaultSecretsCapability.from_drivers(
+            (
+                EnvironmentSecretSourceDriver(
+                    {
+                        "PRIVATE_REDIS_URL": "redis://cache.internal/4",
+                        "PRIVATE_REDIS_CREDENTIALS": "service:pass:@word/?",
+                    }
+                ),
+            )
+        )
+        full_url = CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url_source="environment",
+                    url_key="PRIVATE_REDIS_URL",
+                ),
+            )
+        )
+        split_credentials = CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="rediss://cache.internal/4",
+                    credentials_source="environment",
+                    credentials_key="PRIVATE_REDIS_CREDENTIALS",
+                ),
+            )
+        )
+
+        assert resolve_redis_urls(full_url, secrets) == {
+            "default": "redis://cache.internal/4"
+        }
+        assert resolve_redis_urls(split_credentials, secrets) == {
+            "default": "rediss://service:pass%3A%40word%2F%3F@cache.internal/4"
+        }
+
+    def test_redis_secret_resolution_fails_closed_without_secret_details(self) -> None:
+        settings = CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="redis://cache.internal/4",
+                    credentials_source="environment",
+                    credentials_key="MISSING_REDIS_CREDENTIALS",
+                ),
+            )
+        )
+        secrets = DefaultSecretsCapability.from_drivers(
+            (EnvironmentSecretSourceDriver({}),)
+        )
+
+        with pytest.raises(ConfigurationError) as raised:
+            resolve_redis_urls(settings, secrets)
+
+        assert "MISSING_REDIS_CREDENTIALS" not in str(raised.value)
+
+    @pytest.mark.anyio
+    async def test_direct_redis_backend_construction_rejects_unresolved_secrets(
+        self,
+    ) -> None:
+        settings = CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="redis://cache.internal/4",
+                    credentials_source="environment",
+                    credentials_key="PRIVATE_REDIS_CREDENTIALS",
+                    features=(),
+                ),
+            )
+        )
+
+        with pytest.raises(
+            ConfigurationError,
+            match="connection material must be resolved",
+        ):
+            await build_caches(settings)
+
     def test_requires_the_optional_cache_dependency(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -693,11 +961,68 @@ class TestRedisCache:
             raise ImportError("redis is not installed")
 
         monkeypatch.setattr(
-            "wybra.cache.capabilities.importlib.import_module", missing_redis
+            "wybra.cache.redis_runtime.importlib.import_module", missing_redis
         )
 
         with pytest.raises(ConfigurationError, match=r"Install wybra\[cache\]"):
-            RedisCache("redis://cache")
+            awaitable = RedisCache("redis://cache").get("test", "missing")
+            asyncio.run(awaitable)
+
+    @pytest.mark.anyio
+    async def test_memory_backend_does_not_import_redis_dependency(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def unexpected_import(_: str) -> None:
+            pytest.fail("Memory cache construction must not import Redis.")
+
+        monkeypatch.setattr(
+            "wybra.cache.redis_runtime.importlib.import_module",
+            unexpected_import,
+        )
+
+        caches = await build_caches(CachesSettings.load_settings({"cache": {}}))
+
+        assert caches.require("default").backend == "memory"
+        await caches.close()
+
+    @pytest.mark.anyio
+    async def test_redis_health_failure_closes_client_without_secret_detail(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = SimpleNamespace(close_count=0)
+
+        async def ping() -> bool:
+            raise RuntimeError("redis://user:secret@cache/0")
+
+        async def close() -> None:
+            client.close_count += 1
+
+        client.ping = ping
+        client.aclose = close
+        monkeypatch.setattr(
+            "wybra.cache.redis_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(
+                    from_url=lambda *_args, **_kwargs: client,
+                )
+            ),
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "redis",
+                    "url": "redis://user:secret@cache/0",
+                }
+            }
+        )
+
+        with pytest.raises(ConfigurationError) as raised:
+            await build_caches(settings)
+
+        assert "secret" not in repr(raised.value)
+        assert client.close_count == 1
 
     @pytest.mark.anyio
     async def test_uses_binary_redis_values(
@@ -722,7 +1047,7 @@ class TestRedisCache:
 
         client = FakeRedis()
         monkeypatch.setattr(
-            "wybra.cache.capabilities.importlib.import_module",
+            "wybra.cache.redis_runtime.importlib.import_module",
             lambda _: SimpleNamespace(
                 Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
             ),
@@ -735,8 +1060,64 @@ class TestRedisCache:
         await cache.delete("template", "bytecode")
         assert await cache.get("template", "bytecode") is None
 
+    def test_redis_runtime_rejects_unsafe_direct_namespace(self) -> None:
+        runtime = RedisCacheRuntime("redis://cache", "unsafe:namespace")
+
+        with pytest.raises(ValueError, match="namespace must not contain ':'"):
+            runtime.key("atomic", "owner", "key")
+
 
 class TestCacheModule:
+    @pytest.mark.parametrize(
+        "modules",
+        (
+            ("wybra.secrets", "wybra.cache"),
+            ("wybra.cache", "wybra.secrets"),
+        ),
+    )
+    @pytest.mark.anyio
+    async def test_module_resolves_environment_credentials_before_redis_startup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        modules: tuple[str, str],
+    ) -> None:
+        received_urls: list[str] = []
+        client = SimpleNamespace()
+
+        async def close() -> None:
+            return None
+
+        client.aclose = close
+        client.ping = _healthy_ping
+        monkeypatch.setattr(
+            "wybra.cache.redis_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(
+                    from_url=lambda url, **_kwargs: received_urls.append(url) or client,
+                )
+            ),
+        )
+        site = await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": modules},
+                    "cache": {
+                        "backend": "redis",
+                        "url": "rediss://cache.internal/4",
+                        "features": (),
+                        "credentials_source": "environment",
+                        "credentials_key": "PRIVATE_REDIS_CREDENTIALS",
+                    },
+                }
+            ),
+            environ={"PRIVATE_REDIS_CREDENTIALS": "service:password"},
+        )
+        try:
+            assert received_urls == ["rediss://service:password@cache.internal/4"]
+        finally:
+            await site.close()
+
     @pytest.mark.anyio
     async def test_module_registers_default_and_named_cache_capabilities(self) -> None:
         site = await start(
@@ -796,11 +1177,12 @@ class TestCacheModule:
                 client.close_count += 1
 
             client.aclose = aclose
+            client.ping = _healthy_ping
             clients.append(client)
             return client
 
         monkeypatch.setattr(
-            "wybra.cache.capabilities.importlib.import_module",
+            "wybra.cache.redis_runtime.importlib.import_module",
             lambda _: SimpleNamespace(
                 Redis=SimpleNamespace(from_url=from_url),
             ),
@@ -810,10 +1192,15 @@ class TestCacheModule:
             config_source=MappingConfigSource(
                 {
                     "app": {"modules": ("wybra.cache",)},
-                    "cache": {"backend": "redis", "url": "redis://cache/0"},
+                    "cache": {
+                        "backend": "redis",
+                        "url": "redis://cache/0",
+                        "features": (),
+                    },
                     "cache.session": {
                         "backend": "redis",
                         "url": "redis://cache/1",
+                        "features": (),
                     },
                 }
             ),
@@ -834,6 +1221,7 @@ class TestCacheModule:
             first.close_count += 1
 
         first.aclose = aclose
+        first.ping = _healthy_ping
 
         def from_url(*_args: object, **_kwargs: object) -> SimpleNamespace:
             nonlocal calls
@@ -843,27 +1231,40 @@ class TestCacheModule:
             raise RuntimeError("second cache failed")
 
         monkeypatch.setattr(
-            "wybra.cache.capabilities.importlib.import_module",
+            "wybra.cache.redis_runtime.importlib.import_module",
             lambda _: SimpleNamespace(
                 Redis=SimpleNamespace(from_url=from_url),
             ),
         )
 
-        with pytest.raises(RuntimeError, match="module hook failed"):
+        with pytest.raises(
+            SiteCapabilityError,
+            match=(
+                "module=wybra.cache.*attribute=setup_finalisation.*"
+                "error_type=ConfigurationError"
+            ),
+        ) as raised:
             await start(
                 FastAPI(),
                 config_source=MappingConfigSource(
                     {
                         "app": {"modules": ("wybra.cache",)},
-                        "cache": {"backend": "redis", "url": "redis://cache/0"},
+                        "cache": {
+                            "backend": "redis",
+                            "url": "redis://cache/0",
+                            "features": (),
+                        },
                         "cache.session": {
                             "backend": "redis",
                             "url": "redis://cache/1",
+                            "features": (),
                         },
                     }
                 ),
             )
 
+        assert isinstance(raised.value.__cause__, ConfigurationError)
+        assert "health check failed" in str(raised.value.__cause__)
         assert first.close_count == 1
 
     @pytest.mark.anyio
@@ -938,11 +1339,12 @@ class TestCacheModule:
                 client.close_count += 1
 
             client.aclose = aclose
+            client.ping = _healthy_ping
             clients.append(client)
             return client
 
         monkeypatch.setattr(
-            "wybra.cache.capabilities.importlib.import_module",
+            "wybra.cache.redis_runtime.importlib.import_module",
             lambda _: SimpleNamespace(
                 Redis=SimpleNamespace(from_url=from_url),
             ),
@@ -954,7 +1356,11 @@ class TestCacheModule:
                 config_source=MappingConfigSource(
                     {
                         "app": {"modules": ("wybra.cache", "wybra.cache")},
-                        "cache": {"backend": "redis", "url": "redis://cache/0"},
+                        "cache": {
+                            "backend": "redis",
+                            "url": "redis://cache/0",
+                            "features": (),
+                        },
                     }
                 ),
             )
@@ -977,6 +1383,12 @@ class TestCacheModule:
             config = {"cache": {}}
             registration_count = 0
 
+            def capability_proxy(self, _capability_type: object) -> object:
+                return object()
+
+            def defer_setup_finalisation(self, finaliser: object) -> None:
+                self.finaliser = finaliser
+
             def provide_capability(
                 self,
                 _capability_type: object,
@@ -988,6 +1400,7 @@ class TestCacheModule:
 
         async def build_cancelling_caches(
             _settings: CachesSettings,
+            **_kwargs: object,
         ) -> CancellingCaches:
             return CancellingCaches()
 
@@ -996,8 +1409,11 @@ class TestCacheModule:
             build_cancelling_caches,
         )
 
+        site = FailingSite()
+        await setup_site(site)
+
         with pytest.raises(asyncio.CancelledError) as captured:
-            await setup_site(FailingSite())
+            await site.finaliser()
 
         assert isinstance(captured.value.__cause__, RuntimeError)
 

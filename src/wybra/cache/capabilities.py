@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.core.exceptions import ConfigurationError
 from wybra.events import observe
 from wybra.events.cache import cache_event
@@ -243,11 +243,20 @@ class InMemoryCache(_SingleFlightCache):
 
 @dataclass(slots=True)
 class RedisCache(_SingleFlightCache):
-    url: str
-    _client: Any = field(default=None, init=False, repr=False)
+    url: str = field(repr=False)
+    namespace: str | None = None
+    _runtime_owner: RedisCacheRuntime | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
-        self._redis_client()
+        if self._runtime_owner is None:
+            self._runtime_owner = RedisCacheRuntime(self.url, self.namespace)
+
+    @classmethod
+    def from_runtime(cls, runtime: RedisCacheRuntime) -> RedisCache:
+        return cls(runtime.url, runtime.namespace, runtime)
 
     async def get(self, owner: str, key: str) -> bytes | None:
         started = time.perf_counter()
@@ -277,7 +286,13 @@ class RedisCache(_SingleFlightCache):
         )
 
     async def _get_value(self, owner: str, key: str) -> tuple[bytes | None, str]:
-        value = await self._redis_client().get(_cache_key(owner, key))
+        runtime = self._runtime()
+        cache_key = runtime.baseline_key(owner, key)
+
+        async def get_value(client: Any) -> object:
+            return await client.get(cache_key)
+
+        value = await runtime.feature_call(get_value)
         result = value if isinstance(value, bytes) else None
         return result, "hit" if result is not None else "miss"
 
@@ -286,16 +301,25 @@ class RedisCache(_SingleFlightCache):
     ) -> None:
         if not isinstance(value, bytes):
             raise TypeError("Cache values must be bytes.")
-        await self._redis_client().set(
-            _cache_key(owner, key),
-            value,
-            px=max(1, round(_ttl(ttl) * 1000)),
-        )
+        runtime = self._runtime()
+        cache_key = runtime.baseline_key(owner, key)
+        ttl_milliseconds = runtime.ttl_milliseconds(ttl, label="cache TTL")
+
+        async def set_value(client: Any) -> object:
+            return await client.set(cache_key, value, px=ttl_milliseconds)
+
+        await runtime.feature_call(set_value)
 
     async def delete(self, owner: str, key: str) -> None:
         started = time.perf_counter()
         try:
-            await self._redis_client().delete(_cache_key(owner, key))
+            runtime = self._runtime()
+            cache_key = runtime.baseline_key(owner, key)
+
+            async def delete_value(client: Any) -> object:
+                return await client.delete(cache_key)
+
+            await runtime.feature_call(delete_value)
         except Exception as exc:
             await self._record_failed("delete", owner, key, started=started, error=exc)
             raise
@@ -321,23 +345,12 @@ class RedisCache(_SingleFlightCache):
         )
 
     async def close(self) -> None:
-        client = self._client
-        if client is None:
-            return
-        await client.aclose()
-        self._client = None
+        await self._runtime().close()
 
-    def _redis_client(self) -> Any:
-        if self._client is None:
-            try:
-                redis_module = importlib.import_module("redis.asyncio")
-            except ImportError as exc:
-                raise ConfigurationError(
-                    "Redis cache backend requires the optional cache dependency. "
-                    "Install wybra[cache]."
-                ) from exc
-            self._client = redis_module.Redis.from_url(self.url, decode_responses=False)
-        return self._client
+    def _runtime(self) -> RedisCacheRuntime:
+        if self._runtime_owner is None:
+            raise ConfigurationError("Redis cache runtime is not configured.")
+        return self._runtime_owner
 
 
 def _cache_key(owner: str, key: str) -> str:

@@ -14,6 +14,7 @@ from wybra.events._core import (
     POST_SETUP,
     RESOLVED,
     SETUP,
+    SETUP_FINALISATION,
     SHUTDOWN,
     STARTUP,
     UNAVAILABLE,
@@ -38,6 +39,16 @@ class ModulePostSetupEvent(Event):
     """An observation of a configured module's ``post_setup_site`` hook."""
 
     kind: ClassVar[EventSegment] = POST_SETUP
+    module: str
+    outcome: str
+    error_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ModuleSetupFinalisationEvent(Event):
+    """An observation of a module's deferred setup finalisation."""
+
+    kind: ClassVar[EventSegment] = SETUP_FINALISATION
     module: str
     outcome: str
     error_type: str | None = None
@@ -142,8 +153,11 @@ def module_hook_event(
     attribute = call.arguments["attribute"]
     if not isinstance(module_name, str) or not isinstance(attribute, str):
         raise TypeError("Module hook events require a module and hook name.")
-    event_type = ModuleSetupEvent if attribute == "setup_site" else ModulePostSetupEvent
-    topic_segment = SETUP if event_type is ModuleSetupEvent else POST_SETUP
+    event_type, topic_segment = {
+        "setup_site": (ModuleSetupEvent, SETUP),
+        "setup_finalisation": (ModuleSetupFinalisationEvent, SETUP_FINALISATION),
+        "post_setup_site": (ModulePostSetupEvent, POST_SETUP),
+    }.get(attribute, (ModulePostSetupEvent, POST_SETUP))
     if outcome is None:
         return event_type(
             topic=EVT_SITE(MODULE, topic_segment),
@@ -159,6 +173,9 @@ def module_hook_event(
 
 
 __all__ = (
+    "ModulePostSetupEvent",
+    "ModuleSetupEvent",
+    "ModuleSetupFinalisationEvent",
     "capability_provided_event",
     "capability_resolution_event",
     "module_hook_event",

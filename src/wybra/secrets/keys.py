@@ -4,6 +4,8 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Final
 
+from wybra.cache.config import module_config as cache_module_config
+from wybra.cache.settings import CachesSettings
 from wybra.config import ConfigService, CredentialReference, MappingConfigSource
 from wybra.core.exceptions import ConfigurationError
 from wybra.db.config import module_config as database_module_config
@@ -141,6 +143,7 @@ def configured_credential_references(
     keys.extend(_configured_forms_keys(raw_config))
     keys.extend(_configured_provider_keys(raw_config))
     keys.extend(_configured_database_keys(raw_config, project_root=project_root))
+    keys.extend(_configured_cache_keys(raw_config))
     return _deduplicate_keys(keys)
 
 
@@ -219,6 +222,18 @@ def _configured_database_keys(
     if effective is None:
         return ()
     return effective.credential_references()
+
+
+def _configured_cache_keys(
+    raw_config: Mapping[str, Mapping[str, Any]],
+) -> Iterable[CredentialReference]:
+    config = ConfigService(
+        [MappingConfigSource(raw_config)],
+        config_defs=(cache_module_config,),
+        discover_module_config=False,
+    )
+    settings = CachesSettings.load_settings(config)
+    return settings.credential_references()
 
 
 def builtin_keychain_secret_key(name: str, *, development: bool = False) -> str:

@@ -809,6 +809,7 @@ ITEM: Final = event_segment("item")
 BULK: Final = event_segment("bulk")
 SETUP: Final = event_segment("setup")
 POST_SETUP: Final = event_segment("post_setup")
+SETUP_FINALISATION: Final = event_segment("setup_finalisation")
 STARTUP: Final = event_segment("startup")
 SHUTDOWN: Final = event_segment("shutdown")
 STARTED: Final = event_segment("started")
@@ -958,6 +959,7 @@ __all__ = (
     "ROUTE",
     "SETUP",
     "POST_SETUP",
+    "SETUP_FINALISATION",
     "STARTUP",
     "SHUTDOWN",
     "PERSISTENCE",

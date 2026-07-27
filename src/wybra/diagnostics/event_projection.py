@@ -17,6 +17,7 @@ from wybra.events import (
 
 _EVENT_ATTRIBUTE_NAMES: Final = {
     "ModuleSetupEvent": ("module", "outcome", "error_type"),
+    "ModuleSetupFinalisationEvent": ("module", "outcome", "error_type"),
     "ModulePostSetupEvent": ("module", "outcome", "error_type"),
     "RequestStartedEvent": ("method",),
     "RequestCompletedEvent": (

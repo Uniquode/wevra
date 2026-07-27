@@ -55,17 +55,24 @@ Use an isolated cache when queued alerts need a separate backend or partition:
 
 ```toml
 [cache.messages]
-backend = "memory"
+backend = "redis"
+url = "redis://localhost:6379/2"
+features = ["atomic"]
 
 [wybra.messages]
 storage_backend = "cache"
 cache_name = "messages"
 ```
 
+For a credentialed production Redis endpoint, keep connection material out of
+this configuration and use the secure Redis URL and credential sources in
+[`CACHE.md`](CACHE.md#redis-connection-secrets).
+
 Startup fails before serving requests when the cache module is absent, the
 selected name is missing, or the selected backend does not provide
-`AtomicCacheCapability`. The in-memory provider supports this feature. The
-current named Redis provider does not yet provide advanced atomic features.
+`AtomicCacheCapability`. Both memory and Redis support this feature. Redis
+provides shared, restart-safe atomic queue updates for horizontally scaled
+application instances.
 
 The legacy `cache_url` setting remains temporarily available for direct memory
 or Redis storage, but it is deprecated and cannot be combined with
@@ -77,15 +84,13 @@ storage_backend = "cache"
 cache_url = "redis://localhost:6379/0"
 ```
 
-When the selected named-cache backend provides `AtomicCacheCapability`, move the
-URL into `[cache]` or a named `[cache.<name>]` section and select that cache with
-`cache_name`. Redis deployments must retain the deprecated `cache_url` until
-the named Redis provider supplies atomic features. The legacy Redis path retains
-whole-queue acknowledgement, so alerts appended concurrently with
-acknowledgement can be removed before they are displayed. The named-cache owner
-namespace also changes the physical keys used for queued alerts, so pending
-alerts stored through the legacy URL are not migrated and may be cleared during
-the changeover.
+Move the URL into `[cache]` or a named `[cache.<name>]` section and select that
+cache with `cache_name`. The legacy Redis path retains whole-queue
+acknowledgement, so alerts appended concurrently with acknowledgement can be
+removed before they are displayed. The named-cache namespace also changes the
+physical keys used for queued alerts, so pending alerts stored through the
+legacy URL are not migrated. Drain or accept the expiry of pending alerts
+before removing `cache_url`.
 
 Database storage stores alerts in Wybra-managed persistence. Configure
 `wybra.db` and run migrations before using it.
@@ -108,6 +113,12 @@ message_ttl_seconds = 86400
 `queue_depth` limits stored alerts per request queue. When the queue exceeds
 that depth, the oldest alerts are discarded. `message_ttl_seconds` controls how
 long cache and database alerts remain eligible for display.
+
+For cache storage with Wybra-managed sessions, the queue expires no later than
+the session that owns it. A request that modifies and renews its session uses
+the prospective renewed expiry; acknowledgement preserves the same bound for
+any concurrently queued alerts. Other compatible session mappings use the
+configured message TTL.
 
 Named cache storage keeps one queue in an atomic cache value. Configuration
 fails when the worst-case serialised queue could exceed the cache feature's
