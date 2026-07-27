@@ -1241,6 +1241,37 @@ class TestModuleLifecycle:
         ]
 
     @pytest.mark.anyio
+    async def test_start_accepts_async_callable_deferred_setup_finaliser(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.syspath_prepend(str(tmp_path))
+        _write_module(tmp_path, "async_callable_finaliser_recorder", "calls = []\n")
+        _write_module(
+            tmp_path,
+            "async_callable_finaliser_module",
+            "from async_callable_finaliser_recorder import calls\n"
+            "class Finaliser:\n"
+            "    async def __call__(self):\n"
+            '        calls.append("finalise")\n'
+            "async def setup_site(site):\n"
+            '    calls.append("setup")\n'
+            "    site.defer_setup_finalisation(Finaliser())\n",
+        )
+
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {"app": {"modules": ("async_callable_finaliser_module",)}}
+            ),
+        )
+
+        from async_callable_finaliser_recorder import calls
+
+        assert calls == ["setup", "finalise"]
+
+    @pytest.mark.anyio
     async def test_start_attributes_deferred_setup_finalisation_failure(
         self,
         tmp_path: Path,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -103,8 +104,8 @@ class Site:
         init=False,
         repr=False,
     )
-    _setup_finalisers: list[_DeferredSetupFinaliser] = field(
-        default_factory=list,
+    _setup_finalisers: deque[_DeferredSetupFinaliser] = field(
+        default_factory=deque,
         init=False,
         repr=False,
     )
@@ -144,8 +145,11 @@ class Site:
         self._pending_capability_events.append(capability_type)
 
     def defer_setup_finalisation(self, finaliser: SiteSetupFinaliser) -> None:
-        """Run an asynchronous finaliser after every module setup hook."""
-        if not callable(finaliser) or not iscoroutinefunction(finaliser):
+        """Run an asynchronous finaliser after all module setup hooks."""
+        if not callable(finaliser) or not (
+            iscoroutinefunction(finaliser)
+            or iscoroutinefunction(type(finaliser).__call__)
+        ):
             raise SiteCapabilityError(
                 structured_error(
                     "Deferred setup finaliser is invalid",
@@ -162,7 +166,7 @@ class Site:
 
     async def _finalise_deferred_setup(self) -> None:
         while self._setup_finalisers:
-            deferred = self._setup_finalisers.pop(0)
+            deferred = self._setup_finalisers.popleft()
 
             async def run_finaliser(
                 _site: Site,
