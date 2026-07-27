@@ -18,7 +18,7 @@ from wybra.auth.models import (
     IdentityTotpRecoveryCode,
     User,
 )
-from wybra.config import CredentialReference
+from wybra.config import ConfigService, CredentialReference
 from wybra.db.persistence import close_database, create_database
 from wybra.forms import CSRF_TOKEN_SECRET_KEY_CURRENT, CSRF_TOKEN_SECRET_KEY_PREVIOUS
 from wybra.secrets.keys import (
@@ -163,6 +163,54 @@ credential_source = "keychain"
 [secrets.keychain]
 appname = "uniquode.io"
 username = "deployment"
+""".strip(),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _cache_keychain_config(path: Path) -> Path:
+    path.write_text(
+        """
+[app]
+modules = ["wybra.secrets", "wybra.cache"]
+
+[secrets.keychain]
+appname = "uniquode.io"
+username = "deployment"
+
+[cache]
+backend = "redis"
+url_source = "keychain"
+
+[cache.session]
+backend = "redis"
+url = "rediss://cache.internal/1"
+credentials_source = "keychain"
+
+[cache.tasks]
+backend = "redis"
+url_source = "keychain"
+url_key = "cache/tasks/redis/connection-url"
+""".strip(),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _cache_environment_url_config(path: Path) -> Path:
+    path.write_text(
+        """
+[app]
+modules = ["wybra.secrets", "wybra.cache"]
+
+[secrets.keychain]
+appname = "uniquode.io"
+username = "deployment"
+
+[cache]
+backend = "redis"
+credentials_source = "keychain"
 """.strip(),
         encoding="utf-8",
     )
@@ -670,6 +718,60 @@ def test_list_includes_configured_database_keychain_references(
     )
     assert "app_user" not in result.output
     assert "service_user" not in result.output
+
+
+def test_list_includes_configured_cache_keychain_references(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    keyring = FakeKeyring(
+        {
+            ("uniquode.io", "cache/redis/url"): "redis://default",
+            ("uniquode.io", "cache/redis/credentials"): "user:password",
+            (
+                "uniquode.io",
+                "cache/tasks/redis/connection-url",
+            ): "redis://tasks",
+        }
+    )
+    _install_fake_keyring(monkeypatch, keyring)
+    config_path = _cache_keychain_config(tmp_path / "app.toml")
+
+    result = CliRunner().invoke(
+        secret_cli.secret_command,
+        ["--config", config_path.as_posix(), "list", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    records = json.loads(result.output)["keys"]
+    assert records["cache-url"]["key"] == "cache/redis/url"
+    assert records["cache-url"]["exists"] is True
+    assert records["cache-session-credentials"]["key"] == "cache/redis/credentials"
+    assert records["cache-session-credentials"]["exists"] is True
+    assert records["cache-tasks-url"]["key"] == "cache/tasks/redis/connection-url"
+    assert records["cache-tasks-url"]["exists"] is True
+
+
+def test_list_applies_environment_redis_url_for_cache_credentials(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    keyring = FakeKeyring({("uniquode.io", "cache/redis/credentials"): "user:password"})
+    _install_fake_keyring(monkeypatch, keyring)
+    ConfigService.set_runtime_environment(
+        {"WYBRA_CACHE_URL": "rediss://cache.internal/0"}
+    )
+    config_path = _cache_environment_url_config(tmp_path / "app.toml")
+
+    result = CliRunner().invoke(
+        secret_cli.secret_command,
+        ["--config", config_path.as_posix(), "list", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    records = json.loads(result.output)["keys"]
+    assert records["cache-credentials"]["key"] == "cache/redis/credentials"
+    assert records["cache-credentials"]["exists"] is True
 
 
 def test_list_excludes_crypto_keys_for_non_keychain_config(

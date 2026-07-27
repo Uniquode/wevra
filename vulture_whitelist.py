@@ -197,6 +197,7 @@ _.crypt_refresh_token
 _.crypt_secret
 _.last_used_counter
 _.status
+_.health
 _.activated_at
 _.disabled_at
 _.totp_credentials

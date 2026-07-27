@@ -49,6 +49,12 @@ class SessionMiddlewareContext:
             "load",
             "invalid" if session.invalid_cookie else "succeeded",
         )
+        if not session.invalid_cookie:
+            session.prospective_expires_at = (
+                now + self.settings.resolved_lifetime_seconds
+            )
+            if session.session_id is None:
+                session.expires_at = session.prospective_expires_at
         return session
 
     async def cleanup_expired(self, *, now: float) -> None:

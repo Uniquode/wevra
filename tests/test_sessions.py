@@ -940,6 +940,27 @@ async def test_session_finalisation_skips_unchanged_sessions() -> None:
 
 
 @pytest.mark.anyio
+async def test_new_request_session_has_a_prospective_expiry() -> None:
+    context = SessionMiddlewareContext(
+        settings=_settings({"lifetime_seconds": 60}),
+        storage=MemorySessionStorage(payload_max_bytes=1024),
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+        }
+    )
+
+    session = await context.load_session(request, now=100.0)
+
+    assert session.expires_at == 160.0
+    assert session.prospective_expires_at == 160.0
+
+
+@pytest.mark.anyio
 async def test_session_lifecycle_events_exclude_session_data_and_identifiers() -> None:
     observed: list[Event] = []
 

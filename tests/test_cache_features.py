@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +44,8 @@ from wybra.cache import (
     WorkQueueCacheCapability,
     build_caches,
 )
+from wybra.cache.redis_atomic import RedisAtomicCache
+from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.core.exceptions import ConfigurationError
 
 
@@ -224,6 +227,204 @@ async def test_default_memory_backend_advertises_process_local_features() -> Non
         for metadata in instance.feature_metadata
     )
     assert caches.diagnostics()[0].features == instance.features
+
+
+@pytest.mark.anyio
+async def test_explicit_empty_feature_selection_advertises_baseline_only() -> None:
+    settings = CachesSettings(
+        instances=(CacheSettings(features=()),),
+    )
+
+    caches = await build_caches(settings)
+
+    assert caches.require("default").features == ()
+    assert caches.require("default").optional(AtomicCacheCapability) is None
+    await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_registers_selected_shared_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = SimpleNamespace()
+
+    async def ping() -> bool:
+        return True
+
+    async def close() -> None:
+        return None
+
+    async def config_get(*_keys: str) -> dict[str, str]:
+        return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+    async def eval(*_args: object) -> list[bytes]:
+        return [b"1", b"1", b"1"]
+
+    async def hmget(*_args: object) -> list[None]:
+        return [None, None, None]
+
+    client.ping = ping
+    client.aclose = close
+    client.config_get = config_get
+    client.eval = eval
+    client.hmget = hmget
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    settings = CachesSettings(
+        instances=(
+            CacheSettings(
+                backend="redis",
+                url="redis://secret@cache/0",
+                features=("lease",),
+            ),
+        )
+    )
+
+    caches = await build_caches(settings)
+    instance = caches.require("default")
+
+    assert instance.features == ("lease",)
+    assert instance.optional(AtomicCacheCapability) is None
+    lease = instance.require(LeaseCacheCapability)
+    assert lease is not None
+    assert instance.feature_metadata[0].guarantees.scope == "shared"
+    assert instance.feature_metadata[0].guarantees.durable
+    assert instance.feature_metadata[0].guarantees.restart_recovery
+    assert instance.feature_metadata[0].guarantees.horizontal_consumers
+    assert "secret" not in repr(caches.diagnostics())
+    assert caches.diagnostics()[0].health == "ready"
+    await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_feature_failure_does_not_expose_provider_detail(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailingClient:
+        async def hmget(self, *_args: object) -> None:
+            raise RuntimeError("redis://user:secret@cache raw-key stored-value")
+
+    client = FailingClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    runtime = RedisCacheRuntime("redis://user:secret@cache", "safe")
+
+    with pytest.raises(CacheFeatureError) as raised:
+        await RedisAtomicCache(runtime).get("owner", "key")
+
+    rendered = repr(raised.value)
+    assert "secret" not in rendered
+    assert "raw-key" not in rendered
+    assert "stored-value" not in rendered
+    assert raised.value.__cause__ is None
+    assert "secret" not in caplog.text
+    assert "raw-key" not in caplog.text
+    assert "stored-value" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_redis_feature_rejects_malformed_script_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedClient:
+        async def eval(self, *_args: object) -> list[int]:
+            return [1]
+
+    client = MalformedClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+
+    with pytest.raises(CacheFeatureError, match="invalid state"):
+        await RedisAtomicCache(runtime).create("owner", "key", b"value", ttl=60)
+
+
+@pytest.mark.anyio
+async def test_redis_advanced_features_reject_allkeys_eviction_policy() -> None:
+    class UnsafeClient:
+        async def config_get(self, *_keys: str) -> dict[bytes, bytes]:
+            return {
+                b"appendonly": b"yes",
+                b"maxmemory-policy": b"allkeys-lru",
+            }
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = UnsafeClient()
+
+    with pytest.raises(ConfigurationError, match="non-allkeys eviction policy"):
+        await runtime.validate_features(frozenset({"atomic"}))
+
+
+@pytest.mark.anyio
+async def test_redis_advanced_features_warn_when_configuration_is_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RestrictedClient:
+        async def config_get(self, *_keys: str) -> None:
+            raise RuntimeError("CONFIG command is disabled")
+
+        async def eval(self, *_args: object) -> list[bytes]:
+            return [b"1", b"1", b"1"]
+
+        async def hmget(self, *_args: object) -> list[None]:
+            return [None, None, None]
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = RestrictedClient()
+
+    await runtime.validate_features(frozenset({"atomic"}))
+
+    assert "could not be inspected" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_redis_advanced_features_reject_missing_atomic_read_permission() -> None:
+    class RestrictedClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, *_args: object) -> list[bytes]:
+            return [b"1", b"1", b"1"]
+
+        async def hmget(self, *_args: object) -> None:
+            raise PermissionError("HMGET is denied")
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = RestrictedClient()
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await runtime.validate_features(frozenset({"atomic"}))
+
+
+@pytest.mark.anyio
+async def test_redis_lease_readiness_does_not_require_atomic_read_permission() -> None:
+    class LeaseClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, *_args: object) -> list[bytes]:
+            return [b"1", b"1", b"1"]
+
+        async def hmget(self, *_args: object) -> None:
+            raise AssertionError("Lease readiness must not use HMGET.")
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = LeaseClient()
+
+    await runtime.validate_features(frozenset({"lease"}))
 
 
 @pytest.mark.anyio

@@ -63,6 +63,7 @@ from wybra.sessions import (
     DatabaseSessionStorage as DatabaseRequestSessionStorage,
 )
 from wybra.sessions import (
+    RequestSession,
     SessionCleanupRegistry,
     SessionRecord,
     create_session_id,
@@ -554,6 +555,137 @@ async def test_named_cache_acknowledgement_preserves_concurrent_append() -> None
 
 
 @pytest.mark.anyio
+async def test_cache_messages_expire_no_later_than_the_request_session() -> None:
+    settings = _settings({"storage_backend": "cache", "message_ttl_seconds": 60})
+    observed_ttls: list[float] = []
+
+    class RecordingBackend:
+        async def append(
+            self,
+            queue_key: str,
+            payload: dict[str, object],
+            *,
+            queue_depth: int,
+            ttl_seconds: float,
+        ) -> None:
+            del queue_key, payload, queue_depth
+            observed_ttls.append(ttl_seconds)
+
+    storage = CacheMessagesStorage(settings, RecordingBackend())
+    request = _request()
+    request.scope["session"] = RequestSession(expires_at=110.0)
+    await storage.enqueue(
+        request,
+        AlertRecord(
+            severity=SUCCESS_ALERT,
+            message="Expires with the session",
+            created_at=100.0,
+        ),
+    )
+
+    assert observed_ttls == [10.0]
+
+
+@pytest.mark.anyio
+async def test_cache_messages_use_a_renewed_session_expiry() -> None:
+    settings = _settings({"storage_backend": "cache", "message_ttl_seconds": 60})
+    observed_ttls: list[float] = []
+
+    class RecordingBackend:
+        async def append(
+            self,
+            queue_key: str,
+            payload: dict[str, object],
+            *,
+            queue_depth: int,
+            ttl_seconds: float,
+        ) -> None:
+            del queue_key, payload, queue_depth
+            observed_ttls.append(ttl_seconds)
+
+    storage = CacheMessagesStorage(settings, RecordingBackend())
+    request = _request()
+    request.scope["session"] = RequestSession(
+        expires_at=101.0,
+        prospective_expires_at=160.0,
+    )
+    await storage.enqueue(
+        request,
+        AlertRecord(
+            severity=SUCCESS_ALERT,
+            message="Renewed session",
+            created_at=100.0,
+        ),
+    )
+
+    assert observed_ttls == [60.0]
+
+
+@pytest.mark.anyio
+async def test_cache_acknowledgement_preserves_session_queue_expiry() -> None:
+    settings = _settings({"storage_backend": "cache", "message_ttl_seconds": 60})
+    observed_ttls: list[float | None] = []
+
+    class RecordingBackend:
+        async def peek(self, queue_key: str) -> tuple[dict[str, object], ...]:
+            del queue_key
+            return ()
+
+        async def acknowledge(
+            self,
+            queue_key: str,
+            *,
+            observed: tuple[dict[str, object], ...] | None = None,
+            ttl_seconds: float | None = None,
+        ) -> None:
+            del queue_key, observed
+            observed_ttls.append(ttl_seconds)
+
+    storage = CacheMessagesStorage(settings, RecordingBackend())
+    request = _request(
+        RequestSession(
+            data={SESSION_QUEUE_ID_KEY: "queue"},
+            expires_at=110.0,
+        )
+    )
+    await storage.acknowledge(request, now=100.0)
+
+    assert observed_ttls == [10.0]
+
+
+@pytest.mark.anyio
+async def test_cache_messages_expire_promptly_for_an_expired_session() -> None:
+    settings = _settings({"storage_backend": "cache", "message_ttl_seconds": 60})
+    observed_ttls: list[float] = []
+
+    class RecordingBackend:
+        async def append(
+            self,
+            queue_key: str,
+            payload: dict[str, object],
+            *,
+            queue_depth: int,
+            ttl_seconds: float,
+        ) -> None:
+            del queue_key, payload, queue_depth
+            observed_ttls.append(ttl_seconds)
+
+    storage = CacheMessagesStorage(settings, RecordingBackend())
+    request = _request()
+    request.scope["session"] = RequestSession(expires_at=100.0)
+    await storage.enqueue(
+        request,
+        AlertRecord(
+            severity=SUCCESS_ALERT,
+            message="Expired session",
+            created_at=100.0,
+        ),
+    )
+
+    assert observed_ttls == [1.0]
+
+
+@pytest.mark.anyio
 async def test_cache_acknowledgement_snapshots_before_removing_alerts() -> None:
     settings = _settings({"storage_backend": "cache"})
     atomic_backend = NamedCacheQueueBackend(InMemoryAtomicCache())
@@ -688,8 +820,8 @@ async def test_named_cache_messages_reject_cache_without_atomic_feature() -> Non
                 {
                     "app": {"modules": ("wybra.cache", "wybra.messages")},
                     "cache": {
-                        "backend": "redis",
-                        "url": "redis://cache.example/0",
+                        "backend": "memory",
+                        "features": [],
                     },
                     "wybra.messages": {"storage_backend": "cache"},
                 }

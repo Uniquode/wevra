@@ -70,30 +70,63 @@ async def assert_atomic_conformance(
     assert sorted(counter.value for counter in counters) == list(range(1, 9))
     assert len({counter.revision for counter in counters}) == 8
 
+    typed_value = await feature.create(owner, "typed-value", b"value", ttl=30)
+    assert typed_value is not None
+    with pytest.raises(CacheConflictError):
+        await feature.increment(owner, "typed-value", ttl=30)
+
+    typed_counter = await feature.increment(owner, "typed-counter", ttl=30)
+    with pytest.raises(CacheConflictError):
+        await feature.get(owner, "typed-counter")
+    with pytest.raises(CacheConflictError):
+        await feature.compare_and_swap(
+            owner,
+            "typed-counter",
+            typed_counter.revision,
+            b"value",
+            ttl=30,
+        )
+    with pytest.raises(CacheConflictError):
+        await feature.compare_and_delete(
+            owner,
+            "typed-counter",
+            typed_counter.revision,
+        )
+
 
 async def assert_lease_conformance(
     feature: LeaseCacheCapability,
     advance: AdvanceClock,
     *,
     owner: str = "conformance-lease",
+    lease_ttl: float = 5,
+    renewed_ttl: float = 10,
 ) -> None:
-    first = await feature.acquire(owner, "resource", "holder-1", ttl=5)
+    first = await feature.acquire(owner, "resource", "holder-1", ttl=lease_ttl)
     assert first is not None
-    assert await feature.acquire(owner, "resource", "holder-2", ttl=5) is None
+    assert (
+        await feature.acquire(
+            owner,
+            "resource",
+            "holder-2",
+            ttl=lease_ttl,
+        )
+        is None
+    )
 
-    renewed = await feature.renew(first, ttl=10)
+    renewed = await feature.renew(first, ttl=renewed_ttl)
     await feature.release(renewed)
     with pytest.raises(CacheConflictError):
         await feature.release(renewed)
 
-    second = await feature.acquire(owner, "resource", "holder-2", ttl=5)
+    second = await feature.acquire(owner, "resource", "holder-2", ttl=lease_ttl)
     assert second is not None
     assert second.fencing_token > first.fencing_token
     with pytest.raises(CacheConflictError):
-        await feature.renew(first, ttl=5)
+        await feature.renew(first, ttl=lease_ttl)
 
-    await advance(5)
-    third = await feature.acquire(owner, "resource", "holder-3", ttl=5)
+    await advance(lease_ttl)
+    third = await feature.acquire(owner, "resource", "holder-3", ttl=lease_ttl)
     assert third is not None
     assert third.fencing_token > second.fencing_token
     with pytest.raises(CacheConflictError):

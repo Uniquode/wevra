@@ -70,6 +70,7 @@ from wybra.events.site import (
     CapabilityUnavailableEvent,
     ModulePostSetupEvent,
     ModuleSetupEvent,
+    ModuleSetupFinalisationEvent,
     SiteLifecycleEvent,
 )
 from wybra.events.template import TemplateRenderCompletedEvent
@@ -1444,7 +1445,12 @@ class TestEventsSiteIntegration:
             dispatcher = site.require_capability(EventsCapability)
 
             async def handler(event: Event) -> None:
-                if not isinstance(event, ModuleSetupEvent | ModulePostSetupEvent):
+                if not isinstance(
+                    event,
+                    ModuleSetupEvent
+                    | ModuleSetupFinalisationEvent
+                    | ModulePostSetupEvent,
+                ):
                     return
                 observed.append(
                     (
@@ -1457,8 +1463,11 @@ class TestEventsSiteIntegration:
 
             await dispatcher.subscribe(EVT_SITE, handler)
 
-        async def setup_subject(_site: Site) -> None:
-            return None
+        async def setup_subject(site: Site) -> None:
+            async def finalise() -> None:
+                return None
+
+            site.defer_setup_finalisation(finalise)
 
         async def post_setup_subject(_site: Site) -> None:
             return None
@@ -1505,6 +1514,18 @@ class TestEventsSiteIntegration:
             (
                 "site.module.setup",
                 "ModuleSetupEvent",
+                subject_module.__name__,
+                "succeeded",
+            ),
+            (
+                "site.module.setup_finalisation",
+                "ModuleSetupFinalisationEvent",
+                subject_module.__name__,
+                "started",
+            ),
+            (
+                "site.module.setup_finalisation",
+                "ModuleSetupFinalisationEvent",
                 subject_module.__name__,
                 "succeeded",
             ),

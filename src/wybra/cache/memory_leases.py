@@ -40,7 +40,7 @@ class _LeaseState:
 
 @dataclass(slots=True)
 class InMemoryLeaseCache:
-    clock: Clock = field(default=time.monotonic, repr=False)
+    clock: Clock = field(default=time.time, repr=False)
     max_leases: int = 10_000
     _leases: dict[LeaseKey, _LeaseState] = field(default_factory=dict, init=False)
     _next_fencing_token: int = field(default=0, init=False)

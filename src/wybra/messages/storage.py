@@ -34,6 +34,7 @@ from wybra.messages.exceptions import (
 from wybra.messages.models import MessageAlert
 from wybra.messages.records import AlertPayload, AlertRecord
 from wybra.messages.settings import MessagesSettings
+from wybra.sessions.state import RequestSession
 from wybra.site import Site, SiteCapabilityError, SiteCapabilityProxy
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ REQUEST_ALERTS_RENDERED_ATTRIBUTE = "wybra_messages_alerts_rendered"
 REQUEST_ALERTS_ACKNOWLEDGED_ATTRIBUTE = "wybra_messages_alerts_acknowledged"
 DEFAULT_ATOMIC_QUEUE_CONFLICT_ATTEMPTS = 8
 QUEUE_ENTRY_ID_KEY = "_wybra_queue_entry_id"
+EXPIRED_SESSION_QUEUE_TTL_SECONDS = 1.0
 WYBRA_WARNING_SKIP_PREFIXES = (str(Path(__file__).resolve().parents[1]),)
 
 
@@ -148,19 +150,25 @@ class CacheMessagesStorage:
     backend: CacheQueueBackend
 
     async def enqueue(self, request: Request, alert: AlertRecord) -> None:
+        queue_key = server_side_queue_key(
+            request,
+            prefix=self.settings.cache_key_prefix,
+        )
+        ttl_seconds = _queue_ttl_seconds(
+            request,
+            default_ttl_seconds=self.settings.resolved_message_ttl_seconds,
+            now=alert.created_at,
+        )
         payload = _stored_payload(
             alert,
-            alert.created_at + self.settings.resolved_message_ttl_seconds,
+            alert.created_at + ttl_seconds,
         )
         payload[QUEUE_ENTRY_ID_KEY] = uuid.uuid4().hex
         await self.backend.append(
-            server_side_queue_key(
-                request,
-                prefix=self.settings.cache_key_prefix,
-            ),
+            queue_key,
             payload,
             queue_depth=self.settings.resolved_queue_depth,
-            ttl_seconds=self.settings.resolved_message_ttl_seconds,
+            ttl_seconds=ttl_seconds,
         )
 
     async def peek(self, request: Request, *, now: float) -> tuple[AlertRecord, ...]:
@@ -202,7 +210,11 @@ class CacheMessagesStorage:
             await self.backend.acknowledge(
                 queue_key,
                 observed=observed,
-                ttl_seconds=self.settings.resolved_message_ttl_seconds,
+                ttl_seconds=_queue_ttl_seconds(
+                    request,
+                    default_ttl_seconds=self.settings.resolved_message_ttl_seconds,
+                    now=now,
+                ),
             )
             if hasattr(request.state, REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE):
                 delattr(request.state, REQUEST_PEEKED_CACHE_PAYLOADS_ATTRIBUTE)
@@ -794,6 +806,28 @@ def server_side_queue_key_from_session_data(
     if isinstance(value, str) and value.strip():
         return f"{prefix}{value.strip()}"
     return None
+
+
+def _queue_ttl_seconds(
+    request: Request,
+    *,
+    default_ttl_seconds: float,
+    now: float,
+) -> float:
+    session = request_session(request)
+    if not isinstance(session, RequestSession):
+        return float(default_ttl_seconds)
+    expires_at = (
+        session.prospective_expires_at
+        if session.modified and session.prospective_expires_at is not None
+        else session.expires_at
+    )
+    if isinstance(expires_at, bool) or not isinstance(expires_at, int | float):
+        return float(default_ttl_seconds)
+    remaining = float(expires_at) - now
+    if remaining <= 0:
+        return EXPIRED_SESSION_QUEUE_TTL_SECONDS
+    return min(float(default_ttl_seconds), remaining)
 
 
 def _stored_payload(alert: AlertRecord, expires_at: float) -> AlertPayload:

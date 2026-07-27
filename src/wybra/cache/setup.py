@@ -3,14 +3,33 @@ from __future__ import annotations
 from asyncio import CancelledError
 
 from wybra.cache.capabilities import CacheCapability
+from wybra.cache.redis_connection import resolve_redis_urls
 from wybra.cache.registry import CachesCapability, build_caches
 from wybra.cache.settings import CachesSettings
-from wybra.site import Site
+from wybra.services.secrets import SecretsCapability
+from wybra.site import Site, SiteCapabilityProxy
 
 
 async def setup_site(site: Site) -> None:
     settings = CachesSettings.load_settings(site.config)
-    caches = await build_caches(settings)
+    secrets = site.capability_proxy(SecretsCapability)
+
+    async def finalise_cache_setup() -> None:
+        await _finalise_cache_setup(site, settings, secrets)
+
+    site.defer_setup_finalisation(finalise_cache_setup)
+
+
+async def _finalise_cache_setup(
+    site: Site,
+    settings: CachesSettings,
+    secrets: SiteCapabilityProxy[SecretsCapability],
+) -> None:
+    secret_capability = None
+    if any(instance.requires_secret_resolution for instance in settings.instances):
+        secret_capability = await secrets.finalise_optional()
+    redis_urls = resolve_redis_urls(settings, secret_capability)
+    caches = await build_caches(settings, redis_urls=redis_urls)
     try:
         site.provide_capability(CacheCapability, caches.require("default").values)
         site.provide_capability(CachesCapability, caches)

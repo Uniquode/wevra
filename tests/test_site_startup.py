@@ -1187,6 +1187,90 @@ class TestModuleLifecycle:
         ]
 
     @pytest.mark.anyio
+    async def test_start_finalises_deferred_setup_after_all_module_setup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.syspath_prepend(str(tmp_path))
+        _write_module(tmp_path, "deferred_setup_recorder", "calls = []\n")
+        _write_module(
+            tmp_path,
+            "deferred_first_module",
+            "from deferred_setup_recorder import calls\n"
+            "async def setup_site(site):\n"
+            '    calls.append("first.setup")\n'
+            "    async def finalise():\n"
+            '        calls.append("first.finalise")\n'
+            "    site.defer_setup_finalisation(finalise)\n"
+            "async def post_setup_site(site):\n"
+            '    calls.append("first.post")\n',
+        )
+        _write_module(
+            tmp_path,
+            "deferred_second_module",
+            "from deferred_setup_recorder import calls\n"
+            "async def setup_site(site):\n"
+            '    calls.append("second.setup")\n'
+            "async def post_setup_site(site):\n"
+            '    calls.append("second.post")\n',
+        )
+
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {
+                        "modules": (
+                            "deferred_first_module",
+                            "deferred_second_module",
+                        )
+                    }
+                }
+            ),
+        )
+
+        from deferred_setup_recorder import calls
+
+        assert calls == [
+            "first.setup",
+            "second.setup",
+            "first.finalise",
+            "first.post",
+            "second.post",
+        ]
+
+    @pytest.mark.anyio
+    async def test_start_attributes_deferred_setup_finalisation_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.syspath_prepend(str(tmp_path))
+        _write_module(
+            tmp_path,
+            "failing_deferred_module",
+            "async def setup_site(site):\n"
+            "    async def finalise():\n"
+            "        raise RuntimeError('boom')\n"
+            "    site.defer_setup_finalisation(finalise)\n",
+        )
+
+        with pytest.raises(
+            SiteCapabilityError,
+            match=(
+                "module=failing_deferred_module.*attribute=setup_finalisation.*"
+                "error_type=RuntimeError"
+            ),
+        ):
+            await start(
+                FastAPI(),
+                config_source=MappingConfigSource(
+                    {"app": {"modules": ("failing_deferred_module",)}}
+                ),
+            )
+
+    @pytest.mark.anyio
     async def test_errors_module_registers_error_handling_capability(self) -> None:
         app = FastAPI()
 

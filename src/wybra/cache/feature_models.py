@@ -107,7 +107,7 @@ class LeaseToken:
 
     def __post_init__(self) -> None:
         validate_resource(self.owner, label="cache owner")
-        validate_resource(self.resource)
+        validate_resource(self.resource, label="lease resource")
         validate_resource(self.holder, label="lease holder")
         validate_finite(self.expires_at, label="lease expiry")
         validate_resource(self.token, label="lease token")

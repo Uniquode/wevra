@@ -82,6 +82,17 @@ MEMORY_SCHEDULE_FEATURE = CacheFeatureMetadata(
         scheduling=True,
     ),
 )
+MEMORY_CACHE_FEATURES = frozenset(
+    feature.name
+    for feature in (
+        MEMORY_ATOMIC_FEATURE,
+        MEMORY_LEASE_FEATURE,
+        MEMORY_WORK_QUEUE_FEATURE,
+        MEMORY_STREAM_FEATURE,
+        MEMORY_PUBSUB_FEATURE,
+        MEMORY_SCHEDULE_FEATURE,
+    )
+)
 
 
 @dataclass(slots=True)
@@ -172,6 +183,7 @@ class InMemoryCacheFeatures:
 
 __all__ = (
     "InMemoryCacheFeatures",
+    "MEMORY_CACHE_FEATURES",
     "MEMORY_ATOMIC_FEATURE",
     "MEMORY_LEASE_FEATURE",
     "MEMORY_PUBSUB_FEATURE",
