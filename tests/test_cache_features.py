@@ -41,10 +41,13 @@ from wybra.cache import (
     ScheduleCacheCapability,
     StreamCacheCapability,
     StreamPosition,
+    WorkDelivery,
+    WorkIdentity,
     WorkQueueCacheCapability,
     build_caches,
 )
 from wybra.cache.redis_atomic import RedisAtomicCache
+from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.core.exceptions import ConfigurationError
 
@@ -428,6 +431,117 @@ async def test_redis_lease_readiness_does_not_require_atomic_read_permission() -
 
 
 @pytest.mark.anyio
+async def test_redis_work_queue_readiness_requires_pending_permission() -> None:
+    calls: list[str] = []
+
+    class RestrictedClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, *_args: object) -> list[bytes]:
+            return [b"1", b"1"]
+
+        async def xgroup_create(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def xreadgroup(
+            self,
+            *_args: object,
+            **_kwargs: object,
+        ) -> list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]]:
+            return [(b"stream", [(b"1-0", {b"i": b"identity"})])]
+
+        async def xread(self, *_args: object, **_kwargs: object) -> list[object]:
+            calls.append("XREAD")
+            return []
+
+        async def xinfo_consumers(self, *_args: object) -> list[object]:
+            calls.append("XINFO CONSUMERS")
+            return []
+
+        async def xpending_range(self, *_args: object) -> None:
+            calls.append("XPENDING")
+            raise PermissionError("XPENDING is denied")
+
+        async def xgroup_destroy(self, *_args: object) -> None:
+            return None
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = RestrictedClient()
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await runtime.validate_features(frozenset({"work-queue"}))
+
+    assert calls == ["XREAD", "XINFO CONSUMERS", "XPENDING"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("denied_command", ["XINFO CONSUMERS", "XGROUP DELCONSUMER"])
+async def test_redis_work_queue_readiness_requires_consumer_cleanup_permissions(
+    denied_command: str,
+) -> None:
+    calls: list[str] = []
+
+    class RestrictedClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, *_args: object) -> list[bytes]:
+            return [b"1", b"1"]
+
+        async def xgroup_create(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def xreadgroup(
+            self,
+            *_args: object,
+            **_kwargs: object,
+        ) -> list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]]:
+            return [(b"stream", [(b"1-0", {b"i": b"identity"})])]
+
+        async def xread(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def xinfo_consumers(self, *_args: object) -> list[object]:
+            calls.append("XINFO CONSUMERS")
+            if denied_command == "XINFO CONSUMERS":
+                raise PermissionError(f"{denied_command} is denied")
+            return []
+
+        async def xpending_range(self, *_args: object) -> list[object]:
+            return []
+
+        async def execute_command(self, *_args: object) -> list[object]:
+            return []
+
+        async def xgroup_delconsumer(self, *_args: object) -> int:
+            calls.append("XGROUP DELCONSUMER")
+            if denied_command == "XGROUP DELCONSUMER":
+                raise PermissionError(f"{denied_command} is denied")
+            return 0
+
+        async def xrange(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def xgroup_destroy(self, *_args: object) -> None:
+            return None
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = RestrictedClient()
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await runtime.validate_features(frozenset({"work-queue"}))
+
+    assert calls[-1] == denied_command
+
+
+@pytest.mark.anyio
 async def test_memory_feature_lifecycle_closes_once() -> None:
     features = InMemoryCacheFeatures()
 
@@ -469,6 +583,53 @@ async def test_memory_features_pass_shared_conformance() -> None:
     await assert_stream_conformance(features.streams, retention_count=2)
     await assert_pubsub_conformance(features.pubsub)
     await assert_schedule_conformance(features.schedules, clock(), advance)
+
+
+def test_redis_duration_milliseconds_preserves_positive_submilliseconds() -> None:
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+
+    assert runtime.duration_milliseconds(0.0004, label="visibility timeout") == 1
+    assert (
+        runtime.duration_milliseconds(
+            0,
+            label="work delay",
+            allow_zero=True,
+        )
+        == 0
+    )
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_reject_preserves_positive_submilliseconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = RedisWorkQueue(RedisCacheRuntime("redis://cache", "safe"))
+    captured: dict[str, int] = {}
+
+    async def capture_settlement(
+        self: RedisWorkQueue,
+        delivery: WorkDelivery,
+        *,
+        action: str,
+        delay_milliseconds: int,
+    ) -> None:
+        del self, delivery
+        assert action == "reject"
+        captured["delay"] = delay_milliseconds
+
+    monkeypatch.setattr(RedisWorkQueue, "_settle", capture_settlement)
+    delivery = WorkDelivery(
+        queue="default",
+        identity=WorkIdentity("identity"),
+        payload=b"payload",
+        attempt=1,
+        visible_until=0,
+        receipt="receipt",
+    )
+
+    await queue.reject(delivery, delay=0.0004)
+
+    assert captured == {"delay": 1}
 
 
 async def _memory_backend() -> CacheBackend:

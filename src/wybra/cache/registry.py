@@ -382,10 +382,17 @@ async def _redis_backend(
             ) from startup_error
         raise
     cache = RedisCache.from_runtime(runtime)
+
+    async def close() -> None:
+        try:
+            await features.close()
+        finally:
+            await runtime.close()
+
     return CacheBackend(
         cache,
-        runtime.close,
-        lifecycle_owner=runtime,
+        close,
+        lifecycle_owner=features,
         features=features.registrations(),
     )
 

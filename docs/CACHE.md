@@ -325,7 +325,7 @@ features. Startup fails with installation guidance when `wybra[cache]` is not
 installed, or with a bounded diagnostic when Redis is unavailable.
 
 The baseline byte cache needs only a reachable Redis server when configured
-with `features = []`. Enabling `atomic` or `lease` additionally requires Redis
+with `features = []`. Enabling `atomic`, `lease`, or `work-queue` additionally requires Redis
 scripting, append-only persistence, and an eviction policy other than
 `allkeys-*`. Wybra checks those prerequisites at startup before advertising the
 features, because their revisions and fencing tokens must survive ordinary key
@@ -349,7 +349,7 @@ operation reports a safe cache error if the provider later becomes unavailable.
 | Baseline byte cache | Shared expiring values, isolated by named namespace |
 | Atomic values and counters | Shared atomic create, compare-and-swap, compare-and-delete, and increment with persistent revisions |
 | Leases and fencing | Shared renewable leases with opaque holder tokens and persistent monotonic fencing tokens |
-| Work queues | Not yet implemented |
+| Work queues | Shared Redis Streams consumer-group delivery with acknowledgement, visibility recovery, delayed retry, and bounded dead letters |
 | Streams | Not yet implemented |
 | Pub/sub | Not yet implemented |
 | Schedules | Not yet implemented |
@@ -369,6 +369,28 @@ including URLs, credentials, physical keys, values, scripts, or lease tokens.
 Wybra logs the failed operation and exception type for operator diagnostics.
 The underlying Redis service still owns persistence and availability; deploy
 and back it up according to the application's durability requirements.
+
+### Redis work queues
+
+The Redis `work-queue` feature provides durable, at-least-once delivery across
+application instances. Each logical owner and queue receives a namespaced Redis
+Stream and consumer group. Consumers acknowledge a delivery with its opaque
+receipt; an unacknowledged delivery becomes eligible for recovery after its
+visibility timeout. Rejection can defer retry durably, and terminal failures
+are retained in a bounded dead-letter stream.
+
+Delayed publication uses bounded, provider-private Redis Streams. One promoter
+per configured Redis cache runtime multiplexes active queue signals and writes
+due items to their work streams. Blocking reservers also maintain that promoter,
+so they promote delayed work promptly even when the publishing process exits.
+
+Task handlers and other consumers must be idempotent: a worker can complete an
+external side effect before it loses its delivery receipt, so exactly-once
+execution is not promised. Startup probes Redis Streams consumer groups,
+claims, scripts, sorted sets, and settlement operations; a server that lacks
+that command surface cannot advertise the feature. Durable stream replay, live
+pub/sub, scheduling, Taskiq adapters, and JetStream remain separate future
+work.
 
 ### Atomic values and leases
 
@@ -420,7 +442,7 @@ Changing a configured namespace has the same effect as selecting a fresh cache
 partition. Keep it stable after deployment unless intentional invalidation is
 required.
 
-### Work queues
+### Work queue API
 
 Work queues provide stable identities, explicit acknowledgement, visibility
 timeouts, delayed availability, bounded attempts, and dead-lettering:
@@ -458,6 +480,8 @@ again. Consumers must make externally visible effects idempotent. The returned
 identity does not imply exactly-once execution. Use `dead_letter()` when
 consumer policy determines that a delivery must not be retried; `reject()`
 retains the item for another attempt until its configured attempt boundary.
+`visible_until` is a Unix timestamp float. `dead_letters()` returns retained
+entries in their original dead-letter order, oldest first.
 
 ### Streams and pub/sub
 

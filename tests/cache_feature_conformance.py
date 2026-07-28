@@ -228,6 +228,30 @@ async def assert_work_queue_conformance(
     terminal_dead = await feature.dead_letters(owner, "terminal")
     assert [delivery.identity for delivery in terminal_dead] == [terminal_identity]
 
+    first_dead_identity = await feature.publish(owner, "dead-order", b"first")
+    first_dead = await feature.reserve(
+        owner,
+        "dead-order",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert first_dead is not None
+    await feature.dead_letter(first_dead)
+    second_dead_identity = await feature.publish(owner, "dead-order", b"second")
+    second_dead = await feature.reserve(
+        owner,
+        "dead-order",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert second_dead is not None
+    await feature.dead_letter(second_dead)
+    ordered_dead = await feature.dead_letters(owner, "dead-order")
+    assert [delivery.identity for delivery in ordered_dead] == [
+        first_dead_identity,
+        second_dead_identity,
+    ]
+
     exhausted_identity = await feature.publish(
         owner,
         "exhausted",

@@ -5,12 +5,14 @@ import importlib
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from math import ceil
 from typing import Any, TypeVar
 from urllib.parse import quote
 from uuid import uuid4
 
 from wybra.cache.feature_models import (
     CacheFeatureError,
+    validate_non_negative_finite,
     validate_positive_finite,
     validate_resource,
 )
@@ -20,7 +22,7 @@ ResultT = TypeVar("ResultT")
 logger = logging.getLogger(__name__)
 MAX_REDIS_TTL_MILLISECONDS = 2**62
 
-_ADVANCED_FEATURES = frozenset({"atomic", "lease"})
+_ADVANCED_FEATURES = frozenset({"atomic", "lease", "work-queue"})
 _ATOMIC_READINESS_SCRIPT = """
 if redis.call('exists', KEYS[1]) ~= 0 then
     return {0}
@@ -45,6 +47,37 @@ local sequence_value = redis.call('get', KEYS[2])
 local now = redis.call('time')
 redis.call('del', KEYS[1], KEYS[2])
 return {sequence, sequence_value, now[1]}
+"""
+_WORK_QUEUE_PUBLISH_READINESS_SCRIPT = """
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+redis.call('hset', KEYS[3], ARGV[1], 'payload')
+redis.call('hset', KEYS[4], ARGV[1], 1)
+redis.call('hset', KEYS[5], ARGV[1], 0)
+redis.call('hget', KEYS[3], ARGV[1])
+redis.call('hincrby', KEYS[5], ARGV[1], 1)
+redis.call('zadd', KEYS[2], milliseconds, ARGV[1])
+redis.call('zscore', KEYS[2], ARGV[1])
+redis.call('zrange', KEYS[2], 0, 0, 'WITHSCORES')
+local identities = redis.call('zrangebyscore', KEYS[2], '-inf', milliseconds)
+for _, identity in ipairs(identities) do
+    redis.call('xadd', KEYS[1], '*', 'i', identity)
+    redis.call('zrem', KEYS[2], identity)
+end
+for index = 1, #KEYS do
+    redis.call('pexpire', KEYS[index], ARGV[2])
+end
+return {milliseconds, #identities}
+"""
+_WORK_QUEUE_SETTLE_READINESS_SCRIPT = """
+redis.call('xack', KEYS[1], ARGV[1], ARGV[2])
+redis.call('xdel', KEYS[1], ARGV[2])
+redis.call('hdel', KEYS[2], ARGV[3])
+redis.call('hdel', KEYS[3], ARGV[3])
+redis.call('hdel', KEYS[4], ARGV[3])
+redis.call('hdel', KEYS[5], ARGV[2])
+redis.call('zrem', KEYS[6], ARGV[2])
+return 1
 """
 
 
@@ -123,6 +156,94 @@ class RedisCacheRuntime:
                     1_000,
                 )
                 _validate_readiness_result(result)
+            if "work-queue" in features:
+                queue_key = self.key("readiness", "cache", f"queue-{suffix}")
+                delayed_key = self.key("readiness", "cache", f"queue-delay-{suffix}")
+                payload_key = self.key("readiness", "cache", f"queue-payload-{suffix}")
+                maximum_key = self.key("readiness", "cache", f"queue-maximum-{suffix}")
+                attempt_key = self.key("readiness", "cache", f"queue-attempt-{suffix}")
+                receipt_key = self.key("readiness", "cache", f"queue-receipt-{suffix}")
+                visible_key = self.key("readiness", "cache", f"queue-visible-{suffix}")
+                dead_letter_key = self.key("readiness", "cache", f"queue-dead-{suffix}")
+                recovery_key = self.key(
+                    "readiness",
+                    "cache",
+                    f"queue-recovery-{suffix}",
+                )
+                group = f"wybra-readiness-{suffix}"
+                queue_keys = (
+                    queue_key,
+                    delayed_key,
+                    payload_key,
+                    maximum_key,
+                    attempt_key,
+                    receipt_key,
+                    visible_key,
+                    dead_letter_key,
+                    recovery_key,
+                )
+                try:
+                    result = await client.eval(
+                        _WORK_QUEUE_PUBLISH_READINESS_SCRIPT,
+                        5,
+                        queue_key,
+                        delayed_key,
+                        payload_key,
+                        maximum_key,
+                        attempt_key,
+                        suffix,
+                        300_000,
+                    )
+                    _validate_work_queue_readiness_result(result)
+                    await client.xgroup_create(queue_key, group, id="0-0")
+                    records = await client.xreadgroup(
+                        group,
+                        "readiness",
+                        {queue_key: ">"},
+                        count=1,
+                    )
+                    entry_id = _readiness_entry_id(records)
+                    await client.xread({queue_key: "$"}, count=1, block=1)
+                    await client.xinfo_consumers(queue_key, group)
+                    await client.xpending_range(
+                        queue_key,
+                        group,
+                        "-",
+                        "+",
+                        1,
+                    )
+                    await client.execute_command(
+                        "XCLAIM",
+                        queue_key,
+                        group,
+                        "reclaimer",
+                        0,
+                        entry_id,
+                    )
+                    await client.xgroup_delconsumer(queue_key, group, "readiness")
+                    await client.eval(
+                        _WORK_QUEUE_SETTLE_READINESS_SCRIPT,
+                        6,
+                        queue_key,
+                        payload_key,
+                        maximum_key,
+                        attempt_key,
+                        receipt_key,
+                        visible_key,
+                        group,
+                        entry_id,
+                        suffix,
+                    )
+                    await client.xrange(dead_letter_key, count=1)
+                finally:
+                    try:
+                        await client.xgroup_destroy(queue_key, group)
+                    except Exception:
+                        pass
+                    try:
+                        await client.delete(*queue_keys)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             raise
         except ConfigurationError:
@@ -211,7 +332,25 @@ class RedisCacheRuntime:
 
     def ttl_milliseconds(self, value: float, *, label: str) -> int:
         ttl = validate_positive_finite(value, label=label)
-        milliseconds = max(1, round(ttl * 1000))
+        milliseconds = max(1, round(ttl * 1_000))
+        if milliseconds > MAX_REDIS_TTL_MILLISECONDS:
+            raise ValueError(f"{label.capitalize()} exceeds the Redis TTL limit.")
+        return milliseconds
+
+    def duration_milliseconds(
+        self,
+        value: float,
+        *,
+        label: str,
+        allow_zero: bool = False,
+    ) -> int:
+        if allow_zero:
+            duration = validate_non_negative_finite(value, label=label)
+            if duration == 0:
+                return 0
+        else:
+            duration = validate_positive_finite(value, label=label)
+        milliseconds = max(1, ceil(duration * 1_000))
         if milliseconds > MAX_REDIS_TTL_MILLISECONDS:
             raise ValueError(f"{label.capitalize()} exceeds the Redis TTL limit.")
         return milliseconds
@@ -256,6 +395,36 @@ def _validate_readiness_result(result: object) -> None:
         raise ConfigurationError(
             "Redis cache backend cannot provide the configured advanced features."
         )
+
+
+def _validate_work_queue_readiness_result(result: object) -> None:
+    if not isinstance(result, list | tuple) or len(result) != 2:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+
+
+def _readiness_entry_id(records: object) -> object:
+    if not isinstance(records, list | tuple) or not records:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    stream = records[0]
+    if not isinstance(stream, list | tuple) or len(stream) != 2:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    entries = stream[1]
+    if not isinstance(entries, list | tuple) or not entries:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    entry = entries[0]
+    if not isinstance(entry, list | tuple) or len(entry) != 2:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    return entry[0]
 
 
 def _log_failure(operation: str, error: Exception) -> None:
