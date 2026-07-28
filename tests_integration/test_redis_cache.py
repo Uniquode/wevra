@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -15,16 +16,19 @@ from testcontainers.core.wait_strategies import ExecWaitStrategy
 from tests.cache_feature_conformance import (
     assert_atomic_conformance,
     assert_lease_conformance,
+    assert_work_queue_conformance,
 )
 from tests_support.database_containers import skip_if_docker_unavailable
 
 from wybra.cache import (
     AtomicCacheCapability,
+    CacheConflictError,
     CacheFeatureError,
     CacheSettings,
     CachesSettings,
     LeaseCacheCapability,
     RedisCache,
+    WorkQueueCacheCapability,
     build_caches,
 )
 from wybra.config import MappingConfigSource
@@ -153,7 +157,7 @@ async def test_redis_advanced_features_pass_shared_conformance(
         await asyncio.sleep(seconds + 0.05)
 
     try:
-        assert instance.features == ("atomic", "lease")
+        assert instance.features == ("atomic", "lease", "work-queue")
         await assert_atomic_conformance(
             instance.require(AtomicCacheCapability),
             owner="redis-atomic",
@@ -165,6 +169,1031 @@ async def test_redis_advanced_features_pass_shared_conformance(
             lease_ttl=0.5,
             renewed_ttl=1.0,
         )
+
+        async def advance_queue(seconds: float) -> None:
+            await asyncio.sleep(seconds + 0.2)
+
+        await assert_work_queue_conformance(
+            instance.require(WorkQueueCacheCapability),
+            advance_queue,
+            owner="redis-queue",
+        )
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_round_trips_against_real_redis(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await queue.publish("integration", "work", b"payload")
+        delivery = await queue.reserve(
+            "integration",
+            "work",
+            "worker",
+            visibility_timeout=1,
+        )
+        assert delivery is not None
+        assert delivery.identity == identity
+        assert delivery.payload == b"payload"
+        await queue.acknowledge(delivery)
+        assert (
+            await queue.reserve(
+                "integration",
+                "work",
+                "worker",
+                visibility_timeout=1,
+            )
+            is None
+        )
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_cleans_consumers_after_settlement(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_consumer_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        for visibility_timeout in (0.1, 0.2):
+            await queue.publish("integration", "consumer", b"payload")
+            delivery = await queue.reserve(
+                "integration",
+                "consumer",
+                "worker",
+                visibility_timeout=visibility_timeout,
+            )
+            assert delivery is not None
+            await queue.acknowledge(delivery)
+
+        keys = queue._keys("integration", "consumer")
+        consumers = await queue.runtime.client().xinfo_consumers(keys.stream, "wybra")
+        assert consumers == []
+        assert await queue.runtime.client().hlen(keys.consumers) == 0
+
+        for _index in range(3):
+            assert (
+                await queue.reserve(
+                    "integration",
+                    "consumer",
+                    "worker",
+                    visibility_timeout=1,
+                )
+                is None
+            )
+        assert await queue.runtime.client().hlen(keys.consumers) == 0
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_cleans_expired_consumer_metadata(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_expired_consumer_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        await queue.publish("integration", "consumer", b"payload")
+        first = await queue.reserve(
+            "integration",
+            "consumer",
+            "worker",
+            visibility_timeout=0.05,
+        )
+        assert first is not None
+        keys = queue._keys("integration", "consumer")
+        assert await queue.runtime.client().hlen(keys.consumers) == 1
+
+        await asyncio.sleep(0.1)
+        second = await queue.reserve(
+            "integration",
+            "consumer",
+            "worker",
+            visibility_timeout=1,
+        )
+
+        assert second is not None
+        await queue.acknowledge(second)
+        assert await queue.runtime.client().hlen(keys.consumers) == 0
+        assert await queue.runtime.client().xinfo_consumers(keys.stream, "wybra") == []
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_is_shared_by_independent_runtimes(
+    redis_url: str,
+) -> None:
+    settings = redis_settings(
+        redis_url,
+        f"shared_queue_{uuid4().hex}",
+        features=("work-queue",),
+    )
+    first = await build_caches(settings)
+    second = await build_caches(settings)
+    first_queue = first.require("default").require(WorkQueueCacheCapability)
+    second_queue = second.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await first_queue.publish("integration", "shared", b"payload")
+        first_delivery, second_delivery = await asyncio.gather(
+            first_queue.reserve(
+                "integration",
+                "shared",
+                "worker-one",
+                visibility_timeout=1,
+            ),
+            second_queue.reserve(
+                "integration",
+                "shared",
+                "worker-two",
+                visibility_timeout=1,
+            ),
+        )
+        deliveries = [
+            delivery for delivery in (first_delivery, second_delivery) if delivery
+        ]
+        assert len(deliveries) == 1
+        assert deliveries[0].identity == identity
+        if first_delivery is not None:
+            await first_queue.acknowledge(first_delivery)
+        if second_delivery is not None:
+            await second_queue.acknowledge(second_delivery)
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_waits_for_delayed_work(redis_url: str) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_delayed_wait_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await queue.publish("integration", "delayed", b"payload", delay=0.1)
+        started = time.monotonic()
+        delivery = await queue.reserve(
+            "integration",
+            "delayed",
+            "worker",
+            visibility_timeout=1,
+            wait_timeout=0.5,
+        )
+        assert delivery is not None
+        assert delivery.identity == identity
+        assert time.monotonic() - started < 0.4
+        await queue.acknowledge(delivery)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_non_blocking_reserve_skips_legacy_wake_records(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_wake_poll_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        await queue.publish("integration", "wake", b"delayed", delay=60)
+        keys = queue._keys("integration", "wake")
+        await queue.runtime.client().xadd(keys.stream, {"w": "legacy"})
+        identity = await queue.publish("integration", "wake", b"ready")
+
+        assert (
+            await queue.reserve(
+                "integration",
+                "wake",
+                "worker",
+                visibility_timeout=1,
+            )
+            is None
+        )
+        delivery = await queue.reserve(
+            "integration",
+            "wake",
+            "worker",
+            visibility_timeout=1,
+        )
+
+        assert delivery is not None
+        assert delivery.identity == identity
+        await queue.acknowledge(delivery)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_non_blocking_reserve_bounds_legacy_wake_cleanup(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_wake_bound_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        keys = queue._keys("integration", "wake")
+        for _index in range(3):
+            await queue.runtime.client().xadd(keys.stream, {"w": "legacy"})
+
+        assert (
+            await queue.reserve(
+                "integration",
+                "wake",
+                "worker",
+                visibility_timeout=1,
+            )
+            is None
+        )
+        assert await queue.runtime.client().xlen(keys.stream) == 2
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_defers_work_without_wake_records(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_wake_coalesce_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        for _index in range(20):
+            await queue.publish("integration", "wake", b"delayed", delay=60)
+
+        keys = queue._keys("integration", "wake")
+        assert await queue.runtime.client().xlen(keys.stream) == 0
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_uses_a_bounded_delay_signal_stream(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_delay_signal_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await queue.publish(
+            "integration",
+            "signal",
+            b"payload",
+            delay=0.1,
+        )
+        keys = queue._keys("integration", "signal")
+        assert await queue.runtime.client().xlen(keys.stream) == 0
+        assert await queue.runtime.client().xlen(keys.delay_signals) == 1
+
+        delivery = await queue.reserve(
+            "integration",
+            "signal",
+            "worker",
+            visibility_timeout=1,
+            wait_timeout=0.5,
+        )
+
+        assert delivery is not None
+        assert delivery.identity == identity
+        await queue.acknowledge(delivery)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_multiplexes_delayed_queue_promoters(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_delay_multiplex_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        client = queue.runtime.client()
+        baseline_connections = len(await client.client_list())
+        for index in range(5):
+            await queue.publish(
+                "integration",
+                f"signal-{index}",
+                b"payload",
+                delay=60,
+            )
+        await asyncio.sleep(0.05)
+
+        assert len(await client.client_list()) <= baseline_connections + 1
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_same_name_waiters_share_wait_timeout(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_waiters_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        started = time.monotonic()
+        deliveries = await asyncio.gather(
+            *(
+                queue.reserve(
+                    "integration",
+                    "waiters",
+                    "worker",
+                    visibility_timeout=1,
+                    wait_timeout=0.2,
+                )
+                for _index in range(3)
+            )
+        )
+
+        assert deliveries == [None, None, None]
+        assert time.monotonic() - started < 0.45
+        keys = queue._keys("integration", "waiters")
+        assert await queue.runtime.client().xinfo_consumers(keys.stream, "wybra") == []
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("delay", [0, 0.1])
+async def test_redis_work_queue_reject_wakes_a_blocked_reserver(
+    redis_url: str,
+    delay: float,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_reject_wake_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await queue.publish("integration", "reject", b"payload")
+        initial = await queue.reserve(
+            "integration",
+            "reject",
+            "first-worker",
+            visibility_timeout=10,
+        )
+        assert initial is not None
+        waiting = asyncio.create_task(
+            queue.reserve(
+                "integration",
+                "reject",
+                "second-worker",
+                visibility_timeout=1,
+                wait_timeout=1,
+            )
+        )
+        await asyncio.sleep(0.05)
+        await queue.reject(initial, delay=delay)
+
+        retried = await waiting
+
+        assert retried is not None
+        assert retried.identity == identity
+        assert retried.attempt == 2
+        await queue.acknowledge(retried)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_recovers_unissued_delivery_with_stale_visibility(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_stale_visibility_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        await queue.publish("integration", "stale", b"discarded")
+        initial = await queue.reserve(
+            "integration",
+            "stale",
+            "initial-worker",
+            visibility_timeout=10,
+        )
+        assert initial is not None
+        keys = queue._keys("integration", "stale")
+        client = queue.runtime.client()
+        await client.delete(keys.stream)
+        await client.xgroup_create(keys.stream, "wybra", id="0-0", mkstream=True)
+
+        identity = await queue.publish("integration", "stale", b"payload")
+        records = await client.xreadgroup(
+            "wybra",
+            "interrupted-worker",
+            {keys.stream: ">"},
+            count=1,
+        )
+        assert records
+        await asyncio.sleep(0.1)
+
+        recovered = await queue.reserve(
+            "integration",
+            "stale",
+            "recovery-worker",
+            visibility_timeout=0.05,
+            wait_timeout=0.2,
+        )
+
+        assert recovered is not None
+        assert recovered.identity == identity
+        assert recovered.attempt == 1
+        await queue.acknowledge(recovered)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_reserver_promotes_cross_instance_delayed_work(
+    redis_url: str,
+) -> None:
+    settings = redis_settings(
+        redis_url,
+        f"queue_cross_instance_promoter_{uuid4().hex}",
+        features=("work-queue",),
+    )
+    publisher_caches = await build_caches(settings)
+    reserver_caches = await build_caches(settings)
+    publisher = publisher_caches.require("default").require(WorkQueueCacheCapability)
+    reserver = reserver_caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        waiting = asyncio.create_task(
+            reserver.reserve(
+                "integration",
+                "cross-instance",
+                "worker",
+                visibility_timeout=1,
+                wait_timeout=3,
+            )
+        )
+        await asyncio.sleep(0.05)
+        identity = await publisher.publish(
+            "integration",
+            "cross-instance",
+            b"payload",
+            delay=0.1,
+        )
+        await publisher_caches.close()
+
+        delivery = await waiting
+
+        assert delivery is not None
+        assert delivery.identity == identity
+        await reserver.acknowledge(delivery)
+    finally:
+        await publisher_caches.close()
+        await reserver_caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_retries_promoter_after_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_promoter_retry_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    original_promote = type(queue)._promote
+    failed = False
+
+    async def fail_promoter_once(instance: Any, keys: Any) -> None:
+        nonlocal failed
+        task = asyncio.current_task()
+        if (
+            not failed
+            and task is not None
+            and task.get_name() == "wybra-cache-promoter"
+        ):
+            failed = True
+            raise CacheFeatureError("transient Redis failure")
+        await original_promote(instance, keys)
+
+    monkeypatch.setattr(type(queue), "_promote", fail_promoter_once)
+    try:
+        identity = await queue.publish(
+            "integration",
+            "retry-promoter",
+            b"payload",
+            delay=0.05,
+        )
+
+        delivery = await queue.reserve(
+            "integration",
+            "retry-promoter",
+            "worker",
+            visibility_timeout=1,
+            wait_timeout=2,
+        )
+
+        assert failed
+        assert delivery is not None
+        assert delivery.identity == identity
+        await queue.acknowledge(delivery)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_removes_idle_consumer_on_cache_close(
+    redis_url: str,
+) -> None:
+    settings = redis_settings(
+        redis_url,
+        f"queue_consumer_cleanup_{uuid4().hex}",
+        features=("work-queue",),
+    )
+    first = await build_caches(settings)
+    observer = await build_caches(settings)
+    queue = first.require("default").require(WorkQueueCacheCapability)
+    observer_queue = observer.require("default").require(WorkQueueCacheCapability)
+    try:
+        await queue.publish("integration", "cleanup", b"payload")
+        delivery = await queue.reserve(
+            "integration",
+            "cleanup",
+            "worker",
+            visibility_timeout=1,
+        )
+        assert delivery is not None
+        await queue.acknowledge(delivery)
+        keys = queue._keys("integration", "cleanup")
+
+        await first.close()
+
+        assert (
+            await observer_queue.runtime.client().xinfo_consumers(
+                keys.stream,
+                "wybra",
+            )
+            == []
+        )
+    finally:
+        await observer.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_waits_for_visibility_recovery(redis_url: str) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_visibility_wait_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await queue.publish("integration", "visibility", b"payload")
+        initial = await queue.reserve(
+            "integration",
+            "visibility",
+            "first-worker",
+            visibility_timeout=0.1,
+        )
+        assert initial is not None
+        started = time.monotonic()
+        recovered = await queue.reserve(
+            "integration",
+            "visibility",
+            "second-worker",
+            visibility_timeout=1,
+            wait_timeout=0.5,
+        )
+        assert recovered is not None
+        assert recovered.identity == identity
+        assert recovered.attempt == 2
+        assert time.monotonic() - started < 0.4
+        await queue.acknowledge(recovered)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_preserves_original_visibility_timeout(
+    redis_url: str,
+) -> None:
+    settings = redis_settings(
+        redis_url,
+        f"queue_visibility_policy_{uuid4().hex}",
+        features=("work-queue",),
+    )
+    first = await build_caches(settings)
+    second = await build_caches(settings)
+    first_queue = first.require("default").require(WorkQueueCacheCapability)
+    second_queue = second.require("default").require(WorkQueueCacheCapability)
+    try:
+        identity = await first_queue.publish("integration", "visibility", b"payload")
+        initial = await first_queue.reserve(
+            "integration",
+            "visibility",
+            "first-worker",
+            visibility_timeout=0.5,
+        )
+        assert initial is not None
+        await asyncio.sleep(0.15)
+        assert (
+            await second_queue.reserve(
+                "integration",
+                "visibility",
+                "second-worker",
+                visibility_timeout=0.05,
+            )
+            is None
+        )
+        await asyncio.sleep(0.4)
+        recovered = await second_queue.reserve(
+            "integration",
+            "visibility",
+            "second-worker",
+            visibility_timeout=1,
+        )
+        assert recovered is not None
+        assert recovered.identity == identity
+        await second_queue.acknowledge(recovered)
+        with pytest.raises(CacheConflictError):
+            await first_queue.acknowledge(initial)
+        assert not first_queue._deliveries
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_does_not_return_a_reclaimed_read(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_url: str,
+) -> None:
+    settings = redis_settings(
+        redis_url,
+        f"queue_reclaim_race_{uuid4().hex}",
+        features=("work-queue",),
+    )
+    first = await build_caches(settings)
+    second = await build_caches(settings)
+    first_queue = first.require("default").require(WorkQueueCacheCapability)
+    second_queue = second.require("default").require(WorkQueueCacheCapability)
+    issue_started = asyncio.Event()
+    resume_issue = asyncio.Event()
+    original_feature_call = type(first_queue.runtime).feature_call
+
+    async def stall_issue(
+        runtime: Any,
+        operation: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        if (
+            runtime is first_queue.runtime
+            and getattr(operation, "__name__", "") == "issue"
+        ):
+            issue_started.set()
+            await resume_issue.wait()
+        return await original_feature_call(runtime, operation)
+
+    monkeypatch.setattr(type(first_queue.runtime), "feature_call", stall_issue)
+    try:
+        identity = await first_queue.publish("integration", "race", b"payload")
+        pending = asyncio.create_task(
+            first_queue.reserve(
+                "integration",
+                "race",
+                "worker",
+                visibility_timeout=0.2,
+            )
+        )
+        await issue_started.wait()
+        await asyncio.sleep(0.1)
+        assert (
+            await second_queue.reserve(
+                "integration",
+                "race",
+                "worker",
+                visibility_timeout=0.05,
+            )
+            is None
+        )
+        await asyncio.sleep(0.15)
+        reclaimed = await second_queue.reserve(
+            "integration",
+            "race",
+            "worker",
+            visibility_timeout=0.05,
+        )
+        resume_issue.set()
+        assert await pending is None
+        assert reclaimed is not None
+        assert reclaimed.identity == identity
+        await second_queue.acknowledge(reclaimed)
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_recreates_a_lost_consumer_group(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_lost_group_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        first_identity = await queue.publish("integration", "group", b"first")
+        first = await queue.reserve(
+            "integration",
+            "group",
+            "worker",
+            visibility_timeout=1,
+        )
+        assert first is not None
+        assert first.identity == first_identity
+        await queue.acknowledge(first)
+        keys = queue._keys("integration", "group")
+        await queue.runtime.client().delete(keys.stream)
+        second_identity = await queue.publish("integration", "group", b"second")
+
+        second = await queue.reserve(
+            "integration",
+            "group",
+            "worker",
+            visibility_timeout=1,
+        )
+
+        assert second is not None
+        assert second.identity == second_identity
+        await queue.acknowledge(second)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_recovers_unissued_entries_beyond_one_scan_page(
+    monkeypatch: pytest.MonkeyPatch,
+    redis_url: str,
+) -> None:
+    settings = redis_settings(
+        redis_url,
+        f"queue_recovery_cursor_{uuid4().hex}",
+        features=("work-queue",),
+    )
+    first = await build_caches(settings)
+    second = await build_caches(settings)
+    first_queue = first.require("default").require(WorkQueueCacheCapability)
+    second_queue = second.require("default").require(WorkQueueCacheCapability)
+    issue_count = 0
+    all_issued = asyncio.Event()
+    resume_issue = asyncio.Event()
+    original_feature_call = type(first_queue.runtime).feature_call
+
+    async def stall_issue(
+        runtime: Any,
+        operation: Callable[[Any], Awaitable[Any]],
+    ) -> Any:
+        nonlocal issue_count
+        if (
+            runtime is first_queue.runtime
+            and getattr(operation, "__name__", "") == "issue"
+        ):
+            issue_count += 1
+            if issue_count == 101:
+                all_issued.set()
+            await resume_issue.wait()
+        return await original_feature_call(runtime, operation)
+
+    monkeypatch.setattr(type(first_queue.runtime), "feature_call", stall_issue)
+    pending: list[asyncio.Task[object]] = []
+    try:
+        for _index in range(101):
+            await first_queue.publish("integration", "recovery", b"payload")
+        pending.extend(
+            asyncio.create_task(
+                first_queue.reserve(
+                    "integration",
+                    "recovery",
+                    f"long-{index}",
+                    visibility_timeout=1,
+                )
+            )
+            for index in range(100)
+        )
+        while issue_count < 100:
+            await asyncio.sleep(0)
+        pending.append(
+            asyncio.create_task(
+                first_queue.reserve(
+                    "integration",
+                    "recovery",
+                    "short",
+                    visibility_timeout=0.05,
+                )
+            )
+        )
+        await asyncio.wait_for(all_issued.wait(), timeout=5)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0.1)
+
+        recovered = await second_queue.reserve(
+            "integration",
+            "recovery",
+            "recovery-worker",
+            visibility_timeout=1,
+        )
+
+        assert recovered is not None
+        assert recovered.attempt == 1
+        await second_queue.acknowledge(recovered)
+    finally:
+        resume_issue.set()
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_recovers_pending_delivery_after_restart(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    namespace = f"queue_restart_{uuid4().hex}"
+    settings = redis_settings(redis_url, namespace, features=("work-queue",))
+    first = await build_caches(settings)
+    first_queue = first.require("default").require(WorkQueueCacheCapability)
+    identity = await first_queue.publish("integration", "restart", b"payload")
+    initial = await first_queue.reserve(
+        "integration",
+        "restart",
+        "first-worker",
+        visibility_timeout=0.5,
+    )
+    assert initial is not None
+    await first.close()
+
+    container.get_wrapped_container().restart()
+    restarted_url = (
+        f"redis://{container.get_container_host_ip()}:"
+        f"{container.get_exposed_port(6379)}/0"
+    )
+    await _wait_for_redis(restarted_url)
+    second = await build_caches(
+        redis_settings(restarted_url, namespace, features=("work-queue",))
+    )
+    second_queue = second.require("default").require(WorkQueueCacheCapability)
+    try:
+        await asyncio.sleep(0.7)
+        recovered = await second_queue.reserve(
+            "integration",
+            "restart",
+            "second-worker",
+            visibility_timeout=1,
+        )
+        assert recovered is not None
+        assert recovered.identity == identity
+        assert recovered.attempt == 2
+        await second_queue.acknowledge(recovered)
+    finally:
+        await second.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_reports_a_safe_error_after_outage(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"queue_outage_{uuid4().hex}",
+            features=("work-queue",),
+        )
+    )
+    queue = caches.require("default").require(WorkQueueCacheCapability)
+    try:
+        container.get_wrapped_container().stop()
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await queue.publish("integration", "outage", b"payload")
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_named_namespaces_are_isolated(redis_url: str) -> None:
+    settings = CachesSettings(
+        instances=(
+            CacheSettings(
+                backend="redis",
+                url=redis_url,
+                namespace=f"queue_first_{uuid4().hex}",
+                features=("work-queue",),
+            ),
+            CacheSettings(
+                name="second",
+                backend="redis",
+                url=redis_url,
+                namespace=f"queue_second_{uuid4().hex}",
+                features=("work-queue",),
+            ),
+        )
+    )
+    caches = await build_caches(settings)
+    first = caches.require("default").require(WorkQueueCacheCapability)
+    second = caches.require("second").require(WorkQueueCacheCapability)
+    try:
+        identity = await first.publish("integration", "isolated", b"payload")
+        assert (
+            await second.reserve(
+                "integration",
+                "isolated",
+                "second-worker",
+                visibility_timeout=1,
+            )
+            is None
+        )
+        delivery = await first.reserve(
+            "integration",
+            "isolated",
+            "first-worker",
+            visibility_timeout=1,
+        )
+        assert delivery is not None
+        assert delivery.identity == identity
+        await first.acknowledge(delivery)
     finally:
         await caches.close()
 

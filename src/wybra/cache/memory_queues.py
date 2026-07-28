@@ -53,7 +53,7 @@ class _Reservation:
 
 @dataclass(slots=True)
 class InMemoryWorkQueue:
-    clock: Clock = field(default=time.monotonic, repr=False)
+    clock: Clock = field(default=time.time, repr=False)
     max_items_per_queue: int = 10_000
     max_dead_letters_per_queue: int = 1_000
     max_queues: int = 1_000

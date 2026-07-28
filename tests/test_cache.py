@@ -287,7 +287,6 @@ url = "redis://cache/1"
             ("namespace", "Redis://secret", "cache namespace"),
             ("namespace", "contains:separator", "cache namespace"),
             ("features", ["atomic", "atomic"], "duplicates"),
-            ("features", ["work-queue"], "not implemented"),
             ("features", ["unknown"], "not implemented"),
         ),
     )
@@ -369,7 +368,7 @@ url = "redis://cache/1"
             ("session", "memory"),
         ]
         assert diagnostics[0].partition != diagnostics[1].partition
-        assert diagnostics[0].features == ("atomic", "lease")
+        assert diagnostics[0].features == ("atomic", "lease", "work-queue")
         assert diagnostics[1].features == (
             "atomic",
             "lease",
