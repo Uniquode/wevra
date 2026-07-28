@@ -204,6 +204,7 @@ class RedisCacheRuntime:
                     )
                     entry_id = _readiness_entry_id(records)
                     await client.xread({queue_key: "$"}, count=1, block=1)
+                    await client.xinfo_consumers(queue_key, group)
                     await client.xpending_range(
                         queue_key,
                         group,
@@ -219,6 +220,7 @@ class RedisCacheRuntime:
                         0,
                         entry_id,
                     )
+                    await client.xgroup_delconsumer(queue_key, group, "readiness")
                     await client.eval(
                         _WORK_QUEUE_SETTLE_READINESS_SCRIPT,
                         6,

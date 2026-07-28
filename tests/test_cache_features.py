@@ -432,6 +432,8 @@ async def test_redis_lease_readiness_does_not_require_atomic_read_permission() -
 
 @pytest.mark.anyio
 async def test_redis_work_queue_readiness_requires_pending_permission() -> None:
+    calls: list[str] = []
+
     class RestrictedClient:
         async def config_get(self, *_keys: str) -> dict[str, str]:
             return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
@@ -449,7 +451,16 @@ async def test_redis_work_queue_readiness_requires_pending_permission() -> None:
         ) -> list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]]:
             return [(b"stream", [(b"1-0", {b"i": b"identity"})])]
 
+        async def xread(self, *_args: object, **_kwargs: object) -> list[object]:
+            calls.append("XREAD")
+            return []
+
+        async def xinfo_consumers(self, *_args: object) -> list[object]:
+            calls.append("XINFO CONSUMERS")
+            return []
+
         async def xpending_range(self, *_args: object) -> None:
+            calls.append("XPENDING")
             raise PermissionError("XPENDING is denied")
 
         async def xgroup_destroy(self, *_args: object) -> None:
@@ -463,6 +474,71 @@ async def test_redis_work_queue_readiness_requires_pending_permission() -> None:
 
     with pytest.raises(ConfigurationError, match="cannot provide"):
         await runtime.validate_features(frozenset({"work-queue"}))
+
+    assert calls == ["XREAD", "XINFO CONSUMERS", "XPENDING"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("denied_command", ["XINFO CONSUMERS", "XGROUP DELCONSUMER"])
+async def test_redis_work_queue_readiness_requires_consumer_cleanup_permissions(
+    denied_command: str,
+) -> None:
+    calls: list[str] = []
+
+    class RestrictedClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, *_args: object) -> list[bytes]:
+            return [b"1", b"1"]
+
+        async def xgroup_create(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        async def xreadgroup(
+            self,
+            *_args: object,
+            **_kwargs: object,
+        ) -> list[tuple[bytes, list[tuple[bytes, dict[bytes, bytes]]]]]:
+            return [(b"stream", [(b"1-0", {b"i": b"identity"})])]
+
+        async def xread(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def xinfo_consumers(self, *_args: object) -> list[object]:
+            calls.append("XINFO CONSUMERS")
+            if denied_command == "XINFO CONSUMERS":
+                raise PermissionError(f"{denied_command} is denied")
+            return []
+
+        async def xpending_range(self, *_args: object) -> list[object]:
+            return []
+
+        async def execute_command(self, *_args: object) -> list[object]:
+            return []
+
+        async def xgroup_delconsumer(self, *_args: object) -> int:
+            calls.append("XGROUP DELCONSUMER")
+            if denied_command == "XGROUP DELCONSUMER":
+                raise PermissionError(f"{denied_command} is denied")
+            return 0
+
+        async def xrange(self, *_args: object, **_kwargs: object) -> list[object]:
+            return []
+
+        async def xgroup_destroy(self, *_args: object) -> None:
+            return None
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = RestrictedClient()
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await runtime.validate_features(frozenset({"work-queue"}))
+
+    assert calls[-1] == denied_command
 
 
 @pytest.mark.anyio
