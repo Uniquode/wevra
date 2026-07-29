@@ -314,7 +314,7 @@ jobs:
           fetch-depth: 0
 
       - name: Scan for secrets
-        uses: GitGuardian/ggshield/actions/secret@v1.52.2
+        uses: GitGuardian/ggshield/actions/secret@v1.53.0
         env:
           GITGUARDIAN_API_KEY: ${{ secrets.GITGUARDIAN_API_KEY }}
 
