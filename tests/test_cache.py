@@ -368,7 +368,7 @@ url = "redis://cache/1"
             ("session", "memory"),
         ]
         assert diagnostics[0].partition != diagnostics[1].partition
-        assert diagnostics[0].features == ("atomic", "lease", "work-queue")
+        assert diagnostics[0].features == ("atomic", "lease", "stream", "work-queue")
         assert diagnostics[1].features == (
             "atomic",
             "lease",

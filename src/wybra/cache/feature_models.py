@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 
 MAX_CACHE_FEATURE_PAYLOAD_BYTES = 1_048_576
 MAX_CACHE_FEATURE_LIMIT = 10_000
+MAX_STREAM_POSITION = 2**63 - 1
+DEFAULT_STREAM_RETENTION_COUNT = 1_000
+DEFAULT_STREAM_MAX_CONSUMERS = 10_000
 _FEATURE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
@@ -144,6 +147,8 @@ class StreamPosition:
 
     def __post_init__(self) -> None:
         validate_positive_integer(self.value, label="stream position")
+        if self.value > MAX_STREAM_POSITION:
+            raise ValueError(f"Stream position cannot exceed {MAX_STREAM_POSITION}.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,10 +270,13 @@ __all__ = (
     "CachePositionExpiredError",
     "CacheRevision",
     "CounterCacheValue",
+    "DEFAULT_STREAM_MAX_CONSUMERS",
+    "DEFAULT_STREAM_RETENTION_COUNT",
     "FencingToken",
     "LeaseToken",
     "MAX_CACHE_FEATURE_LIMIT",
     "MAX_CACHE_FEATURE_PAYLOAD_BYTES",
+    "MAX_STREAM_POSITION",
     "ScheduleClaim",
     "ScheduleRecord",
     "StreamPosition",

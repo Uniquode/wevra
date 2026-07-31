@@ -250,6 +250,7 @@ _.reserve
 _.reject
 _.dead_letter
 _.read_consumer
+_.forget_consumer
 _.due
 _.durable
 _.restart_recovery

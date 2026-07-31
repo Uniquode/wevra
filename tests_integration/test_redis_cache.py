@@ -16,6 +16,7 @@ from testcontainers.core.wait_strategies import ExecWaitStrategy
 from tests.cache_feature_conformance import (
     assert_atomic_conformance,
     assert_lease_conformance,
+    assert_stream_conformance,
     assert_work_queue_conformance,
 )
 from tests_support.database_containers import skip_if_docker_unavailable
@@ -28,9 +29,14 @@ from wybra.cache import (
     CachesSettings,
     LeaseCacheCapability,
     RedisCache,
+    StreamCacheCapability,
+    StreamPosition,
     WorkQueueCacheCapability,
     build_caches,
 )
+from wybra.cache.feature_models import DEFAULT_STREAM_RETENTION_COUNT
+from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_streams import RedisStreamCache
 from wybra.config import MappingConfigSource
 from wybra.messages import MessagesCapability
 from wybra.sessions import NamedCacheSessionStorage, SessionRecord
@@ -157,7 +163,7 @@ async def test_redis_advanced_features_pass_shared_conformance(
         await asyncio.sleep(seconds + 0.05)
 
     try:
-        assert instance.features == ("atomic", "lease", "work-queue")
+        assert instance.features == ("atomic", "lease", "stream", "work-queue")
         await assert_atomic_conformance(
             instance.require(AtomicCacheCapability),
             owner="redis-atomic",
@@ -177,6 +183,11 @@ async def test_redis_advanced_features_pass_shared_conformance(
             instance.require(WorkQueueCacheCapability),
             advance_queue,
             owner="redis-queue",
+        )
+        await assert_stream_conformance(
+            instance.require(StreamCacheCapability),
+            retention_count=DEFAULT_STREAM_RETENTION_COUNT,
+            owner="redis-stream",
         )
     finally:
         await caches.close()
@@ -1194,6 +1205,225 @@ async def test_redis_work_queue_named_namespaces_are_isolated(redis_url: str) ->
         assert delivery is not None
         assert delivery.identity == identity
         await first.acknowledge(delivery)
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_stream_named_namespaces_are_isolated(redis_url: str) -> None:
+    settings = CachesSettings(
+        instances=(
+            CacheSettings(
+                backend="redis",
+                url=redis_url,
+                namespace=f"stream_first_{uuid4().hex}",
+                features=("stream",),
+            ),
+            CacheSettings(
+                name="second",
+                backend="redis",
+                url=redis_url,
+                namespace=f"stream_second_{uuid4().hex}",
+                features=("stream",),
+            ),
+        )
+    )
+    caches = await build_caches(settings)
+    first = caches.require("default").require(StreamCacheCapability)
+    second = caches.require("second").require(StreamCacheCapability)
+    try:
+        position = await first.append("integration", "isolated", b"payload")
+        await first.acknowledge("integration", "isolated", "projection", position)
+        assert await second.read("integration", "isolated") == ()
+        second_position = await second.append("integration", "isolated", b"second")
+        records = await first.read("integration", "isolated")
+        assert len(records) == 1
+        assert records[0].position == position
+        assert records[0].payload == b"payload"
+        second_records = await second.read_consumer(
+            "integration",
+            "isolated",
+            "projection",
+        )
+        assert len(second_records) == 1
+        assert second_records[0].position == second_position
+        assert second_records[0].payload == b"second"
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_stream_consumer_position_survives_registry_rebuild(
+    redis_url: str,
+) -> None:
+    namespace = f"stream_registry_{uuid4().hex}"
+    settings = redis_settings(redis_url, namespace, features=("stream",))
+    first_caches = await build_caches(settings)
+    first = first_caches.require("default").require(StreamCacheCapability)
+    try:
+        first_position = await first.append("integration", "restart", b"first")
+        second_position = await first.append("integration", "restart", b"second")
+        await first.acknowledge(
+            "integration",
+            "restart",
+            "projection",
+            first_position,
+        )
+    finally:
+        await first_caches.close()
+
+    second_caches = await build_caches(settings)
+    second = second_caches.require("default").require(StreamCacheCapability)
+    try:
+        records = await second.read_consumer("integration", "restart", "projection")
+        assert [record.position for record in records] == [second_position]
+        third_position = await second.append("integration", "restart", b"third")
+        assert third_position > second_position
+    finally:
+        await second_caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_stream_bounds_durable_consumer_positions(
+    redis_url: str,
+) -> None:
+    runtime = RedisCacheRuntime(redis_url, f"stream_consumers_{uuid4().hex}")
+    streams = RedisStreamCache(runtime, max_consumers=1)
+    try:
+        await runtime.health_check()
+        await runtime.validate_features(frozenset({"stream"}))
+        position = await streams.append("integration", "consumers", b"payload")
+        await streams.acknowledge(
+            "integration",
+            "consumers",
+            "first",
+            position,
+        )
+        with pytest.raises(CacheFeatureError, match="consumer capacity"):
+            await streams.acknowledge(
+                "integration",
+                "consumers",
+                "second",
+                position,
+            )
+        assert await streams.forget_consumer(
+            "integration",
+            "consumers",
+            "first",
+        )
+        await streams.acknowledge(
+            "integration",
+            "consumers",
+            "second",
+            position,
+        )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_stream_preserves_precise_positions_and_exact_retention(
+    redis_url: str,
+) -> None:
+    runtime = RedisCacheRuntime(redis_url, f"stream_precision_{uuid4().hex}")
+    streams = RedisStreamCache(runtime, retention_count=2)
+    starting_position = 2**53 - 1
+    try:
+        await runtime.health_check()
+        await runtime.validate_features(frozenset({"stream"}))
+        await runtime.client().set(
+            runtime.key("stream-sequence", "integration", "precision"),
+            starting_position,
+        )
+        first = await streams.append("integration", "precision", b"first")
+        second = await streams.append("integration", "precision", b"second")
+        third = await streams.append("integration", "precision", b"third")
+
+        assert [first.value, second.value, third.value] == [
+            starting_position + 1,
+            starting_position + 2,
+            starting_position + 3,
+        ]
+        records = await streams.read("integration", "precision")
+        assert [record.position for record in records] == [second, third]
+        await streams.acknowledge("integration", "precision", "projection", second)
+        with pytest.raises(CacheConflictError, match="does not exist"):
+            await streams.acknowledge(
+                "integration",
+                "precision",
+                "projection",
+                StreamPosition(third.value + 1),
+            )
+        resumed = await streams.read_consumer(
+            "integration",
+            "precision",
+            "projection",
+        )
+        assert [record.position for record in resumed] == [third]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_stream_survives_redis_restart(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    namespace = f"stream_restart_{uuid4().hex}"
+    settings = redis_settings(redis_url, namespace, features=("stream",))
+    first_caches = await build_caches(settings)
+    first = first_caches.require("default").require(StreamCacheCapability)
+    try:
+        first_position = await first.append("integration", "restart", b"first")
+        second_position = await first.append("integration", "restart", b"second")
+        await first.acknowledge(
+            "integration",
+            "restart",
+            "projection",
+            first_position,
+        )
+    finally:
+        await first_caches.close()
+
+    container.get_wrapped_container().restart()
+    restarted_url = (
+        f"redis://{container.get_container_host_ip()}:"
+        f"{container.get_exposed_port(6379)}/0"
+    )
+    await _wait_for_redis(restarted_url)
+    second_caches = await build_caches(
+        redis_settings(restarted_url, namespace, features=("stream",))
+    )
+    second = second_caches.require("default").require(StreamCacheCapability)
+    try:
+        records = await second.read_consumer("integration", "restart", "projection")
+        assert [record.position for record in records] == [second_position]
+        third_position = await second.append("integration", "restart", b"third")
+        assert third_position > second_position
+    finally:
+        await second_caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_stream_reports_a_safe_error_after_outage(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"stream_outage_{uuid4().hex}",
+            features=("stream",),
+        )
+    )
+    streams = caches.require("default").require(StreamCacheCapability)
+    try:
+        container.get_wrapped_container().stop()
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await streams.append("integration", "outage", b"payload")
     finally:
         await caches.close()
 
