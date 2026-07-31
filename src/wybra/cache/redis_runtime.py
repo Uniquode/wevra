@@ -12,9 +12,20 @@ from uuid import uuid4
 
 from wybra.cache.feature_models import (
     CacheFeatureError,
+    validate_finite,
     validate_non_negative_finite,
+    validate_payload,
     validate_positive_finite,
+    validate_positive_integer,
     validate_resource,
+)
+from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_CLAIM_SCRIPT,
+    SCHEDULE_COMPLETE_SCRIPT,
+    SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_RELEASE_SCRIPT,
+    SCHEDULE_UPDATE_SCRIPT,
 )
 from wybra.cache.redis_stream_scripts import (
     STREAM_ACKNOWLEDGE_SCRIPT,
@@ -28,7 +39,7 @@ ResultT = TypeVar("ResultT")
 logger = logging.getLogger(__name__)
 MAX_REDIS_TTL_MILLISECONDS = 2**62
 
-_ADVANCED_FEATURES = frozenset({"atomic", "lease", "stream", "work-queue"})
+_ADVANCED_FEATURES = frozenset({"atomic", "lease", "schedule", "stream", "work-queue"})
 _ATOMIC_READINESS_SCRIPT = """
 if redis.call('exists', KEYS[1]) ~= 0 then
     return {0}
@@ -306,6 +317,135 @@ class RedisCacheRuntime:
                         await client.delete(*stream_keys)
                     except Exception:
                         pass
+            if "schedule" in features:
+                owner = f"readiness-{suffix}"
+                identity = "schedule"
+                record_key = self.key("schedule", owner, identity)
+                claim_key = self.key(
+                    "schedule-claim",
+                    owner,
+                    identity,
+                )
+                revision_key = self.sequence_key(f"schedule-revision-{suffix}")
+                fencing_key = self.sequence_key(f"schedule-fencing-{suffix}")
+                count_key = self.sequence_key(f"schedule-count-{suffix}")
+                due_key = self.key("schedule-due", owner, "records")
+                claims_key = self.key("schedule-claims", owner, "records")
+                index_key = self.key("schedule-index", owner, "records")
+                schedule_keys = (
+                    record_key,
+                    claim_key,
+                    revision_key,
+                    fencing_key,
+                    count_key,
+                    due_key,
+                    claims_key,
+                    index_key,
+                )
+                try:
+                    result = await client.eval(
+                        SCHEDULE_CREATE_SCRIPT,
+                        5,
+                        record_key,
+                        due_key,
+                        revision_key,
+                        index_key,
+                        count_key,
+                        identity,
+                        0,
+                        b"readiness",
+                        "",
+                        1,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    revision = result[1]
+                    result = await client.eval(
+                        SCHEDULE_UPDATE_SCRIPT,
+                        4,
+                        record_key,
+                        claim_key,
+                        due_key,
+                        revision_key,
+                        revision,
+                        0,
+                        b"updated",
+                        "",
+                        identity,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    revision = result[1]
+                    result = await client.eval(
+                        SCHEDULE_DUE_SCRIPT,
+                        3,
+                        due_key,
+                        claims_key,
+                        index_key,
+                        0,
+                        1,
+                    )
+                    _validate_schedule_due_result(result)
+                    result = await client.eval(
+                        SCHEDULE_CLAIM_SCRIPT,
+                        5,
+                        record_key,
+                        claim_key,
+                        fencing_key,
+                        due_key,
+                        claims_key,
+                        "readiness",
+                        suffix,
+                        1_000,
+                    )
+                    _validate_schedule_result(result, length=8)
+                    fencing_token = result[6]
+                    result = await client.eval(
+                        SCHEDULE_RELEASE_SCRIPT,
+                        4,
+                        record_key,
+                        claim_key,
+                        due_key,
+                        claims_key,
+                        "readiness",
+                        suffix,
+                        fencing_token,
+                        revision,
+                        identity,
+                    )
+                    _validate_schedule_result(result, length=1)
+                    result = await client.eval(
+                        SCHEDULE_CLAIM_SCRIPT,
+                        5,
+                        record_key,
+                        claim_key,
+                        fencing_key,
+                        due_key,
+                        claims_key,
+                        "readiness",
+                        suffix,
+                        1_000,
+                    )
+                    _validate_schedule_result(result, length=8)
+                    result = await client.eval(
+                        SCHEDULE_COMPLETE_SCRIPT,
+                        7,
+                        record_key,
+                        due_key,
+                        claim_key,
+                        revision_key,
+                        count_key,
+                        claims_key,
+                        index_key,
+                        "readiness",
+                        suffix,
+                        result[6],
+                        revision,
+                    )
+                    _validate_schedule_result(result, length=2)
+                finally:
+                    try:
+                        await client.delete(*schedule_keys)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             raise
         except ConfigurationError:
@@ -482,6 +622,75 @@ def _validate_stream_readiness_result(result: object) -> None:
             "Redis cache backend cannot provide the configured advanced features."
         )
     _validate_stream_result(result[0])
+
+
+def _validate_schedule_result(result: object, *, length: int) -> None:
+    if (
+        isinstance(result, list | tuple)
+        and len(result) == length
+        and result[0] in (1, b"1", "1")
+    ):
+        return
+    raise ConfigurationError(
+        "Redis cache backend cannot provide the configured advanced features."
+    )
+
+
+def _validate_schedule_due_result(result: object) -> None:
+    if not isinstance(result, list | tuple) or len(result) != 1:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    record = result[0]
+    if not isinstance(record, list | tuple) or len(record) != 5:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    identity, payload, revision, due_at, interval = record
+    try:
+        _readiness_resource(identity)
+        if not isinstance(payload, bytes):
+            raise TypeError
+        validate_payload(payload)
+        _readiness_positive_integer(revision)
+        _readiness_number(due_at, positive=False)
+        if interval not in (b"", "", None):
+            _readiness_number(interval, positive=True)
+    except TypeError, ValueError, UnicodeDecodeError:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        ) from None
+
+
+def _readiness_resource(value: object) -> None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str):
+        raise TypeError
+    validate_resource(value, label="schedule identity")
+
+
+def _readiness_positive_integer(value: object) -> None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError
+    validate_positive_integer(value, label="schedule revision")
+
+
+def _readiness_number(value: object, *, positive: bool) -> None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = float(value)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError
+    if positive:
+        validate_positive_finite(value, label="schedule interval")
+    else:
+        validate_finite(value, label="schedule due time")
 
 
 def _readiness_entry_id(records: object) -> object:

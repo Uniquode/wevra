@@ -50,6 +50,15 @@ from wybra.cache import (
 from wybra.cache.redis_atomic import RedisAtomicCache
 from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_CLAIM_SCRIPT,
+    SCHEDULE_COMPLETE_SCRIPT,
+    SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_RELEASE_SCRIPT,
+    SCHEDULE_UPDATE_SCRIPT,
+)
+from wybra.cache.redis_schedules import RedisScheduleCache
 from wybra.cache.redis_streams import RedisStreamCache
 from wybra.core.exceptions import ConfigurationError
 
@@ -373,6 +382,366 @@ async def test_redis_registers_stream_feature_metadata(
     assert "hset" in client.scripts[2]
     assert "hdel" in client.scripts[3]
     await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_registers_schedule_feature_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            self.scripts.append(script)
+            self.calls.append((script, _args))
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [[b"schedule", b"updated", b"2", b"0", b""]]
+            if script is SCHEDULE_CLAIM_SCRIPT:
+                return [
+                    1,
+                    b"schedule",
+                    b"updated",
+                    b"2",
+                    b"0",
+                    b"",
+                    b"1",
+                    b"0.5",
+                ]
+            if script is SCHEDULE_RELEASE_SCRIPT:
+                return [1]
+            if script is SCHEDULE_COMPLETE_SCRIPT:
+                return [1, 0]
+            raise AssertionError("Unexpected schedule readiness script.")
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+
+    caches = await build_caches(
+        CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="redis://secret@cache/0",
+                    features=("schedule",),
+                ),
+            ),
+        )
+    )
+    instance = caches.require("default")
+
+    assert instance.features == ("schedule",)
+    assert instance.require(ScheduleCacheCapability) is not None
+    guarantees = instance.feature_metadata[0].guarantees
+    assert guarantees.scope == "shared"
+    assert guarantees.durable
+    assert guarantees.restart_recovery
+    assert guarantees.horizontal_consumers
+    assert guarantees.ordering_scope == "due-time"
+    assert guarantees.scheduling
+    assert client.scripts == [
+        SCHEDULE_CREATE_SCRIPT,
+        SCHEDULE_UPDATE_SCRIPT,
+        SCHEDULE_DUE_SCRIPT,
+        SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_RELEASE_SCRIPT,
+        SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_COMPLETE_SCRIPT,
+    ]
+    due_call = next(
+        args for script, args in client.calls if script is SCHEDULE_DUE_SCRIPT
+    )
+    assert due_call[0] == 3
+    assert all("readiness-" in key for key in due_call[1:4])
+
+    await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_translates_record_and_claim_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [[b"once", b"updated", b"2", b"0", b""]]
+            if script is SCHEDULE_CLAIM_SCRIPT:
+                return [
+                    1,
+                    b"once",
+                    b"updated",
+                    b"2",
+                    b"0",
+                    b"",
+                    b"1",
+                    b"1.5",
+                ]
+            if script is SCHEDULE_RELEASE_SCRIPT:
+                return [1]
+            if script is SCHEDULE_COMPLETE_SCRIPT:
+                return [1, 0]
+            raise AssertionError("Unexpected schedule script.")
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    created = await schedules.create("tasks", "once", b"payload", next_due_at=0)
+    updated = await schedules.update(
+        "tasks",
+        "once",
+        created.revision,
+        b"updated",
+        next_due_at=0,
+    )
+    due = await schedules.due("tasks", before=0)
+    claim = await schedules.claim("tasks", "once", "scheduler", ttl=1)
+
+    assert created is not None
+    assert created.revision == CacheRevision(1)
+    assert updated is not None
+    assert due == (updated,)
+    assert claim is not None
+    assert claim.record == updated
+    assert claim.fencing_token.value == 1
+    await schedules.release(claim)
+    claim = await schedules.claim("tasks", "once", "scheduler", ttl=1)
+    assert claim is not None
+    assert await schedules.complete(claim) is None
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_translates_capacity_and_malformed_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [-1]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [[b"once", b"payload", b"1", b"0", b"0"]]
+            raise AssertionError("Unexpected schedule script.")
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    with pytest.raises(CacheFeatureError, match="record capacity"):
+        await schedules.create("tasks", "once", b"payload", next_due_at=0)
+    with pytest.raises(CacheFeatureError, match="interval is invalid"):
+        await schedules.due("tasks", before=0)
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_rejects_malformed_identity_and_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    [[b"", b"payload", b"1", b"0", b""]],
+                    [[b"valid", b"x" * 1_048_577, b"1", b"0", b""]],
+                )
+            )
+
+        async def eval(self, script: str, *_args: object) -> object:
+            assert script is SCHEDULE_DUE_SCRIPT
+            return next(self.responses)
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    with pytest.raises(CacheFeatureError, match="identity is invalid"):
+        await schedules.due("tasks", before=0)
+    with pytest.raises(CacheFeatureError, match="payload is invalid"):
+        await schedules.due("tasks", before=0)
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_rejects_unsafe_recurrence_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_CLAIM_SCRIPT:
+                return [
+                    1,
+                    b"recurring",
+                    b"payload",
+                    b"1",
+                    b"0",
+                    b"1",
+                    b"1",
+                    b"1.5",
+                ]
+            if script is SCHEDULE_COMPLETE_SCRIPT:
+                return [-2]
+            raise AssertionError("Unexpected schedule script.")
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    created = await schedules.create(
+        "tasks",
+        "recurring",
+        b"payload",
+        next_due_at=0,
+        interval_seconds=1,
+    )
+    assert created is not None
+    claim = await schedules.claim("tasks", "recurring", "scheduler", ttl=1)
+    assert claim is not None
+    with pytest.raises(CacheFeatureError, match="cannot advance safely"):
+        await schedules.complete(claim)
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_readiness_rejects_operational_script_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                raise RuntimeError("ACL denied HMGET")
+            raise AssertionError("Unexpected schedule readiness script.")
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await build_caches(
+            CachesSettings(
+                instances=(
+                    CacheSettings(
+                        backend="redis",
+                        url="redis://cache",
+                        namespace="safe",
+                        features=("schedule",),
+                    ),
+                ),
+            )
+        )
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_readiness_rejects_malformed_due_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [0]
+            raise AssertionError("Unexpected schedule readiness script.")
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await build_caches(
+            CachesSettings(
+                instances=(
+                    CacheSettings(
+                        backend="redis",
+                        url="redis://cache",
+                        namespace="safe",
+                        features=("schedule",),
+                    ),
+                ),
+            )
+        )
 
 
 @pytest.mark.anyio

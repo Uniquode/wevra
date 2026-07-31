@@ -9,6 +9,7 @@ MAX_CACHE_FEATURE_LIMIT = 10_000
 MAX_STREAM_POSITION = 2**63 - 1
 DEFAULT_STREAM_RETENTION_COUNT = 1_000
 DEFAULT_STREAM_MAX_CONSUMERS = 10_000
+DEFAULT_SCHEDULE_MAX_RECORDS = 10_000
 _FEATURE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
@@ -259,6 +260,21 @@ def validate_limit(value: int) -> int:
     return value
 
 
+def validate_schedule_values(
+    payload: bytes,
+    next_due_at: float,
+    interval_seconds: float | None,
+) -> tuple[bytes, float, float | None]:
+    payload = validate_payload(payload)
+    next_due_at = validate_finite(next_due_at, label="schedule due time")
+    if interval_seconds is not None:
+        interval_seconds = validate_positive_finite(
+            interval_seconds,
+            label="schedule interval",
+        )
+    return payload, next_due_at, interval_seconds
+
+
 __all__ = (
     "AtomicCacheValue",
     "CacheConflictError",
@@ -270,6 +286,7 @@ __all__ = (
     "CachePositionExpiredError",
     "CacheRevision",
     "CounterCacheValue",
+    "DEFAULT_SCHEDULE_MAX_RECORDS",
     "DEFAULT_STREAM_MAX_CONSUMERS",
     "DEFAULT_STREAM_RETENTION_COUNT",
     "FencingToken",
@@ -291,4 +308,5 @@ __all__ = (
     "validate_positive_finite",
     "validate_positive_integer",
     "validate_resource",
+    "validate_schedule_values",
 )
