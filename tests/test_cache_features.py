@@ -626,6 +626,8 @@ async def test_redis_stream_rejects_acknowledgements_beyond_latest_position(
 
 
 def test_stream_positions_are_bounded_for_every_backend() -> None:
+    assert StreamPosition(MAX_STREAM_POSITION).value == MAX_STREAM_POSITION
+
     with pytest.raises(ValueError, match="cannot exceed"):
         StreamPosition(MAX_STREAM_POSITION + 1)
 
