@@ -6,6 +6,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 
 from wybra.cache.feature_models import (
+    DEFAULT_STREAM_MAX_CONSUMERS,
+    DEFAULT_STREAM_RETENTION_COUNT,
     CacheConflictError,
     CacheFeatureError,
     CachePositionExpiredError,
@@ -25,9 +27,9 @@ _SUBSCRIPTION_CLOSED = object()
 
 @dataclass(slots=True)
 class InMemoryStreamCache:
-    max_records: int = 1_000
+    max_records: int = DEFAULT_STREAM_RETENTION_COUNT
     max_streams: int = 1_000
-    max_consumers: int = 10_000
+    max_consumers: int = DEFAULT_STREAM_MAX_CONSUMERS
     _records: dict[StreamKey, deque[StreamRecord]] = field(
         default_factory=dict,
         init=False,
@@ -121,12 +123,35 @@ class InMemoryStreamCache:
                 raise CacheConflictError(
                     f"Stream consumer {consumer!r} cannot move backwards."
                 )
-            if current is None and len(self._consumer_positions) >= self.max_consumers:
+            if (
+                current is None
+                and self._consumer_count(stream_key) >= self.max_consumers
+            ):
                 raise CacheFeatureError(
                     "The in-memory stream cache has reached its configured "
                     "consumer capacity."
                 )
             self._consumer_positions[consumer_key] = position
+
+    async def forget_consumer(
+        self,
+        owner: str,
+        stream: str,
+        consumer: str,
+    ) -> bool:
+        stream_key = _stream_key(owner, stream)
+        consumer = validate_resource(consumer, label="stream consumer")
+        async with self._lock:
+            return (
+                self._consumer_positions.pop((stream_key, consumer), None) is not None
+            )
+
+    def _consumer_count(self, stream_key: StreamKey) -> int:
+        return sum(
+            1
+            for consumer_stream_key, _consumer in self._consumer_positions
+            if consumer_stream_key == stream_key
+        )
 
     def _read(
         self,

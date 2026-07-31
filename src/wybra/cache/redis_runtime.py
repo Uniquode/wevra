@@ -16,13 +16,19 @@ from wybra.cache.feature_models import (
     validate_positive_finite,
     validate_resource,
 )
+from wybra.cache.redis_stream_scripts import (
+    STREAM_ACKNOWLEDGE_SCRIPT,
+    STREAM_APPEND_SCRIPT,
+    STREAM_FORGET_CONSUMER_SCRIPT,
+    STREAM_READ_SCRIPT,
+)
 from wybra.core.exceptions import ConfigurationError
 
 ResultT = TypeVar("ResultT")
 logger = logging.getLogger(__name__)
 MAX_REDIS_TTL_MILLISECONDS = 2**62
 
-_ADVANCED_FEATURES = frozenset({"atomic", "lease", "work-queue"})
+_ADVANCED_FEATURES = frozenset({"atomic", "lease", "stream", "work-queue"})
 _ATOMIC_READINESS_SCRIPT = """
 if redis.call('exists', KEYS[1]) ~= 0 then
     return {0}
@@ -244,6 +250,62 @@ class RedisCacheRuntime:
                         await client.delete(*queue_keys)
                     except Exception:
                         pass
+            if "stream" in features:
+                stream_key = self.key("readiness", "cache", f"stream-{suffix}")
+                sequence_key = self.key(
+                    "readiness",
+                    "cache",
+                    f"stream-sequence-{suffix}",
+                )
+                consumer_key = self.key(
+                    "readiness",
+                    "cache",
+                    f"stream-consumer-{suffix}",
+                )
+                stream_keys = (stream_key, sequence_key, consumer_key)
+                try:
+                    result = await client.eval(
+                        STREAM_APPEND_SCRIPT,
+                        2,
+                        stream_key,
+                        sequence_key,
+                        b"readiness",
+                        1,
+                        300_000,
+                    )
+                    _validate_stream_result(result)
+                    result = await client.eval(
+                        STREAM_READ_SCRIPT,
+                        1,
+                        stream_key,
+                        "0",
+                        1,
+                    )
+                    _validate_stream_readiness_result(result)
+                    result = await client.eval(
+                        STREAM_ACKNOWLEDGE_SCRIPT,
+                        2,
+                        sequence_key,
+                        consumer_key,
+                        "readiness",
+                        1,
+                        1,
+                        300_000,
+                    )
+                    _validate_stream_result(result)
+                    await client.hget(consumer_key, "readiness")
+                    result = await client.eval(
+                        STREAM_FORGET_CONSUMER_SCRIPT,
+                        1,
+                        consumer_key,
+                        "readiness",
+                    )
+                    _validate_stream_result(result)
+                finally:
+                    try:
+                        await client.delete(*stream_keys)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             raise
         except ConfigurationError:
@@ -402,6 +464,24 @@ def _validate_work_queue_readiness_result(result: object) -> None:
         raise ConfigurationError(
             "Redis cache backend cannot provide the configured advanced features."
         )
+
+
+def _validate_stream_result(result: object) -> None:
+    if isinstance(result, int) and not isinstance(result, bool) and result == 1:
+        return
+    if isinstance(result, bytes | str) and result in (b"1", "1"):
+        return
+    raise ConfigurationError(
+        "Redis cache backend cannot provide the configured advanced features."
+    )
+
+
+def _validate_stream_readiness_result(result: object) -> None:
+    if not isinstance(result, list | tuple) or len(result) < 2:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    _validate_stream_result(result[0])
 
 
 def _readiness_entry_id(records: object) -> object:

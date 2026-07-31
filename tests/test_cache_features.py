@@ -14,6 +14,7 @@ from cache_feature_conformance import (
     assert_work_queue_conformance,
 )
 from wybra.cache import (
+    MAX_STREAM_POSITION,
     AtomicCacheCapability,
     AtomicCacheValue,
     CacheBackend,
@@ -49,6 +50,7 @@ from wybra.cache import (
 from wybra.cache.redis_atomic import RedisAtomicCache
 from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_streams import RedisStreamCache
 from wybra.core.exceptions import ConfigurationError
 
 
@@ -304,6 +306,76 @@ async def test_redis_registers_selected_shared_features(
 
 
 @pytest.mark.anyio
+async def test_redis_registers_stream_feature_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StreamClient:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            self.scripts.append(script)
+            if "xadd" in script:
+                return b"1"
+            if "xrange" in script:
+                return [1, [b"1-0", [b"p", b"1", b"d", b"readiness"]]]
+            return 1
+
+        async def hget(self, *_args: object) -> None:
+            return None
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = StreamClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    caches = await build_caches(
+        CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="redis://secret@cache/0",
+                    features=("stream",),
+                ),
+            ),
+        )
+    )
+    instance = caches.require("default")
+
+    assert instance.features == ("stream",)
+    assert instance.require(StreamCacheCapability) is not None
+    guarantees = instance.feature_metadata[0].guarantees
+    assert guarantees.scope == "shared"
+    assert guarantees.durable
+    assert guarantees.restart_recovery
+    assert guarantees.horizontal_consumers
+    assert guarantees.ordering_scope == "stream"
+    assert guarantees.replay
+    assert guarantees.retention
+    assert guarantees.acknowledgement
+    assert len(client.scripts) == 4
+    assert "xadd" in client.scripts[0]
+    assert "xrange" in client.scripts[1]
+    assert "hset" in client.scripts[2]
+    assert "hdel" in client.scripts[3]
+    await caches.close()
+
+
+@pytest.mark.anyio
 async def test_redis_feature_failure_does_not_expose_provider_detail(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -428,6 +500,163 @@ async def test_redis_lease_readiness_does_not_require_atomic_read_permission() -
     runtime._client = LeaseClient()
 
     await runtime.validate_features(frozenset({"lease"}))
+
+
+@pytest.mark.anyio
+async def test_redis_stream_readiness_requires_stream_read_permission() -> None:
+    class RestrictedClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            if "xrange" in script:
+                raise PermissionError("XRANGE is denied")
+            return 1
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = RestrictedClient()
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await runtime.validate_features(frozenset({"stream"}))
+
+
+@pytest.mark.anyio
+async def test_redis_stream_readiness_rejects_invalid_script_result() -> None:
+    class InvalidClient:
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, *_args: object) -> bytes:
+            return b"0"
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache", "safe")
+    runtime._client = InvalidClient()
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await runtime.validate_features(frozenset({"stream"}))
+
+
+@pytest.mark.anyio
+async def test_redis_stream_rejects_malformed_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MalformedClient:
+        async def eval(self, *_args: object) -> list[object]:
+            return [1, [b"1-0", [b"p", b"1"]]]
+
+    client = MalformedClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    streams = RedisStreamCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    with pytest.raises(CacheFeatureError, match="invalid records"):
+        await streams.read("owner", "events")
+
+
+@pytest.mark.anyio
+async def test_redis_stream_reads_only_the_requested_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PagingClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        async def eval(
+            self,
+            *_args: object,
+        ) -> list[object]:
+            self.calls.append(_args)
+            return [1, [b"2-0", [b"p", b"2", b"d", b"second"]]]
+
+    client = PagingClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    streams = RedisStreamCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    records = await streams.read(
+        "owner",
+        "events",
+        after=StreamPosition(1),
+        limit=1,
+    )
+
+    assert [record.position.value for record in records] == [2]
+    assert len(client.calls) == 1
+    assert client.calls[0][1:] == (1, "safe:stream:owner:events", 1, 1)
+
+
+@pytest.mark.anyio
+async def test_redis_stream_rejects_acknowledgements_beyond_latest_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FutureAcknowledgementClient:
+        async def eval(self, *_args: object) -> int:
+            return 0
+
+    client = FutureAcknowledgementClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    streams = RedisStreamCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    with pytest.raises(CacheConflictError, match="does not exist"):
+        await streams.acknowledge(
+            "owner",
+            "events",
+            "projection",
+            StreamPosition(2),
+        )
+
+
+def test_stream_positions_are_bounded_for_every_backend() -> None:
+    with pytest.raises(ValueError, match="cannot exceed"):
+        StreamPosition(MAX_STREAM_POSITION + 1)
+
+
+@pytest.mark.anyio
+async def test_redis_stream_rejects_new_consumers_at_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CapacityClient:
+        async def eval(self, *_args: object) -> int:
+            return -2
+
+    client = CapacityClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    streams = RedisStreamCache(
+        RedisCacheRuntime("redis://cache", "safe"),
+        max_consumers=1,
+    )
+
+    with pytest.raises(CacheFeatureError, match="consumer capacity"):
+        await streams.acknowledge(
+            "owner",
+            "events",
+            "projection",
+            StreamPosition(1),
+        )
 
 
 @pytest.mark.anyio
@@ -1088,6 +1317,21 @@ async def test_stream_bounds_namespaces_and_consumer_positions() -> None:
     await stream.acknowledge("tasks", "one", "first", first)
     with pytest.raises(CacheFeatureError, match="consumer capacity"):
         await stream.acknowledge("tasks", "one", "second", first)
+
+
+@pytest.mark.anyio
+async def test_stream_bounds_and_releases_consumers_per_logical_stream() -> None:
+    stream = InMemoryStreamCache(max_consumers=1)
+    first = await stream.append("tasks", "first", b"one")
+    second = await stream.append("tasks", "second", b"two")
+    await stream.acknowledge("tasks", "first", "projection", first)
+    await stream.acknowledge("tasks", "second", "projection", second)
+
+    with pytest.raises(CacheFeatureError, match="consumer capacity"):
+        await stream.acknowledge("tasks", "first", "other", first)
+
+    assert await stream.forget_consumer("tasks", "first", "projection")
+    await stream.acknowledge("tasks", "first", "other", first)
 
 
 @pytest.mark.anyio

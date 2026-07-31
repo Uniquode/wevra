@@ -325,11 +325,13 @@ features. Startup fails with installation guidance when `wybra[cache]` is not
 installed, or with a bounded diagnostic when Redis is unavailable.
 
 The baseline byte cache needs only a reachable Redis server when configured
-with `features = []`. Enabling `atomic`, `lease`, or `work-queue` additionally requires Redis
-scripting, append-only persistence, and an eviction policy other than
-`allkeys-*`. Wybra checks those prerequisites at startup before advertising the
-features, because their revisions and fencing tokens must survive ordinary key
-expiry and process restart. If the Redis service blocks `CONFIG GET`, Wybra
+with `features = []`. Enabling `atomic`, `lease`, `stream`, or `work-queue`
+additionally requires Redis scripting, append-only persistence, and an eviction
+policy other than `allkeys-*`. Wybra checks those prerequisites at startup
+before advertising the features, because their revisions and fencing tokens
+must survive ordinary key expiry and process restart. Advanced-feature Redis
+ACLs must also permit `PEXPIRE` for bounded readiness probes. If the Redis
+service blocks `CONFIG GET`, Wybra
 logs a warning and continues only when its operational readiness checks pass;
 the operator then owns verification of persistence and eviction policy. Redis
 Cluster is not yet supported for these advanced features; use a standalone or
@@ -350,7 +352,7 @@ operation reports a safe cache error if the provider later becomes unavailable.
 | Atomic values and counters | Shared atomic create, compare-and-swap, compare-and-delete, and increment with persistent revisions |
 | Leases and fencing | Shared renewable leases with opaque holder tokens and persistent monotonic fencing tokens |
 | Work queues | Shared Redis Streams consumer-group delivery with acknowledgement, visibility recovery, delayed retry, and bounded dead letters |
-| Streams | Not yet implemented |
+| Streams | Shared ordered replay with a fixed 1,000-record retained history and durable consumer positions |
 | Pub/sub | Not yet implemented |
 | Schedules | Not yet implemented |
 
@@ -388,9 +390,45 @@ Task handlers and other consumers must be idempotent: a worker can complete an
 external side effect before it loses its delivery receipt, so exactly-once
 execution is not promised. Startup probes Redis Streams consumer groups,
 claims, scripts, sorted sets, and settlement operations; a server that lacks
-that command surface cannot advertise the feature. Durable stream replay, live
-pub/sub, scheduling, Taskiq adapters, and JetStream remain separate future
-work.
+that command surface cannot advertise the feature. Live pub/sub, scheduling,
+Taskiq adapters, and JetStream remain separate future work.
+
+### Redis streams
+
+The Redis `stream` feature provides durable ordered records for one logical
+owner and stream. Each append receives a stable, monotonically increasing
+`StreamPosition`; the Redis implementation keeps its internal stream identifier
+private. Internally, its identifiers encode the allocated position rather than
+a timestamp; do not add auto-generated Redis stream entries to Wybra-managed
+stream keys. Redis retains the latest 1,000 records for each logical stream and
+trims older records exactly when later records are appended. Stream positions
+use positive signed 64-bit integers, matching Redis's durable sequence limit.
+
+Consumers use `read_consumer()` and `acknowledge()` to retain a durable,
+monotonically advancing position. A consumer can therefore recreate its Wybra
+cache registry or resume on another application instance and read only records
+after its last acknowledgement. Reading is at least once until acknowledgement:
+an interrupted projection can read a record again and must make its external
+effects idempotent. Attempting to move an acknowledgement backwards or beyond
+the latest appended position raises `CacheConflictError`.
+
+Each logical Redis stream retains positions for at most 10,000 durable consumer
+names. A new consumer beyond that bound receives a cache feature error; use a
+stable consumer identity for a projection or explicitly partition independent
+projections into separate streams. Call `forget_consumer()` when a projection is
+permanently retired: it removes the durable position, frees the per-stream
+consumer slot, and causes a later consumer with that name to replay retained
+history.
+
+Replay is bounded by retention. Passing an `after` position older than the
+retained window, including through `read_consumer()` after a long-lived
+consumer has fallen behind, raises `CachePositionExpiredError` rather than
+silently skipping history. Recover by rebuilding the projection from its
+authoritative source, then acknowledge the most recent retained record before
+resuming consumer reads. Redis startup verifies the append, exact trim, replay,
+and consumer-position command surface before the feature is advertised.
+Deleting stream or sequence keys, `FLUSHDB`, and `FLUSHALL` invalidates their
+positions.
 
 ### Atomic values and leases
 
@@ -507,6 +545,12 @@ if records:
         records[-1].position,
     )
 
+await stream.forget_consumer(
+    "tasks",
+    "lifecycle",
+    "retired-status-projection",
+)
+
 pubsub = tasks.require(PubSubCacheCapability, consumer="live task updates")
 subscription = await pubsub.subscribe("tasks", "updates")
 try:
@@ -518,6 +562,13 @@ finally:
 A replay request older than retained stream history raises
 `CachePositionExpiredError`. Pub/sub never promises replay; publishing before a
 subscriber connects returns no delivery for that subscriber.
+
+For Redis, a logical stream retains exactly 1,000 records. A projection that
+cannot tolerate missed history must acknowledge frequently enough to remain
+within that retained window, or rebuild from its authoritative source. Both
+memory and Redis backends bound durable consumer names per logical stream;
+retire obsolete names with `forget_consumer()` so they do not consume that
+stream's capacity.
 
 ### Schedules
 

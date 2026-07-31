@@ -145,6 +145,13 @@ class StreamCacheCapability(Protocol):
         position: StreamPosition,
     ) -> None: ...
 
+    async def forget_consumer(
+        self,
+        owner: str,
+        stream: str,
+        consumer: str,
+    ) -> bool: ...
+
 
 @runtime_checkable
 class PubSubSubscription(Protocol):

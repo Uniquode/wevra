@@ -42,6 +42,7 @@ _EXPORT_MODULES = {
     "LeaseCacheCapability": "wybra.cache.feature_contracts",
     "LeaseToken": "wybra.cache.feature_models",
     "MAX_CACHE_FEATURE_PAYLOAD_BYTES": "wybra.cache.feature_models",
+    "MAX_STREAM_POSITION": "wybra.cache.feature_models",
     "PubSubCacheCapability": "wybra.cache.feature_contracts",
     "PubSubSubscription": "wybra.cache.feature_contracts",
     "RedisCache": "wybra.cache.capabilities",

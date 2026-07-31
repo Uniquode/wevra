@@ -296,6 +296,10 @@ async def assert_stream_conformance(
     await feature.acknowledge(owner, "events", "projection", second)
     with pytest.raises(CacheConflictError):
         await feature.acknowledge(owner, "events", "projection", first)
+    assert await feature.forget_consumer(owner, "events", "missing") is False
+    assert await feature.forget_consumer(owner, "events", "projection") is True
+    replayed = await feature.read_consumer(owner, "events", "projection")
+    assert [record.position for record in replayed] == [first, second]
 
     retained_positions = [
         await feature.append(owner, "retained", str(index).encode())
