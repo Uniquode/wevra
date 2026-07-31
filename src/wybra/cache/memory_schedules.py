@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from wybra.cache.feature_models import (
+    DEFAULT_SCHEDULE_MAX_RECORDS,
     CacheConflictError,
     CacheFeatureError,
     CacheRevision,
@@ -16,10 +17,10 @@ from wybra.cache.feature_models import (
     ScheduleRecord,
     validate_finite,
     validate_limit,
-    validate_payload,
     validate_positive_finite,
     validate_positive_integer,
     validate_resource,
+    validate_schedule_values,
 )
 
 type Clock = Callable[[], float]
@@ -38,7 +39,7 @@ class _ClaimState:
 @dataclass(slots=True)
 class InMemoryScheduleCache:
     clock: Clock = field(default=time.time, repr=False)
-    max_records: int = 10_000
+    max_records: int = DEFAULT_SCHEDULE_MAX_RECORDS
     _records: dict[ScheduleKey, ScheduleRecord] = field(
         default_factory=dict,
         init=False,
@@ -64,7 +65,7 @@ class InMemoryScheduleCache:
         interval_seconds: float | None = None,
     ) -> ScheduleRecord | None:
         schedule_key = _schedule_key(owner, identity)
-        payload, next_due_at, interval_seconds = _schedule_values(
+        payload, next_due_at, interval_seconds = validate_schedule_values(
             payload,
             next_due_at,
             interval_seconds,
@@ -98,7 +99,7 @@ class InMemoryScheduleCache:
         interval_seconds: float | None = None,
     ) -> ScheduleRecord | None:
         schedule_key = _schedule_key(owner, identity)
-        payload, next_due_at, interval_seconds = _schedule_values(
+        payload, next_due_at, interval_seconds = validate_schedule_values(
             payload,
             next_due_at,
             interval_seconds,
@@ -244,21 +245,6 @@ def _schedule_key(owner: str, identity: str) -> ScheduleKey:
         validate_resource(owner, label="cache owner"),
         validate_resource(identity, label="schedule identity"),
     )
-
-
-def _schedule_values(
-    payload: bytes,
-    next_due_at: float,
-    interval_seconds: float | None,
-) -> tuple[bytes, float, float | None]:
-    payload = validate_payload(payload)
-    next_due_at = validate_finite(next_due_at, label="schedule due time")
-    if interval_seconds is not None:
-        interval_seconds = validate_positive_finite(
-            interval_seconds,
-            label="schedule interval",
-        )
-    return payload, next_due_at, interval_seconds
 
 
 def _claim_value(

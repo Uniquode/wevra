@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from wybra.cache.feature_contracts import (
     AtomicCacheCapability,
     LeaseCacheCapability,
+    ScheduleCacheCapability,
     StreamCacheCapability,
     WorkQueueCacheCapability,
 )
@@ -17,6 +18,7 @@ from wybra.cache.redis_atomic import RedisAtomicCache
 from wybra.cache.redis_leases import RedisLeaseCache
 from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_schedules import RedisScheduleCache
 from wybra.cache.redis_streams import RedisStreamCache
 
 REDIS_ATOMIC_FEATURE = CacheFeatureMetadata(
@@ -64,6 +66,17 @@ REDIS_STREAM_FEATURE = CacheFeatureMetadata(
         acknowledgement=True,
     ),
 )
+REDIS_SCHEDULE_FEATURE = CacheFeatureMetadata(
+    "schedule",
+    CacheFeatureGuarantees(
+        scope="shared",
+        durable=True,
+        restart_recovery=True,
+        horizontal_consumers=True,
+        ordering_scope="due-time",
+        scheduling=True,
+    ),
+)
 REDIS_CACHE_FEATURES = frozenset(
     feature.name
     for feature in (
@@ -71,6 +84,7 @@ REDIS_CACHE_FEATURES = frozenset(
         REDIS_LEASE_FEATURE,
         REDIS_WORK_QUEUE_FEATURE,
         REDIS_STREAM_FEATURE,
+        REDIS_SCHEDULE_FEATURE,
     )
 )
 
@@ -82,12 +96,14 @@ class RedisCacheFeatures:
     leases: RedisLeaseCache = field(init=False)
     work_queue: RedisWorkQueue = field(init=False)
     streams: RedisStreamCache = field(init=False)
+    schedules: RedisScheduleCache = field(init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "atomic", RedisAtomicCache(self.runtime))
         object.__setattr__(self, "leases", RedisLeaseCache(self.runtime))
         object.__setattr__(self, "work_queue", RedisWorkQueue(self.runtime))
         object.__setattr__(self, "streams", RedisStreamCache(self.runtime))
+        object.__setattr__(self, "schedules", RedisScheduleCache(self.runtime))
 
     def registrations(self) -> tuple[CacheFeatureRegistration, ...]:
         return (
@@ -111,6 +127,11 @@ class RedisCacheFeatures:
                 self.streams,
                 REDIS_STREAM_FEATURE,
             ),
+            CacheFeatureRegistration(
+                ScheduleCacheCapability,
+                self.schedules,
+                REDIS_SCHEDULE_FEATURE,
+            ),
         )
 
     async def close(self) -> None:
@@ -121,6 +142,7 @@ __all__ = (
     "REDIS_ATOMIC_FEATURE",
     "REDIS_CACHE_FEATURES",
     "REDIS_LEASE_FEATURE",
+    "REDIS_SCHEDULE_FEATURE",
     "REDIS_STREAM_FEATURE",
     "REDIS_WORK_QUEUE_FEATURE",
     "RedisCacheFeatures",
