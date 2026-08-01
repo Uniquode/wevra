@@ -375,17 +375,61 @@ class RedisWorkQueue:
             label="visibility timeout",
         )
         redis_consumer = f"{_CONSUMER_PREFIX}{uuid4().hex}:{consumer}"
-        delivery = await self._reserve(
-            keys,
-            redis_consumer,
-            visibility_timeout,
-            visibility_milliseconds,
-            wait_timeout,
-        )
-        if delivery is None:
-            await self._remove_consumer_if_idle(keys, redis_consumer)
+        try:
+            delivery = await self._reserve(
+                keys,
+                redis_consumer,
+                visibility_timeout,
+                visibility_milliseconds,
+                wait_timeout,
+            )
+        except BaseException:
             self._consumers.discard((keys, redis_consumer))
+            await self._cleanup_generated_consumer(
+                keys,
+                redis_consumer,
+                suppress_errors=True,
+            )
+            raise
+        if delivery is None:
+            self._consumers.discard((keys, redis_consumer))
+            await self._cleanup_generated_consumer(
+                keys,
+                redis_consumer,
+                suppress_errors=False,
+            )
         return delivery
+
+    async def _cleanup_generated_consumer(
+        self,
+        keys: _QueueKeys,
+        consumer: str,
+        *,
+        suppress_errors: bool,
+    ) -> None:
+        cleanup = asyncio.create_task(
+            self._remove_consumer_if_idle(keys, consumer),
+            name="wybra-cache-consumer-cleanup",
+        )
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                pass
+        try:
+            cleanup.result()
+        except Exception as error:
+            if not suppress_errors:
+                raise
+            logger.warning(
+                "Redis work-queue consumer cleanup failed after reserve error: %s.",
+                type(error).__name__,
+            )
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _reserve(
         self,

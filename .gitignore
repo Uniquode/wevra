@@ -34,3 +34,4 @@ build/
 .guide.yaml
 .openspec-*.*
 .idea
+.pi-subagents

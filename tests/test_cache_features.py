@@ -1953,6 +1953,65 @@ async def test_redis_work_queue_reject_preserves_positive_submilliseconds(
     assert captured == {"delay": 1}
 
 
+@pytest.mark.anyio
+async def test_redis_work_queue_cancellation_cleans_generated_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = RedisWorkQueue(RedisCacheRuntime("redis://cache", "safe"))
+    reserve_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def blocking_reserve(
+        self: RedisWorkQueue,
+        keys: object,
+        consumer: str,
+        _visibility_timeout: float,
+        _visibility_milliseconds: int,
+        _wait_timeout: float,
+    ) -> None:
+        self._consumers.add((keys, consumer))  # type: ignore[arg-type]
+        reserve_started.set()
+        await asyncio.Event().wait()
+
+    async def delayed_cleanup(
+        _self: RedisWorkQueue,
+        _keys: object,
+        _consumer: str,
+    ) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(RedisWorkQueue, "_reserve", blocking_reserve)
+    monkeypatch.setattr(
+        RedisWorkQueue,
+        "_remove_consumer_if_idle",
+        delayed_cleanup,
+    )
+    reservation = asyncio.create_task(
+        queue.reserve(
+            "tasks",
+            "default",
+            "worker",
+            visibility_timeout=30,
+            wait_timeout=10,
+        )
+    )
+
+    await reserve_started.wait()
+    reservation.cancel()
+    await cleanup_started.wait()
+
+    assert not reservation.done()
+    assert queue._consumers == set()
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reservation
+    assert cleanup_finished.is_set()
+
+
 async def _memory_backend() -> CacheBackend:
     return CacheBackend(InMemoryCache())
 

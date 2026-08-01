@@ -112,9 +112,9 @@ name must correspond to `[cache]` for `default`, or to a configured named cache
 such as `[cache.task_work]` when `cache_name = "task_work"`. Taskiq preflight
 runs after cache setup finalisation and checks that `wybra.cache` provides the
 selected cache. It then stops startup with an explicit message that no
-cache-backed Taskiq broker is available yet. This protects applications from
-silently falling back to inline execution while durable task integration is
-incomplete.
+configured cache-backed Taskiq runtime is available yet. This protects
+applications from silently falling back to inline execution while durable task
+integration is incomplete.
 
 ### Cache-backed Taskiq results
 
@@ -139,6 +139,31 @@ interval together to control result-wait cache traffic.
 `get_result(..., with_logs=False)` omits the result's worker log. Request logs
 explicitly with `with_logs=True`; this controls the returned result, not the
 cache read, because Taskiq stores the log in its result envelope.
+
+### Cache-backed Taskiq broker
+
+`CacheTaskiqBroker` is the reusable optional adapter from Taskiq's broker
+contract to a named cache's work-queue feature. It publishes the opaque bytes
+produced by Taskiq's formatter and returns them to workers with a Taskiq
+acknowledgement callback bound to the exact queue delivery. Taskiq task identity
+remains in its message envelope; cache delivery receipts and provider details
+remain internal to the adapter. Durability follows the selected cache provider:
+the memory work queue remains process-local and volatile, while a conforming
+production provider advertises its shared durability and restart guarantees.
+
+Taskiq retry middleware re-publishes a failed task through the broker and its
+float-coercible `delay` label becomes durable queue delay in seconds. A worker
+that stops before acknowledging leaves its delivery for normal visibility-expiry
+recovery. Production workers that require at-least-once execution must not use
+Taskiq's `WHEN_RECEIVED` acknowledgement mode, which settles the delivery before
+execution. Configure the visibility timeout to cover prefetch queueing plus the
+longest expected execution and result-save interval; a shorter timeout permits
+the same task to be delivered concurrently while its first execution is still
+running.
+
+The adapter does not activate `[tasks] backend = "taskiq"` itself; site
+capability, worker registration, lifecycle, and scheduling integration remain
+later work.
 
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
