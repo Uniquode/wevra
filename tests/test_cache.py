@@ -15,6 +15,7 @@ from jinja2.exceptions import TemplateRuntimeError
 from wybra.cache import (
     CacheBackend,
     CacheCapability,
+    CacheFeatureError,
     CacheNotFoundError,
     CachesCapability,
     CacheSettings,
@@ -26,6 +27,7 @@ from wybra.cache import (
     setup_site,
 )
 from wybra.cache.redis_connection import resolve_redis_urls
+from wybra.cache.redis_features import RedisCacheFeatures
 from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.config import (
     ConfigService,
@@ -264,6 +266,19 @@ url = "redis://cache/1"
         assert settings.require("messages").features == ("atomic",)
         assert settings.require("baseline").features == ()
 
+    def test_accepts_redis_live_pubsub_feature_selection(self) -> None:
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "redis",
+                    "url": "redis://cache/0",
+                    "features": ["pub-sub"],
+                }
+            }
+        )
+
+        assert settings.require("default").features == ("pub-sub",)
+
     def test_treats_blank_environment_feature_selection_as_unset(self) -> None:
         ConfigService.set_runtime_environment({"WYBRA_CACHE_FEATURES": "   "})
         config = ConfigService(
@@ -371,6 +386,7 @@ url = "redis://cache/1"
         assert diagnostics[0].features == (
             "atomic",
             "lease",
+            "pub-sub",
             "schedule",
             "stream",
             "work-queue",
@@ -1445,6 +1461,34 @@ class TestCacheModule:
         assert close_calls == ["session", "default"]
 
     @pytest.mark.anyio
+    async def test_registry_retries_only_failed_backend_cleanup(self) -> None:
+        settings = CachesSettings.load_settings(
+            {"cache": {}, "cache.session": {"backend": "memory"}}
+        )
+        close_calls: list[str] = []
+        session_attempts = 0
+
+        async def factory(settings: CacheSettings) -> CacheBackend:
+            async def close() -> None:
+                nonlocal session_attempts
+                close_calls.append(settings.name)
+                if settings.name == "session":
+                    session_attempts += 1
+                    if session_attempts == 1:
+                        raise RuntimeError("close failed once")
+
+            return CacheBackend(InMemoryCache(), close)
+
+        caches = await build_caches(settings, factories={"memory": factory})
+
+        with pytest.raises(BaseExceptionGroup, match="shutdown failed"):
+            await caches.close()
+        await caches.close()
+        await caches.close()
+
+        assert close_calls == ["session", "default", "session"]
+
+    @pytest.mark.anyio
     async def test_registry_preserves_cancellation_after_closing_every_backend(
         self,
     ) -> None:
@@ -1467,6 +1511,114 @@ class TestCacheModule:
             await caches.close()
 
         assert close_calls == ["session", "default"]
+
+    @pytest.mark.anyio
+    async def test_registry_retries_only_cancelled_backend_cleanup(self) -> None:
+        settings = CachesSettings.load_settings(
+            {"cache": {}, "cache.session": {"backend": "memory"}}
+        )
+        close_calls: list[str] = []
+        session_attempts = 0
+
+        async def factory(settings: CacheSettings) -> CacheBackend:
+            async def close() -> None:
+                nonlocal session_attempts
+                close_calls.append(settings.name)
+                if settings.name == "session":
+                    session_attempts += 1
+                    if session_attempts == 1:
+                        raise asyncio.CancelledError
+
+            return CacheBackend(InMemoryCache(), close)
+
+        caches = await build_caches(settings, factories={"memory": factory})
+
+        with pytest.raises(asyncio.CancelledError):
+            await caches.close()
+        await caches.close()
+
+        assert close_calls == ["session", "default", "session"]
+
+    @pytest.mark.anyio
+    async def test_registry_serialises_concurrent_close_calls(self) -> None:
+        settings = CachesSettings.load_settings({"cache": {}})
+        started = asyncio.Event()
+        release = asyncio.Event()
+        close_calls = 0
+
+        async def factory(_settings: CacheSettings) -> CacheBackend:
+            async def close() -> None:
+                nonlocal close_calls
+                close_calls += 1
+                started.set()
+                await release.wait()
+
+            return CacheBackend(InMemoryCache(), close)
+
+        caches = await build_caches(settings, factories={"memory": factory})
+        first = asyncio.create_task(caches.close())
+        await started.wait()
+        second = asyncio.create_task(caches.close())
+        await asyncio.sleep(0)
+        release.set()
+
+        await asyncio.gather(first, second)
+
+        assert close_calls == 1
+
+    @pytest.mark.anyio
+    async def test_redis_backend_retries_features_before_closing_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = SimpleNamespace(close_count=0)
+        feature_close_attempts = 0
+
+        async def ping() -> bool:
+            return True
+
+        async def close_client() -> None:
+            client.close_count += 1
+
+        client.ping = ping
+        client.aclose = close_client
+        monkeypatch.setattr(
+            "wybra.cache.redis_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+            ),
+        )
+        original_close = RedisCacheFeatures.close
+
+        async def fail_features_once(features: RedisCacheFeatures) -> None:
+            nonlocal feature_close_attempts
+            feature_close_attempts += 1
+            if feature_close_attempts == 1:
+                raise CacheFeatureError("feature cleanup failed once")
+            await original_close(features)
+
+        monkeypatch.setattr(RedisCacheFeatures, "close", fail_features_once)
+        caches = await build_caches(
+            CachesSettings(
+                instances=(
+                    CacheSettings(
+                        backend="redis",
+                        url="redis://cache/0",
+                        features=(),
+                    ),
+                )
+            )
+        )
+
+        with pytest.raises(BaseExceptionGroup, match="shutdown failed"):
+            await caches.close()
+        assert client.close_count == 0
+
+        await caches.close()
+        await caches.close()
+
+        assert feature_close_attempts == 2
+        assert client.close_count == 1
 
     @pytest.mark.anyio
     async def test_registry_closes_shared_lifecycle_owner_once(self) -> None:
