@@ -1625,40 +1625,6 @@ class TestAuthentication:
         await assert_encrypted_storage()
 
     @pytest.mark.anyio
-    async def test_wybra_auth_provider_credential_store_handles_legacy_plaintext(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        async def assert_legacy_plaintext() -> None:
-            database = await initialise_auth_database(
-                sqlite_file_url(tmp_path / "provider-legacy.sqlite3")
-            )
-            try:
-                async with connection_scope(database) as session:
-                    provider = await IdentityProvider.create(
-                        provider_name="github",
-                        provider_subject="subject-1",
-                        crypt_access_token="legacy-access-token",
-                        crypt_refresh_token="legacy-refresh-token",
-                        account_email="person@example.com",
-                        provider_enabled=True,
-                        using_db=session,
-                    )
-
-                    store = TortoiseProviderCredentialStore(
-                        session,
-                        make_test_only_secret_service(),
-                    )
-
-                    assert store.decrypt_access_token(provider) == "legacy-access-token"
-                    assert (
-                        store.decrypt_refresh_token(provider) == "legacy-refresh-token"
-                    )
-            finally:
-                await close_database(database)
-
-        await assert_legacy_plaintext()
-
     @pytest.mark.anyio
     async def test_wybra_auth_provider_credential_store_rejects_malformed_envelope(
         self,
@@ -1730,8 +1696,8 @@ class TestAuthentication:
         secret_service = SecretEnvelopeService.from_env({})
 
         assert options.integration_enabled("provider") is False
-        assert secret_service.decrypt("legacy-plaintext") == (
-            "legacy-plaintext",
+        assert secret_service.decrypt("plain-token") == (
+            "plain-token",
             PLAIN_TEXT_VERSION,
         )
 

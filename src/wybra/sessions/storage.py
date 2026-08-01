@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import logging
 import uuid
-import warnings
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -293,111 +291,6 @@ class CookieSessionStorage:
 
 
 @dataclass(frozen=True, slots=True)
-class CacheSessionStorage:
-    url: str
-    key_prefix: str
-    payload_max_bytes: int
-    cleanup_registry: SessionCleanupRegistry | None = None
-    _client: Any = field(default=None, init=False, repr=False, compare=False)
-    _memory: MemorySessionStorage | None = field(default=None, init=False, repr=False)
-
-    async def load(self, session_id: str, *, now: float) -> SessionRecord | None:
-        if self.url.startswith("memory://"):
-            return await self._memory_storage().load(session_id, now=now)
-        raw_payload = await self._redis_client().get(self._key(session_id))
-        if raw_payload is None:
-            return None
-        if isinstance(raw_payload, bytes):
-            raw_payload = raw_payload.decode("utf-8")
-        if not isinstance(raw_payload, str):
-            return None
-        try:
-            record = _record_from_json(raw_payload)
-        except SessionStorageError:
-            return None
-        if record.expired(now):
-            await self.delete(session_id)
-            return None
-        return record
-
-    async def save(self, session_id: str, record: SessionRecord) -> None:
-        if self.url.startswith("memory://"):
-            await self._memory_storage().save(session_id, record)
-            return
-        payload = _record_json(record, max_bytes=self.payload_max_bytes)
-        await self._redis_client().set(
-            self._key(session_id),
-            payload,
-            ex=max(1, int(record.expires_at - record.updated_at)),
-        )
-
-    async def delete(self, session_id: str) -> None:
-        if self.url.startswith("memory://"):
-            await self._memory_storage().delete(session_id)
-            return
-        client = self._redis_client()
-        raw_payload = await client.get(self._key(session_id))
-        cleanup_data = _record_data_from_json(raw_payload)
-        await client.delete(self._key(session_id))
-        if cleanup_data is not None:
-            await _cleanup_session_data(self.cleanup_registry, cleanup_data)
-
-    async def validate(self) -> None:
-        if self.url.startswith("memory://"):
-            return None
-        try:
-            await self._redis_client().ping()
-        except Exception as exc:  # pragma: no cover - external service
-            raise SessionStorageError("Redis session cache is unavailable.") from exc
-
-    async def cleanup(self, *, now: float) -> None:
-        if self.url.startswith("memory://"):
-            await self._memory_storage().cleanup(now=now)
-
-    async def close(self) -> None:
-        if self._memory is not None:
-            await self._memory.close()
-        client = self._client
-        if client is None:
-            return
-        close = getattr(client, "aclose", None) or getattr(client, "close", None)
-        if close is not None:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
-        object.__setattr__(self, "_client", None)
-
-    def _memory_storage(self) -> MemorySessionStorage:
-        if self._memory is None:
-            object.__setattr__(
-                self,
-                "_memory",
-                MemorySessionStorage(
-                    payload_max_bytes=self.payload_max_bytes,
-                    cleanup_registry=self.cleanup_registry,
-                ),
-            )
-        assert self._memory is not None
-        return self._memory
-
-    def _redis_client(self) -> Any:
-        if self._client is not None:
-            return self._client
-        try:
-            redis_module = importlib.import_module("redis.asyncio")
-        except ImportError as exc:
-            raise SessionsConfigurationError(
-                "Redis session cache requires the optional redis package."
-            ) from exc
-        client = redis_module.Redis.from_url(self.url, decode_responses=True)
-        object.__setattr__(self, "_client", client)
-        return client
-
-    def _key(self, session_id: str) -> str:
-        return f"{self.key_prefix}{session_id}"
-
-
-@dataclass(frozen=True, slots=True)
 class NamedCacheSessionStorage:
     cache: CacheCapability = field(repr=False)
     key_prefix: str
@@ -559,19 +452,10 @@ def storage_from_settings(
     cleanup_registry: SessionCleanupRegistry | None = None,
 ) -> SessionStorage:
     if settings.resolved_storage_backend is not SessionStorageBackend.CACHE:
-        ignored_cache_settings = [
-            setting
-            for setting, value in (
-                ("cache_name", settings.cache_name),
-                ("cache_url", settings.cache_url),
-            )
-            if value is not None
-        ]
-        if ignored_cache_settings:
+        if settings.cache_name is not None:
             logger.warning(
-                "wybra.sessions.%s %s ignored unless storage_backend is 'cache'.",
-                " and wybra.sessions.".join(ignored_cache_settings),
-                "are" if len(ignored_cache_settings) > 1 else "is",
+                "wybra.sessions.cache_name is ignored unless storage_backend is "
+                "'cache'."
             )
     if settings.resolved_storage_backend is SessionStorageBackend.MEMORY:
         return MemorySessionStorage(
@@ -591,23 +475,6 @@ def storage_from_settings(
             cleanup_registry=cleanup_registry,
         )
     if settings.resolved_storage_backend is SessionStorageBackend.CACHE:
-        if settings.cache_url is not None:
-            deprecation_message = (
-                "wybra.sessions.cache_url is deprecated; configure wybra.cache "
-                "and select it with wybra.sessions.cache_name instead."
-            )
-            warnings.warn(
-                deprecation_message,
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            logger.warning(deprecation_message)
-            return CacheSessionStorage(
-                url=settings.cache_url,
-                key_prefix=settings.cache_key_prefix,
-                payload_max_bytes=settings.resolved_payload_max_bytes,
-                cleanup_registry=cleanup_registry,
-            )
         try:
             caches = site.require_capability(CachesCapability)
         except SiteCapabilityError as exc:
@@ -823,7 +690,6 @@ def _check_size(value: str, max_bytes: int) -> None:
 
 
 __all__ = (
-    "CacheSessionStorage",
     "CookieSessionStorage",
     "DatabaseSessionStorage",
     "FileSessionStorage",

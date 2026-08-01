@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import asyncio
-import importlib
 import json
 import logging
 import uuid
-import warnings
 from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, ClassVar, Protocol, cast
-from urllib.parse import urlparse
 
 from fastapi import Request
 from tortoise.expressions import Q
@@ -48,7 +43,6 @@ REQUEST_ALERTS_ACKNOWLEDGED_ATTRIBUTE = "wybra_messages_alerts_acknowledged"
 DEFAULT_ATOMIC_QUEUE_CONFLICT_ATTEMPTS = 8
 QUEUE_ENTRY_ID_KEY = "_wybra_queue_entry_id"
 EXPIRED_SESSION_QUEUE_TTL_SECONDS = 1.0
-WYBRA_WARNING_SKIP_PREFIXES = (str(Path(__file__).resolve().parents[1]),)
 
 
 class MessagesStorage(Protocol):
@@ -256,61 +250,6 @@ class CacheMessagesStorage:
         await self.backend.close()
 
 
-@dataclass(slots=True)
-class InMemoryCacheQueueBackend:
-    _queues: dict[str, list[AlertPayload]] = field(default_factory=dict)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-    async def append(
-        self,
-        queue_key: str,
-        payload: AlertPayload,
-        *,
-        queue_depth: int,
-        ttl_seconds: float,
-    ) -> None:
-        async with self._lock:
-            queue = list(self._queues.get(queue_key, ()))
-            queue.append(payload)
-            self._queues[queue_key] = queue[-queue_depth:]
-
-    async def pop(self, queue_key: str) -> tuple[AlertPayload, ...]:
-        async with self._lock:
-            return tuple(self._queues.pop(queue_key, ()))
-
-    async def peek(self, queue_key: str) -> tuple[AlertPayload, ...]:
-        async with self._lock:
-            return tuple(self._queues.get(queue_key, ()))
-
-    async def acknowledge(
-        self,
-        queue_key: str,
-        *,
-        observed: Sequence[Mapping[str, object]] | None = None,
-        ttl_seconds: float | None = None,
-    ) -> None:
-        del ttl_seconds
-        async with self._lock:
-            if observed is None:
-                self._queues.pop(queue_key, None)
-                return
-            current = self._queues.get(queue_key)
-            if current is None:
-                return
-            remaining = _remaining_after_acknowledgement(current, observed)
-            if remaining:
-                self._queues[queue_key] = remaining
-            else:
-                self._queues.pop(queue_key, None)
-
-    async def validate(self) -> None:
-        return None
-
-    async def close(self) -> None:
-        async with self._lock:
-            self._queues.clear()
-
-
 @dataclass(frozen=True, slots=True)
 class NamedCacheQueueBackend:
     atomic: AtomicCacheCapability = field(repr=False)
@@ -464,114 +403,6 @@ class NamedCacheQueueBackend:
         )
 
 
-_REDIS_APPEND_QUEUE_SCRIPT = """
-local raw_queue = redis.call('GET', KEYS[1])
-local queue = {}
-if raw_queue then
-  local ok, decoded = pcall(cjson.decode, raw_queue)
-  if ok and type(decoded) == 'table' then
-    queue = decoded
-  end
-end
-
-local ok, payload = pcall(cjson.decode, ARGV[1])
-if not ok then
-  return redis.error_reply('invalid alert payload')
-end
-
-table.insert(queue, payload)
-local queue_depth = tonumber(ARGV[2])
-while #queue > queue_depth do
-  table.remove(queue, 1)
-end
-
-redis.call('SET', KEYS[1], cjson.encode(queue), 'EX', tonumber(ARGV[3]))
-return 1
-"""
-
-_REDIS_POP_QUEUE_SCRIPT = """
-local raw_queue = redis.call('GET', KEYS[1])
-if raw_queue then
-  redis.call('DEL', KEYS[1])
-end
-return raw_queue
-"""
-
-
-@dataclass(slots=True)
-class RedisCacheQueueBackend:
-    url: str
-    _client: Any = field(default=None, init=False, repr=False)
-
-    async def append(
-        self,
-        queue_key: str,
-        payload: AlertPayload,
-        *,
-        queue_depth: int,
-        ttl_seconds: float,
-    ) -> None:
-        await self._redis_client().eval(
-            _REDIS_APPEND_QUEUE_SCRIPT,
-            1,
-            queue_key,
-            json.dumps(payload),
-            str(queue_depth),
-            str(max(1, int(ttl_seconds))),
-        )
-
-    async def pop(self, queue_key: str) -> tuple[AlertPayload, ...]:
-        raw_queue = await self._redis_client().eval(
-            _REDIS_POP_QUEUE_SCRIPT,
-            1,
-            queue_key,
-        )
-        return tuple(_payloads_from_json(raw_queue))
-
-    async def peek(self, queue_key: str) -> tuple[AlertPayload, ...]:
-        return tuple(_payloads_from_json(await self._redis_client().get(queue_key)))
-
-    async def acknowledge(
-        self,
-        queue_key: str,
-        *,
-        observed: Sequence[Mapping[str, object]] | None = None,
-        ttl_seconds: float | None = None,
-    ) -> None:
-        del observed, ttl_seconds
-        await self._redis_client().delete(queue_key)
-
-    async def validate(self) -> None:
-        client = self._redis_client()
-        try:
-            await client.ping()
-        except Exception as exc:  # pragma: no cover - depends on external service
-            raise MessageStorageError("Redis messages cache is unavailable.") from exc
-
-    async def close(self) -> None:
-        client = self._client
-        if client is None:
-            return
-        close = getattr(client, "aclose", None) or getattr(client, "close", None)
-        if close is not None:
-            result = close()
-            if asyncio.iscoroutine(result):
-                await result
-        self._client = None
-
-    def _redis_client(self) -> Any:
-        if self._client is not None:
-            return self._client
-        try:
-            redis_module = importlib.import_module("redis.asyncio")
-        except ImportError as exc:
-            raise MessagesConfigurationError(
-                "Redis messages cache requires the optional redis package."
-            ) from exc
-        self._client = redis_module.Redis.from_url(self.url, decode_responses=True)
-        return self._client
-
-
 @dataclass(frozen=True, slots=True)
 class DatabaseMessagesStorage:
     settings: MessagesSettings
@@ -690,38 +521,14 @@ class DatabaseMessagesStorage:
 
 def storage_from_settings(site: Site, settings: MessagesSettings) -> MessagesStorage:
     if settings.resolved_storage_backend is not MessageStorageBackend.CACHE:
-        ignored_cache_settings = [
-            setting
-            for setting, value in (
-                ("cache_name", settings.cache_name),
-                ("cache_url", settings.cache_url),
-            )
-            if value is not None
-        ]
-        if ignored_cache_settings:
+        if settings.cache_name is not None:
             logger.warning(
-                "wybra.messages.%s %s ignored unless storage_backend is 'cache'.",
-                " and wybra.messages.".join(ignored_cache_settings),
-                "are" if len(ignored_cache_settings) > 1 else "is",
+                "wybra.messages.cache_name is ignored unless storage_backend is "
+                "'cache'."
             )
     if settings.resolved_storage_backend is MessageStorageBackend.SESSION:
         return SessionMessagesStorage(settings)
     if settings.resolved_storage_backend is MessageStorageBackend.CACHE:
-        if settings.cache_url is not None:
-            deprecation_message = (
-                "wybra.messages.cache_url is deprecated; configure wybra.cache "
-                "and select it with wybra.messages.cache_name instead."
-            )
-            warnings.warn(
-                deprecation_message,
-                DeprecationWarning,
-                skip_file_prefixes=WYBRA_WARNING_SKIP_PREFIXES,
-            )
-            logger.warning(deprecation_message)
-            return CacheMessagesStorage(
-                settings=settings,
-                backend=cache_backend_from_url(settings.cache_url),
-            )
         try:
             caches = site.require_capability(CachesCapability)
         except SiteCapabilityError as exc:
@@ -754,17 +561,6 @@ def storage_from_settings(site: Site, settings: MessagesSettings) -> MessagesSto
             database=site.capability_proxy(DatabaseCapability),
         )
     raise MessagesConfigurationError("Unsupported messages storage backend.")
-
-
-def cache_backend_from_url(url: str) -> CacheQueueBackend:
-    parsed = urlparse(url)
-    if parsed.scheme == "memory":
-        return InMemoryCacheQueueBackend()
-    if parsed.scheme in {"redis", "rediss"}:
-        return RedisCacheQueueBackend(url)
-    raise MessagesConfigurationError(
-        "wybra.messages.cache_url must use memory://, redis://, or rediss://."
-    )
 
 
 def request_session(request: Request) -> MutableMapping[str, Any]:
@@ -951,12 +747,9 @@ __all__ = (
     "CacheMessagesStorage",
     "CacheQueueBackend",
     "DatabaseMessagesStorage",
-    "InMemoryCacheQueueBackend",
     "MessagesStorage",
     "NamedCacheQueueBackend",
-    "RedisCacheQueueBackend",
     "SessionMessagesStorage",
-    "cache_backend_from_url",
     "request_session",
     "server_side_queue_key",
     "storage_from_settings",

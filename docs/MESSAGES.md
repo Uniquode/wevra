@@ -74,24 +74,6 @@ selected name is missing, or the selected backend does not provide
 provides shared, restart-safe atomic queue updates for horizontally scaled
 application instances.
 
-The legacy `cache_url` setting remains temporarily available for direct memory
-or Redis storage, but it is deprecated and cannot be combined with
-`cache_name`:
-
-```toml
-[wybra.messages]
-storage_backend = "cache"
-cache_url = "redis://localhost:6379/0"
-```
-
-Move the URL into `[cache]` or a named `[cache.<name>]` section and select that
-cache with `cache_name`. The legacy Redis path retains whole-queue
-acknowledgement, so alerts appended concurrently with acknowledgement can be
-removed before they are displayed. The named-cache namespace also changes the
-physical keys used for queued alerts, so pending alerts stored through the
-legacy URL are not migrated. Drain or accept the expiry of pending alerts
-before removing `cache_url`.
-
 Database storage stores alerts in Wybra-managed persistence. Configure
 `wybra.db` and run migrations before using it.
 

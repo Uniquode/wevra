@@ -12,9 +12,20 @@ from uuid import uuid4
 
 from wybra.cache.feature_models import (
     CacheFeatureError,
+    validate_finite,
     validate_non_negative_finite,
+    validate_payload,
     validate_positive_finite,
+    validate_positive_integer,
     validate_resource,
+)
+from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_CLAIM_SCRIPT,
+    SCHEDULE_COMPLETE_SCRIPT,
+    SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_RELEASE_SCRIPT,
+    SCHEDULE_UPDATE_SCRIPT,
 )
 from wybra.cache.redis_stream_scripts import (
     STREAM_ACKNOWLEDGE_SCRIPT,
@@ -28,7 +39,10 @@ ResultT = TypeVar("ResultT")
 logger = logging.getLogger(__name__)
 MAX_REDIS_TTL_MILLISECONDS = 2**62
 
-_ADVANCED_FEATURES = frozenset({"atomic", "lease", "stream", "work-queue"})
+_ADVANCED_FEATURES = frozenset(
+    {"atomic", "lease", "pub-sub", "schedule", "stream", "work-queue"}
+)
+_DURABLE_FEATURES = frozenset({"atomic", "lease", "schedule", "stream", "work-queue"})
 _ATOMIC_READINESS_SCRIPT = """
 if redis.call('exists', KEYS[1]) ~= 0 then
     return {0}
@@ -137,7 +151,8 @@ class RedisCacheRuntime:
         suffix = uuid4().hex
         try:
             client = self.client()
-            await self._validate_advanced_configuration(client)
+            if features & _DURABLE_FEATURES:
+                await self._validate_advanced_configuration(client)
             if "atomic" in features:
                 result = await client.eval(
                     _ATOMIC_READINESS_SCRIPT,
@@ -162,6 +177,39 @@ class RedisCacheRuntime:
                     1_000,
                 )
                 _validate_readiness_result(result)
+            if "pub-sub" in features:
+                channel = self.key("readiness", "pub-sub", suffix)
+                subscription = await self.open_pubsub()
+                try:
+                    await self.subscribe_pubsub(subscription, channel)
+                    await client.publish(channel, b"readiness")
+                    message = await self.subscription_call(
+                        lambda: subscription.get_message(
+                            ignore_subscribe_messages=True,
+                            timeout=1,
+                        )
+                    )
+                    _validate_pubsub_readiness_result(message, channel)
+                except asyncio.CancelledError as cancellation:
+                    try:
+                        await self.subscription_call(subscription.aclose)
+                    except BaseException as cleanup_error:
+                        cancellation.add_note(
+                            "Redis pub/sub readiness cleanup after cancellation "
+                            f"failed ({type(cleanup_error).__name__})."
+                        )
+                    raise
+                except BaseException as readiness_error:
+                    try:
+                        await self.subscription_call(subscription.aclose)
+                    except BaseException as cleanup_error:
+                        raise BaseExceptionGroup(
+                            "Redis pub/sub readiness and cleanup failed.",
+                            [readiness_error, cleanup_error],
+                        ) from readiness_error
+                    raise
+                else:
+                    await self.subscription_call(subscription.aclose)
             if "work-queue" in features:
                 queue_key = self.key("readiness", "cache", f"queue-{suffix}")
                 delayed_key = self.key("readiness", "cache", f"queue-delay-{suffix}")
@@ -306,6 +354,135 @@ class RedisCacheRuntime:
                         await client.delete(*stream_keys)
                     except Exception:
                         pass
+            if "schedule" in features:
+                owner = f"readiness-{suffix}"
+                identity = "schedule"
+                record_key = self.key("schedule", owner, identity)
+                claim_key = self.key(
+                    "schedule-claim",
+                    owner,
+                    identity,
+                )
+                revision_key = self.sequence_key(f"schedule-revision-{suffix}")
+                fencing_key = self.sequence_key(f"schedule-fencing-{suffix}")
+                count_key = self.sequence_key(f"schedule-count-{suffix}")
+                due_key = self.key("schedule-due", owner, "records")
+                claims_key = self.key("schedule-claims", owner, "records")
+                index_key = self.key("schedule-index", owner, "records")
+                schedule_keys = (
+                    record_key,
+                    claim_key,
+                    revision_key,
+                    fencing_key,
+                    count_key,
+                    due_key,
+                    claims_key,
+                    index_key,
+                )
+                try:
+                    result = await client.eval(
+                        SCHEDULE_CREATE_SCRIPT,
+                        5,
+                        record_key,
+                        due_key,
+                        revision_key,
+                        index_key,
+                        count_key,
+                        identity,
+                        0,
+                        b"readiness",
+                        "",
+                        1,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    revision = result[1]
+                    result = await client.eval(
+                        SCHEDULE_UPDATE_SCRIPT,
+                        4,
+                        record_key,
+                        claim_key,
+                        due_key,
+                        revision_key,
+                        revision,
+                        0,
+                        b"updated",
+                        "",
+                        identity,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    revision = result[1]
+                    result = await client.eval(
+                        SCHEDULE_DUE_SCRIPT,
+                        3,
+                        due_key,
+                        claims_key,
+                        index_key,
+                        0,
+                        1,
+                    )
+                    _validate_schedule_due_result(result)
+                    result = await client.eval(
+                        SCHEDULE_CLAIM_SCRIPT,
+                        5,
+                        record_key,
+                        claim_key,
+                        fencing_key,
+                        due_key,
+                        claims_key,
+                        "readiness",
+                        suffix,
+                        1_000,
+                    )
+                    _validate_schedule_result(result, length=8)
+                    fencing_token = result[6]
+                    result = await client.eval(
+                        SCHEDULE_RELEASE_SCRIPT,
+                        4,
+                        record_key,
+                        claim_key,
+                        due_key,
+                        claims_key,
+                        "readiness",
+                        suffix,
+                        fencing_token,
+                        revision,
+                        identity,
+                    )
+                    _validate_schedule_result(result, length=1)
+                    result = await client.eval(
+                        SCHEDULE_CLAIM_SCRIPT,
+                        5,
+                        record_key,
+                        claim_key,
+                        fencing_key,
+                        due_key,
+                        claims_key,
+                        "readiness",
+                        suffix,
+                        1_000,
+                    )
+                    _validate_schedule_result(result, length=8)
+                    result = await client.eval(
+                        SCHEDULE_COMPLETE_SCRIPT,
+                        7,
+                        record_key,
+                        due_key,
+                        claim_key,
+                        revision_key,
+                        count_key,
+                        claims_key,
+                        index_key,
+                        "readiness",
+                        suffix,
+                        result[6],
+                        revision,
+                    )
+                    _validate_schedule_result(result, length=2)
+                finally:
+                    try:
+                        await client.delete(*schedule_keys)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             raise
         except ConfigurationError:
@@ -350,6 +527,38 @@ class RedisCacheRuntime:
             raise
         except Exception as exc:
             _log_failure("feature operation", exc)
+            raise CacheFeatureError("Redis cache feature operation failed.") from None
+
+    async def open_pubsub(self) -> Any:
+        async def create_subscription(client: Any) -> Any:
+            return client.pubsub()
+
+        return await self.feature_call(create_subscription)
+
+    async def subscribe_pubsub(self, subscription: Any, channel: str) -> None:
+        await self.subscription_call(lambda: subscription.subscribe(channel))
+        result = await self.subscription_call(
+            lambda: subscription.get_message(
+                ignore_subscribe_messages=False,
+                timeout=1,
+            )
+        )
+        _validate_pubsub_subscription_result(result, channel)
+
+    async def subscription_call(
+        self,
+        operation: Callable[[], Awaitable[ResultT]],
+    ) -> ResultT:
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except ConfigurationError:
+            raise
+        except CacheFeatureError:
+            raise
+        except Exception as exc:
+            _log_failure("pub/sub operation", exc)
             raise CacheFeatureError("Redis cache feature operation failed.") from None
 
     def baseline_key(self, owner: str, key: str) -> str:
@@ -476,12 +685,111 @@ def _validate_stream_result(result: object) -> None:
     )
 
 
+def _validate_pubsub_readiness_result(result: object, channel: str) -> None:
+    if not isinstance(result, dict):
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    message_type = result.get("type")
+    received_channel = result.get("channel")
+    payload = result.get("data")
+    if (
+        message_type not in ("message", b"message")
+        or received_channel not in (channel, channel.encode())
+        or payload != b"readiness"
+    ):
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+
+
+def _validate_pubsub_subscription_result(result: object, channel: str) -> None:
+    if not isinstance(result, dict):
+        raise CacheFeatureError("Redis pub/sub subscription returned invalid state.")
+    message_type = result.get("type")
+    received_channel = result.get("channel")
+    if message_type not in ("subscribe", b"subscribe") or received_channel not in (
+        channel,
+        channel.encode(),
+    ):
+        raise CacheFeatureError("Redis pub/sub subscription returned invalid state.")
+
+
 def _validate_stream_readiness_result(result: object) -> None:
     if not isinstance(result, list | tuple) or len(result) < 2:
         raise ConfigurationError(
             "Redis cache backend cannot provide the configured advanced features."
         )
     _validate_stream_result(result[0])
+
+
+def _validate_schedule_result(result: object, *, length: int) -> None:
+    if (
+        isinstance(result, list | tuple)
+        and len(result) == length
+        and result[0] in (1, b"1", "1")
+    ):
+        return
+    raise ConfigurationError(
+        "Redis cache backend cannot provide the configured advanced features."
+    )
+
+
+def _validate_schedule_due_result(result: object) -> None:
+    if not isinstance(result, list | tuple) or len(result) != 1:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    record = result[0]
+    if not isinstance(record, list | tuple) or len(record) != 5:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    identity, payload, revision, due_at, interval = record
+    try:
+        _readiness_resource(identity)
+        if not isinstance(payload, bytes):
+            raise TypeError
+        validate_payload(payload)
+        _readiness_positive_integer(revision)
+        _readiness_number(due_at, positive=False)
+        if interval not in (b"", "", None):
+            _readiness_number(interval, positive=True)
+    except TypeError, ValueError, UnicodeDecodeError:
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        ) from None
+
+
+def _readiness_resource(value: object) -> None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str):
+        raise TypeError
+    validate_resource(value, label="schedule identity")
+
+
+def _readiness_positive_integer(value: object) -> None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError
+    validate_positive_integer(value, label="schedule revision")
+
+
+def _readiness_number(value: object, *, positive: bool) -> None:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = float(value)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError
+    if positive:
+        validate_positive_finite(value, label="schedule interval")
+    else:
+        validate_finite(value, label="schedule due time")
 
 
 def _readiness_entry_id(records: object) -> object:

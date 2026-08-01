@@ -135,7 +135,7 @@ def get_request_context(request: Any) -> dict[str, Any]:
         return context.as_dict()
 
     raise ContextProviderError(
-        "Stored request template context must be a TemplateContext; migrate raw "
+        "Stored request template context must be a TemplateContext; wrap raw "
         "mapping values with TemplateContext.from_mapping(...)."
     )
 

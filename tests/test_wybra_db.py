@@ -1080,10 +1080,9 @@ class TestDatabaseConfigurationAndRuntime:
             == (project_root / "structured.sqlite3").resolve().as_posix()
         )
 
-    def test_structured_database_config_overrides_legacy_url_with_info_log(
+    def test_database_configuration_rejects_structured_and_url_sources(
         self,
         tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
         config = ConfigService(
             [
@@ -1091,7 +1090,7 @@ class TestDatabaseConfigurationAndRuntime:
                     {
                         "app": {
                             "modules": ("wybra.db",),
-                            "database_url": "sqlite:///legacy.sqlite3",
+                            "database_url": "sqlite:///direct.sqlite3",
                         },
                         "app.database": {
                             "backend": "sqlite",
@@ -1103,15 +1102,14 @@ class TestDatabaseConfigurationAndRuntime:
             config_defs=(db_module_config,),
         )
 
-        with caplog.at_level("INFO", logger="wybra.db.settings"):
-            connection = resolve_database_connection_from_config(
+        with pytest.raises(
+            ConfigurationError,
+            match=r"either \[app\.database\] or \[app\]\.database_url",
+        ):
+            resolve_database_connection_from_config(
                 config,
                 project_root=tmp_path,
             )
-
-        assert connection is not None
-        assert connection.source == "structured"
-        assert "overrides [app].database_url" in caplog.text
 
     def test_database_url_environment_overrides_structured_database_config(
         self,

@@ -1702,11 +1702,15 @@ def _config_with_migrations_root(
     apps = config.get("apps")
     if not isinstance(apps, dict):
         raise MigrationConfigurationError("Tortoise configuration has no apps.")
-    if not all(isinstance(app_config, dict) for app_config in apps.values()):
+    if not all(
+        isinstance(app_label, str) and isinstance(app_config, dict)
+        for app_label, app_config in apps.items()
+    ):
         raise MigrationConfigurationError("Tortoise configuration has invalid apps.")
+    typed_apps = cast(dict[str, dict[str, Any]], apps)
     migrations_package = tortoise_migrations_package(migrations_root)
-    temporary_labels = set(apps) if app_labels is None else set(app_labels)
-    unknown_labels = temporary_labels - set(apps)
+    temporary_labels = set(typed_apps) if app_labels is None else set(app_labels)
+    unknown_labels = temporary_labels - set(typed_apps)
     if unknown_labels:
         raise MigrationConfigurationError(
             "Temporary migration apps are not configured: "
@@ -1723,7 +1727,7 @@ def _config_with_migrations_root(
                     else app_config["migrations"]
                 ),
             }
-            for app_label, app_config in apps.items()
+            for app_label, app_config in typed_apps.items()
         },
     }
 

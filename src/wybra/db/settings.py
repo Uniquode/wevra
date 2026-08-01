@@ -991,9 +991,8 @@ def effective_database_config_from_config(
 
     if _structured_database_configured(structured_values):
         if database_url is not None:
-            logger.info(
-                "[app.database] overrides [app].database_url; remove "
-                "[app].database_url to avoid dead database configuration."
+            raise ConfigurationError(
+                "Configure either [app.database] or [app].database_url, not both."
             )
         return EffectiveDatabaseConfig.from_structured(
             StructuredDatabaseConfig.from_values(
@@ -1772,7 +1771,7 @@ def _required_aws_managed_target(value: object) -> AwsManagedTarget:
     if isinstance(value, str):
         target = value.strip().lower()
         if target in {"rds", "aurora"}:
-            return cast(AwsManagedTarget, target)
+            return target
     raise ConfigurationError("AWS database managed target must be rds or aurora.")
 
 

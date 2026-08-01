@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 
 import pytest
@@ -330,6 +331,10 @@ async def assert_schedule_conformance(
     advance: AdvanceClock,
     *,
     owner: str = "conformance-schedule",
+    claim_ttl: float = 5,
+    recurring_interval: float = 10,
+    recurring_advance: float = 35,
+    due_tolerance: float = 0,
 ) -> None:
     current_time = now
     record = await feature.create(
@@ -359,7 +364,7 @@ async def assert_schedule_conformance(
     )
     assert await feature.due(owner, before=current_time) == (updated,)
 
-    claim = await feature.claim(owner, "once", "scheduler", ttl=5)
+    claim = await feature.claim(owner, "once", "scheduler", ttl=claim_ttl)
     assert claim is not None
     assert (
         await feature.update(
@@ -382,11 +387,11 @@ async def assert_schedule_conformance(
         next_due_at=current_time,
     )
     assert released is not None
-    first = await feature.claim(owner, "once", "scheduler-1", ttl=5)
+    first = await feature.claim(owner, "once", "scheduler-1", ttl=claim_ttl)
     assert first is not None
-    await advance(5)
-    current_time += 5
-    second = await feature.claim(owner, "once", "scheduler-2", ttl=5)
+    await advance(claim_ttl)
+    current_time += claim_ttl
+    second = await feature.claim(owner, "once", "scheduler-2", ttl=claim_ttl)
     assert second is not None
     assert second.fencing_token > first.fencing_token
     with pytest.raises(CacheConflictError):
@@ -398,7 +403,7 @@ async def assert_schedule_conformance(
         "recurring",
         b"recurring",
         next_due_at=current_time,
-        interval_seconds=10,
+        interval_seconds=recurring_interval,
     )
     assert recurring is not None
     recurring_claim = await feature.claim(
@@ -408,11 +413,19 @@ async def assert_schedule_conformance(
         ttl=60,
     )
     assert recurring_claim is not None
-    await advance(35)
-    current_time += 35
+    await advance(recurring_advance)
+    current_time += recurring_advance
     advanced = await feature.complete(recurring_claim)
     assert advanced is not None
-    assert advanced.next_due_at == current_time + 5
+    expected_offset = recurring_interval - math.fmod(
+        recurring_advance,
+        recurring_interval,
+    )
+    assert math.isclose(
+        advanced.next_due_at,
+        current_time + expected_offset,
+        abs_tol=due_tolerance,
+    )
 
 
 __all__ = (

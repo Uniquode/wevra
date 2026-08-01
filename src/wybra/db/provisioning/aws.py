@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from wybra.db.provisioning.core import (
     DatabaseFamily,
@@ -154,7 +154,7 @@ def _normalise_managed_target(value: object) -> AwsManagedTarget:
     if isinstance(value, str):
         target = value.strip().lower()
         if target in {"rds", "aurora"}:
-            return cast(AwsManagedTarget, target)
+            return target
     raise DatabaseProvisioningConfigurationError(
         "AWS managed database metadata target must be rds or aurora."
     )

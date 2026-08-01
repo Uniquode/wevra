@@ -48,8 +48,19 @@ from wybra.cache import (
     build_caches,
 )
 from wybra.cache.redis_atomic import RedisAtomicCache
+from wybra.cache.redis_features import RedisCacheFeatures
+from wybra.cache.redis_pubsub import RedisPubSubCache, RedisPubSubSubscription
 from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_CLAIM_SCRIPT,
+    SCHEDULE_COMPLETE_SCRIPT,
+    SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_RELEASE_SCRIPT,
+    SCHEDULE_UPDATE_SCRIPT,
+)
+from wybra.cache.redis_schedules import RedisScheduleCache
 from wybra.cache.redis_streams import RedisStreamCache
 from wybra.core.exceptions import ConfigurationError
 
@@ -373,6 +384,1085 @@ async def test_redis_registers_stream_feature_metadata(
     assert "hset" in client.scripts[2]
     assert "hdel" in client.scripts[3]
     await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_registers_pubsub_feature_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PubSubHandle:
+        def __init__(self) -> None:
+            self.channels: list[str] = []
+            self.messages: list[dict[str, bytes | int]] = []
+            self.closed = False
+
+        async def subscribe(self, channel: str) -> None:
+            self.channels.append(channel)
+            self.messages.append(
+                {"type": b"subscribe", "channel": channel.encode(), "data": 1}
+            )
+
+        async def get_message(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, bytes | int] | None:
+            if self.messages:
+                return self.messages.pop(0)
+            return None
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class PubSubClient:
+        def __init__(self) -> None:
+            self.subscription = PubSubHandle()
+            self.published: list[tuple[str, bytes]] = []
+            self.configuration_checked = False
+
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            self.configuration_checked = True
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        def pubsub(self) -> PubSubHandle:
+            return self.subscription
+
+        async def publish(self, channel: str, payload: bytes) -> int:
+            self.published.append((channel, payload))
+            self.subscription.messages.append(
+                {"type": b"message", "channel": channel.encode(), "data": payload}
+            )
+            return 1
+
+    client = PubSubClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    caches = await build_caches(
+        CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="redis://secret@cache/0",
+                    features=("pub-sub",),
+                ),
+            ),
+        )
+    )
+    instance = caches.require("default")
+
+    assert instance.features == ("pub-sub",)
+    assert instance.require(PubSubCacheCapability) is not None
+    guarantees = instance.feature_metadata[0].guarantees
+    assert guarantees.scope == "shared"
+    assert not guarantees.durable
+    assert not guarantees.restart_recovery
+    assert guarantees.horizontal_consumers
+    assert guarantees.ordering_scope == "topic"
+    assert not guarantees.replay
+    assert not guarantees.retention
+    assert not guarantees.acknowledgement
+    assert client.subscription.closed
+    assert len(client.subscription.channels) == 1
+    assert client.subscription.channels == [client.published[0][0]]
+    assert not client.configuration_checked
+
+    await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_delivers_live_messages_and_closes_subscriptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PubSubHandle:
+        def __init__(self) -> None:
+            self.channels: set[str] = set()
+            self.messages: list[dict[str, bytes | int]] = []
+            self.pending_channels: set[str] = set()
+            self.closed = False
+
+        async def subscribe(self, channel: str) -> None:
+            self.messages.append(
+                {"type": b"subscribe", "channel": channel.encode(), "data": 1}
+            )
+            self.pending_channels.add(channel)
+
+        async def get_message(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, bytes | int] | None:
+            if self.messages:
+                message = self.messages.pop(0)
+                received_channel = message.get("channel")
+                if message["type"] == b"subscribe" and isinstance(
+                    received_channel,
+                    bytes,
+                ):
+                    self.channels.add(received_channel.decode())
+                return message
+            return None
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class PubSubClient:
+        def __init__(self) -> None:
+            self.subscriptions: list[PubSubHandle] = []
+
+        def pubsub(self) -> PubSubHandle:
+            handle = PubSubHandle()
+            self.subscriptions.append(handle)
+            return handle
+
+        async def publish(self, channel: str, payload: bytes) -> int:
+            subscribers = [
+                subscription
+                for subscription in self.subscriptions
+                if not subscription.closed and channel in subscription.channels
+            ]
+            for subscription in subscribers:
+                subscription.messages.append(
+                    {
+                        "type": b"message",
+                        "channel": channel.encode(),
+                        "data": payload,
+                    }
+                )
+            return len(subscribers)
+
+        async def aclose(self) -> None:
+            return None
+
+    client = PubSubClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    runtime = RedisCacheRuntime("redis://secret@cache/0", "test")
+    pubsub = RedisPubSubCache(runtime)
+
+    assert await pubsub.publish("owner", "topic", b"offline") == 0
+    subscription = await pubsub.subscribe("owner", "topic")
+    with pytest.raises(TimeoutError):
+        await subscription.receive(timeout=0.1)
+    assert await pubsub.publish("owner", "topic", b"online") == 1
+    assert await subscription.receive() == b"online"
+    await subscription.close()
+    await subscription.close()
+    assert client.subscriptions[0].closed
+    with pytest.raises(CacheFeatureError, match="subscription is closed"):
+        await subscription.receive()
+
+    live = await pubsub.subscribe("owner", "second")
+    await pubsub.close()
+    assert client.subscriptions[1].closed
+    with pytest.raises(CacheFeatureError, match="subscription is closed"):
+        await live.receive()
+    with pytest.raises(CacheFeatureError, match="pub/sub cache is closed"):
+        await pubsub.publish("owner", "second", b"after-close")
+    await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_close_cancels_a_stalled_activation() -> None:
+    activation_started = asyncio.Event()
+
+    class Handle:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class StalledRuntime:
+        def __init__(self) -> None:
+            self.handle = Handle()
+
+        def key(self, domain: str, owner: str, topic: str) -> str:
+            return f"test:{domain}:{owner}:{topic}"
+
+        async def open_pubsub(self) -> Handle:
+            return self.handle
+
+        async def subscribe_pubsub(self, _handle: Handle, _channel: str) -> None:
+            activation_started.set()
+            await asyncio.Event().wait()
+
+        async def subscription_call(self, operation: object) -> object:
+            return await operation()
+
+    runtime = StalledRuntime()
+    pubsub = RedisPubSubCache(runtime)
+    pending = asyncio.create_task(pubsub.subscribe("owner", "topic"))
+    await activation_started.wait()
+
+    await asyncio.wait_for(pubsub.close(), timeout=0.2)
+
+    with pytest.raises(CacheFeatureError, match="pub/sub cache is closed"):
+        await pending
+    assert runtime.handle.closed
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_caller_cancellation_releases_completed_activation() -> None:
+    activation_started = asyncio.Event()
+
+    class Handle:
+        closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class CancellationResistantRuntime:
+        def __init__(self) -> None:
+            self.handle = Handle()
+
+        def key(self, domain: str, owner: str, topic: str) -> str:
+            return f"test:{domain}:{owner}:{topic}"
+
+        async def open_pubsub(self) -> Handle:
+            return self.handle
+
+        async def subscribe_pubsub(self, _handle: Handle, _channel: str) -> None:
+            activation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return
+
+        async def subscription_call(self, operation: object) -> object:
+            return await operation()
+
+    runtime = CancellationResistantRuntime()
+    pubsub = RedisPubSubCache(runtime)
+    pending = asyncio.create_task(pubsub.subscribe("owner", "topic"))
+    await activation_started.wait()
+
+    pending.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert runtime.handle.closed
+    assert not pubsub._subscriptions
+    assert not pubsub._pending_handles
+    assert not pubsub._activations
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_retries_retained_failed_activation_cleanup() -> None:
+    class Handle:
+        def __init__(self) -> None:
+            self.close_attempts = 0
+
+        async def aclose(self) -> None:
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise RuntimeError("first cleanup failed")
+
+    class FailingRuntime:
+        def __init__(self) -> None:
+            self.handle = Handle()
+
+        def key(self, domain: str, owner: str, topic: str) -> str:
+            return f"test:{domain}:{owner}:{topic}"
+
+        async def open_pubsub(self) -> Handle:
+            return self.handle
+
+        async def subscribe_pubsub(self, _handle: Handle, _channel: str) -> None:
+            raise CacheFeatureError("Redis cache feature operation failed.")
+
+        async def subscription_call(self, operation: object) -> object:
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise CacheFeatureError(
+                    "Redis cache feature operation failed."
+                ) from None
+
+    runtime = FailingRuntime()
+    pubsub = RedisPubSubCache(runtime)
+
+    with pytest.raises(CacheFeatureError, match="feature operation failed") as raised:
+        await pubsub.subscribe("owner", "topic")
+
+    assert raised.value.__notes__ == [
+        "Redis pub/sub activation cleanup also failed (CacheFeatureError); "
+        "cache shutdown will retry."
+    ]
+    assert runtime.handle.close_attempts == 1
+
+    await pubsub.close()
+
+    assert runtime.handle.close_attempts == 2
+    assert not pubsub._pending_handles
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_serialises_receives_with_one_total_timeout() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    active_reads = 0
+    maximum_reads = 0
+    channel = "test:pub-sub:owner:topic"
+
+    class Handle:
+        async def get_message(self, **_kwargs: object) -> dict[str, bytes]:
+            nonlocal active_reads, maximum_reads
+            active_reads += 1
+            maximum_reads = max(maximum_reads, active_reads)
+            started.set()
+            try:
+                await release.wait()
+                return {
+                    "type": b"message",
+                    "channel": channel.encode(),
+                    "data": b"first",
+                }
+            finally:
+                active_reads -= 1
+
+    class Runtime:
+        async def subscription_call(self, operation: object) -> object:
+            return await operation()
+
+    async def close() -> None:
+        return None
+
+    subscription = RedisPubSubSubscription(Runtime(), Handle(), channel, close)
+    first = asyncio.create_task(subscription.receive())
+    await started.wait()
+
+    with pytest.raises(TimeoutError, match="receive timed out"):
+        await subscription.receive(timeout=0.01)
+
+    release.set()
+    assert await first == b"first"
+    assert maximum_reads == 1
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_receive_timeout_bounds_an_overlong_provider_read() -> None:
+    channel = "test:pub-sub:owner:topic"
+
+    class Handle:
+        cancelled = False
+
+        async def get_message(self, **_kwargs: object) -> object:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+
+    class Runtime:
+        async def subscription_call(self, operation: object) -> object:
+            return await operation()
+
+    async def close() -> None:
+        return None
+
+    handle = Handle()
+    subscription = RedisPubSubSubscription(Runtime(), handle, channel, close)
+
+    with pytest.raises(TimeoutError, match="receive timed out"):
+        await asyncio.wait_for(subscription.receive(timeout=0.01), timeout=0.1)
+
+    assert handle.cancelled
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("received_channel", [None, b"wrong-channel"])
+async def test_redis_pubsub_rejects_missing_or_wrong_delivery_channel(
+    received_channel: bytes | None,
+) -> None:
+    channel = "test:pub-sub:owner:topic"
+
+    class Handle:
+        async def get_message(self, **_kwargs: object) -> dict[str, object]:
+            return {
+                "type": b"message",
+                "channel": received_channel,
+                "data": b"payload",
+            }
+
+    class Runtime:
+        async def subscription_call(self, operation: object) -> object:
+            return await operation()
+
+    async def close() -> None:
+        return None
+
+    subscription = RedisPubSubSubscription(Runtime(), Handle(), channel, close)
+
+    with pytest.raises(CacheFeatureError, match="invalid state"):
+        await subscription.receive(timeout=0.1)
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_iteration_preserves_a_failure_during_close() -> None:
+    channel = "test:pub-sub:owner:topic"
+    subscription: RedisPubSubSubscription
+
+    class Handle:
+        async def get_message(self, **_kwargs: object) -> object:
+            subscription._closed = True
+            subscription._close_event.set()
+            raise CacheFeatureError("Redis cache feature operation failed.")
+
+    class Runtime:
+        async def subscription_call(self, operation: object) -> object:
+            return await operation()
+
+    async def close() -> None:
+        return None
+
+    subscription = RedisPubSubSubscription(Runtime(), Handle(), channel, close)
+
+    with pytest.raises(CacheFeatureError, match="feature operation failed"):
+        await anext(subscription)
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_propagates_open_subscription_failures() -> None:
+    class FailedRuntime:
+        async def subscription_call(self, _operation: object) -> object:
+            raise CacheFeatureError("Redis cache feature operation failed.")
+
+    async def close() -> None:
+        return None
+
+    subscription = RedisPubSubSubscription(
+        FailedRuntime(),
+        SimpleNamespace(),
+        "test:pub-sub:owner:topic",
+        close,
+    )
+
+    with pytest.raises(CacheFeatureError, match="feature operation failed"):
+        await anext(subscription)
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_subscription_retries_failed_close() -> None:
+    attempts = 0
+
+    async def close() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise CacheFeatureError("Redis cache feature operation failed.")
+
+    subscription = RedisPubSubSubscription(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "test:pub-sub:owner:topic",
+        close,
+    )
+
+    with pytest.raises(CacheFeatureError, match="feature operation failed"):
+        await subscription.close()
+    with pytest.raises(CacheFeatureError, match="subscription is closed"):
+        await subscription.receive()
+
+    await subscription.close()
+    await subscription.close()
+
+    assert attempts == 2
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_cache_preserves_cancellation_after_full_cleanup() -> None:
+    cancelled_attempts = 0
+    released = False
+
+    async def cancel_once() -> None:
+        nonlocal cancelled_attempts
+        cancelled_attempts += 1
+        if cancelled_attempts == 1:
+            raise asyncio.CancelledError
+
+    async def release() -> None:
+        nonlocal released
+        released = True
+
+    pubsub = RedisPubSubCache(SimpleNamespace())
+    cancelling = RedisPubSubSubscription(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "test:pub-sub:owner:cancelling",
+        cancel_once,
+    )
+    succeeding = RedisPubSubSubscription(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "test:pub-sub:owner:succeeding",
+        release,
+    )
+    pubsub._subscriptions.update((cancelling, succeeding))
+
+    with pytest.raises(asyncio.CancelledError):
+        await pubsub.close()
+
+    assert released
+
+    await pubsub.close()
+
+    assert cancelled_attempts == 2
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_cache_closes_every_subscription_after_failure() -> None:
+    attempts = 0
+    released = False
+
+    async def fail_once() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise CacheFeatureError("Redis cache feature operation failed.")
+
+    async def release() -> None:
+        nonlocal released
+        released = True
+
+    pubsub = RedisPubSubCache(SimpleNamespace())
+    failing = RedisPubSubSubscription(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "test:pub-sub:owner:failing",
+        fail_once,
+    )
+    succeeding = RedisPubSubSubscription(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        "test:pub-sub:owner:succeeding",
+        release,
+    )
+    pubsub._subscriptions.update((failing, succeeding))
+
+    with pytest.raises(ExceptionGroup, match="Redis pub/sub subscription cleanup"):
+        await pubsub.close()
+
+    assert released
+
+    await pubsub.close()
+
+    assert attempts == 2
+
+
+@pytest.mark.anyio
+async def test_redis_feature_close_attempts_every_capability() -> None:
+    class FailedPubSub:
+        async def close(self) -> None:
+            raise CacheFeatureError("Redis cache feature operation failed.")
+
+    class TrackingWorkQueue:
+        closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    features = RedisCacheFeatures(SimpleNamespace())
+    work_queue = TrackingWorkQueue()
+    object.__setattr__(features, "pubsub", FailedPubSub())
+    object.__setattr__(features, "work_queue", work_queue)
+
+    with pytest.raises(ExceptionGroup, match="Redis cache feature cleanup"):
+        await features.close()
+
+    assert work_queue.closed
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_readiness_rejects_wrong_delivery_channel() -> None:
+    class PubSubHandle:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, bytes | int]] = []
+
+        async def subscribe(self, channel: str) -> None:
+            self.messages.append(
+                {"type": b"subscribe", "channel": channel.encode(), "data": 1}
+            )
+
+        async def get_message(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, bytes | int] | None:
+            if self.messages:
+                return self.messages.pop(0)
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    class PubSubClient:
+        def __init__(self) -> None:
+            self.subscription = PubSubHandle()
+
+        def pubsub(self) -> PubSubHandle:
+            return self.subscription
+
+        async def publish(self, _channel: str, payload: bytes) -> int:
+            self.subscription.messages.append(
+                {"type": b"message", "channel": b"wrong", "data": payload}
+            )
+            return 1
+
+    runtime = RedisCacheRuntime("redis://secret@cache/0", "test")
+    runtime._client = PubSubClient()
+
+    with pytest.raises(
+        ConfigurationError,
+        match="cannot provide the configured advanced features",
+    ):
+        await runtime.validate_features(frozenset({"pub-sub"}))
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_readiness_rejects_failed_cleanup() -> None:
+    class PubSubHandle:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, bytes | int]] = []
+
+        async def subscribe(self, channel: str) -> None:
+            self.messages.append(
+                {"type": b"subscribe", "channel": channel.encode(), "data": 1}
+            )
+
+        async def get_message(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, bytes | int] | None:
+            if self.messages:
+                return self.messages.pop(0)
+            return None
+
+        async def aclose(self) -> None:
+            raise RuntimeError("connection lost")
+
+    class PubSubClient:
+        def __init__(self) -> None:
+            self.subscription = PubSubHandle()
+
+        def pubsub(self) -> PubSubHandle:
+            return self.subscription
+
+        async def publish(self, channel: str, payload: bytes) -> int:
+            self.subscription.messages.append(
+                {"type": b"message", "channel": channel.encode(), "data": payload}
+            )
+            return 1
+
+    runtime = RedisCacheRuntime("redis://secret@cache/0", "test")
+    runtime._client = PubSubClient()
+
+    with pytest.raises(
+        ConfigurationError,
+        match="cannot provide the configured advanced features",
+    ):
+        await runtime.validate_features(frozenset({"pub-sub"}))
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_readiness_preserves_cancellation_after_failed_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PubSubHandle:
+        async def aclose(self) -> None:
+            raise RuntimeError("connection lost")
+
+    class PubSubClient:
+        def pubsub(self) -> PubSubHandle:
+            return PubSubHandle()
+
+    async def cancel_subscription(
+        _runtime: RedisCacheRuntime,
+        _subscription: object,
+        _channel: str,
+    ) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(RedisCacheRuntime, "subscribe_pubsub", cancel_subscription)
+    runtime = RedisCacheRuntime("redis://secret@cache/0", "test")
+    runtime._client = PubSubClient()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await runtime.validate_features(frozenset({"pub-sub"}))
+
+    assert raised.value.__notes__ == [
+        "Redis pub/sub readiness cleanup after cancellation failed (CacheFeatureError)."
+    ]
+
+
+@pytest.mark.anyio
+async def test_redis_registers_schedule_feature_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        def __init__(self) -> None:
+            self.scripts: list[str] = []
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            self.scripts.append(script)
+            self.calls.append((script, _args))
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [[b"schedule", b"updated", b"2", b"0", b""]]
+            if script is SCHEDULE_CLAIM_SCRIPT:
+                return [
+                    1,
+                    b"schedule",
+                    b"updated",
+                    b"2",
+                    b"0",
+                    b"",
+                    b"1",
+                    b"0.5",
+                ]
+            if script is SCHEDULE_RELEASE_SCRIPT:
+                return [1]
+            if script is SCHEDULE_COMPLETE_SCRIPT:
+                return [1, 0]
+            raise AssertionError("Unexpected schedule readiness script.")
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+
+    caches = await build_caches(
+        CachesSettings(
+            instances=(
+                CacheSettings(
+                    backend="redis",
+                    url="redis://secret@cache/0",
+                    features=("schedule",),
+                ),
+            ),
+        )
+    )
+    instance = caches.require("default")
+
+    assert instance.features == ("schedule",)
+    assert instance.require(ScheduleCacheCapability) is not None
+    guarantees = instance.feature_metadata[0].guarantees
+    assert guarantees.scope == "shared"
+    assert guarantees.durable
+    assert guarantees.restart_recovery
+    assert guarantees.horizontal_consumers
+    assert guarantees.ordering_scope == "due-time"
+    assert guarantees.scheduling
+    assert client.scripts == [
+        SCHEDULE_CREATE_SCRIPT,
+        SCHEDULE_UPDATE_SCRIPT,
+        SCHEDULE_DUE_SCRIPT,
+        SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_RELEASE_SCRIPT,
+        SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_COMPLETE_SCRIPT,
+    ]
+    due_call = next(
+        args for script, args in client.calls if script is SCHEDULE_DUE_SCRIPT
+    )
+    assert due_call[0] == 3
+    assert all("readiness-" in key for key in due_call[1:4])
+
+    await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_translates_record_and_claim_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [[b"once", b"updated", b"2", b"0", b""]]
+            if script is SCHEDULE_CLAIM_SCRIPT:
+                return [
+                    1,
+                    b"once",
+                    b"updated",
+                    b"2",
+                    b"0",
+                    b"",
+                    b"1",
+                    b"1.5",
+                ]
+            if script is SCHEDULE_RELEASE_SCRIPT:
+                return [1]
+            if script is SCHEDULE_COMPLETE_SCRIPT:
+                return [1, 0]
+            raise AssertionError("Unexpected schedule script.")
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    created = await schedules.create("tasks", "once", b"payload", next_due_at=0)
+    updated = await schedules.update(
+        "tasks",
+        "once",
+        created.revision,
+        b"updated",
+        next_due_at=0,
+    )
+    due = await schedules.due("tasks", before=0)
+    claim = await schedules.claim("tasks", "once", "scheduler", ttl=1)
+
+    assert created is not None
+    assert created.revision == CacheRevision(1)
+    assert updated is not None
+    assert due == (updated,)
+    assert claim is not None
+    assert claim.record == updated
+    assert claim.fencing_token.value == 1
+    await schedules.release(claim)
+    claim = await schedules.claim("tasks", "once", "scheduler", ttl=1)
+    assert claim is not None
+    assert await schedules.complete(claim) is None
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_translates_capacity_and_malformed_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [-1]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [[b"once", b"payload", b"1", b"0", b"0"]]
+            raise AssertionError("Unexpected schedule script.")
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    with pytest.raises(CacheFeatureError, match="record capacity"):
+        await schedules.create("tasks", "once", b"payload", next_due_at=0)
+    with pytest.raises(CacheFeatureError, match="interval is invalid"):
+        await schedules.due("tasks", before=0)
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_rejects_malformed_identity_and_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        def __init__(self) -> None:
+            self.responses = iter(
+                (
+                    [[b"", b"payload", b"1", b"0", b""]],
+                    [[b"valid", b"x" * 1_048_577, b"1", b"0", b""]],
+                )
+            )
+
+        async def eval(self, script: str, *_args: object) -> object:
+            assert script is SCHEDULE_DUE_SCRIPT
+            return next(self.responses)
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    with pytest.raises(CacheFeatureError, match="identity is invalid"):
+        await schedules.due("tasks", before=0)
+    with pytest.raises(CacheFeatureError, match="payload is invalid"):
+        await schedules.due("tasks", before=0)
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_rejects_unsafe_recurrence_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_CLAIM_SCRIPT:
+                return [
+                    1,
+                    b"recurring",
+                    b"payload",
+                    b"1",
+                    b"0",
+                    b"1",
+                    b"1",
+                    b"1.5",
+                ]
+            if script is SCHEDULE_COMPLETE_SCRIPT:
+                return [-2]
+            raise AssertionError("Unexpected schedule script.")
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+    schedules = RedisScheduleCache(RedisCacheRuntime("redis://cache", "safe"))
+
+    created = await schedules.create(
+        "tasks",
+        "recurring",
+        b"payload",
+        next_due_at=0,
+        interval_seconds=1,
+    )
+    assert created is not None
+    claim = await schedules.claim("tasks", "recurring", "scheduler", ttl=1)
+    assert claim is not None
+    with pytest.raises(CacheFeatureError, match="cannot advance safely"):
+        await schedules.complete(claim)
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_readiness_rejects_operational_script_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                raise RuntimeError("ACL denied HMGET")
+            raise AssertionError("Unexpected schedule readiness script.")
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await build_caches(
+            CachesSettings(
+                instances=(
+                    CacheSettings(
+                        backend="redis",
+                        url="redis://cache",
+                        namespace="safe",
+                        features=("schedule",),
+                    ),
+                ),
+            )
+        )
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_readiness_rejects_malformed_due_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScheduleClient:
+        async def ping(self) -> bool:
+            return True
+
+        async def aclose(self) -> None:
+            return None
+
+        async def config_get(self, *_keys: str) -> dict[str, str]:
+            return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
+
+        async def eval(self, script: str, *_args: object) -> object:
+            if script is SCHEDULE_CREATE_SCRIPT:
+                return [1, b"1"]
+            if script is SCHEDULE_UPDATE_SCRIPT:
+                return [1, b"2"]
+            if script is SCHEDULE_DUE_SCRIPT:
+                return [0]
+            raise AssertionError("Unexpected schedule readiness script.")
+
+        async def delete(self, *_keys: str) -> None:
+            return None
+
+    client = ScheduleClient()
+    monkeypatch.setattr(
+        "wybra.cache.redis_runtime.importlib.import_module",
+        lambda _: SimpleNamespace(
+            Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+        ),
+    )
+
+    with pytest.raises(ConfigurationError, match="cannot provide"):
+        await build_caches(
+            CachesSettings(
+                instances=(
+                    CacheSettings(
+                        backend="redis",
+                        url="redis://cache",
+                        namespace="safe",
+                        features=("schedule",),
+                    ),
+                ),
+            )
+        )
 
 
 @pytest.mark.anyio

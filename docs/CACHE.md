@@ -159,7 +159,7 @@ full URL is already a complete connection. If a configured secret source or
 key cannot be resolved, startup fails before serving requests and never falls
 back to a raw URL.
 
-A raw credential-bearing URL remains accepted only for backwards compatibility:
+A raw credential-bearing URL is accepted only as a last resort:
 
 ```toml
 [cache]
@@ -221,8 +221,7 @@ cache_name = "session"
 
 Session startup fails before serving requests when `wybra.cache` is absent or
 the selected name is not configured. Session diagnostics report only the cache
-name or legacy compatibility mode, never provider URLs or credentials. See
-[`SESSION.md`](SESSION.md) for legacy `cache_url` migration guidance.
+name, never provider URLs or credentials.
 
 Cache-backed queued messages require `AtomicCacheCapability`. Select an
 isolated cache with `wybra.messages.cache_name`, or omit the setting to use
@@ -246,9 +245,7 @@ cache_name = "messages"
 ```
 
 Messages startup fails when the cache module, selected name, or required atomic
-feature is unavailable. Both memory and Redis supply the feature. See
-[`MESSAGES.md`](MESSAGES.md) for legacy `cache_url` migration guidance and the
-queued-alert key change.
+feature is unavailable. Both memory and Redis supply the feature.
 
 Every cache operation requires an owner and a logical key. Owners must be
 non-blank and cannot contain `:`; the owner prefixes the backend key and keeps
@@ -325,17 +322,21 @@ features. Startup fails with installation guidance when `wybra[cache]` is not
 installed, or with a bounded diagnostic when Redis is unavailable.
 
 The baseline byte cache needs only a reachable Redis server when configured
-with `features = []`. Enabling `atomic`, `lease`, `stream`, or `work-queue`
-additionally requires Redis scripting, append-only persistence, and an eviction
-policy other than `allkeys-*`. Wybra checks those prerequisites at startup
-before advertising the features, because their revisions and fencing tokens
-must survive ordinary key expiry and process restart. Advanced-feature Redis
-ACLs must also permit `PEXPIRE` for bounded readiness probes. If the Redis
-service blocks `CONFIG GET`, Wybra
-logs a warning and continues only when its operational readiness checks pass;
+with `features = []`. Enabling `atomic`, `lease`, `schedule`, `stream`, or
+`work-queue` additionally requires Redis scripting, append-only persistence,
+and an eviction policy other than `allkeys-*`. Wybra checks those prerequisites
+at startup before advertising the features, because their revisions and fencing
+tokens must survive ordinary key expiry and process restart. Their Redis ACLs
+must also permit `PEXPIRE` for bounded readiness probes. If the Redis service
+blocks `CONFIG GET`, Wybra logs a warning and continues only when its operational
+readiness checks pass;
 the operator then owns verification of persistence and eviction policy. Redis
 Cluster is not yet supported for these advanced features; use a standalone or
 compatible non-clustered deployment.
+
+The live `pub-sub` feature needs a reachable Redis server plus permission to
+subscribe and publish. It does not require persistence, scripting, or a
+particular eviction policy because it retains no messages or feature state.
 
 Upgrading an existing Redis baseline cache with omitted `features` enables the
 implemented advanced features and therefore requires these prerequisites.
@@ -351,10 +352,10 @@ operation reports a safe cache error if the provider later becomes unavailable.
 | Baseline byte cache | Shared expiring values, isolated by named namespace |
 | Atomic values and counters | Shared atomic create, compare-and-swap, compare-and-delete, and increment with persistent revisions |
 | Leases and fencing | Shared renewable leases with opaque holder tokens and persistent monotonic fencing tokens |
+| Pub/sub | Shared live fan-out with no replay or retained history |
 | Work queues | Shared Redis Streams consumer-group delivery with acknowledgement, visibility recovery, delayed retry, and bounded dead letters |
+| Schedules | Shared revisioned one-time and interval records with due ordering and fenced claims |
 | Streams | Shared ordered replay with a fixed 1,000-record retained history and durable consumer positions |
-| Pub/sub | Not yet implemented |
-| Schedules | Not yet implemented |
 
 Redis atomic mutations and lease changes are provider-atomic. Revisions and
 fencing sequences survive individual entry expiry, deletion, and Wybra runtime
@@ -363,8 +364,9 @@ restart according to the Redis provider's configured persistence window.
 recent sequence update. Deleting sequence keys, `FLUSHDB`, and `FLUSHALL` are
 destructive operations that invalidate previously issued revisions and fencing
 tokens. Lease expiries use Redis server time, making coordination safe across
-horizontally scaled application instances. Redis feature metadata reports
-shared scope, durability, restart recovery, and horizontal-consumer support.
+horizontally scaled application instances. Redis metadata reports shared scope
+for every advanced feature, durability and restart recovery only for durable
+features, and horizontal-consumer support.
 
 Provider failures are translated to bounded cache feature errors without
 including URLs, credentials, physical keys, values, scripts, or lease tokens.
@@ -390,8 +392,44 @@ Task handlers and other consumers must be idempotent: a worker can complete an
 external side effect before it loses its delivery receipt, so exactly-once
 execution is not promised. Startup probes Redis Streams consumer groups,
 claims, scripts, sorted sets, and settlement operations; a server that lacks
-that command surface cannot advertise the feature. Live pub/sub, scheduling,
-Taskiq adapters, and JetStream remain separate future work.
+that command surface cannot advertise the feature. Taskiq adapters and JetStream
+remain separate future work.
+
+### Redis pub/sub
+
+The Redis `pub-sub` feature provides live fan-out for one logical owner and
+topic across application instances. Each channel is private to the configured
+cache namespace, so named caches sharing a Redis database cannot cross-deliver
+messages. `publish()` returns Redis's active-subscriber count.
+
+Pub/sub retains no messages and does not promise replay, acknowledgement,
+redelivery, or delivery to offline subscribers. Each subscription owns a Redis
+pub/sub handle; close it explicitly, or allow cache-registry shutdown to close
+it. Use the `stream` feature when consumers require durable replay or resumable
+positions.
+
+### Redis schedules
+
+The Redis `schedule` feature provides durable revisioned one-time and interval
+schedule records for each logical owner. A due query returns records in due-time
+order and omits schedules holding a live claim. A scheduler claims a due record
+with an opaque token and monotonically increasing fencing token; only that
+claim can release or complete the record. Expired claims automatically become
+eligible for a later scheduler with a newer fencing token.
+
+Completing a one-time schedule removes it. Completing an interval schedule
+advances its due time past missed intervals without creating a burst of historic
+emissions. Updating a claimed schedule or using a stale revision returns no
+update; releasing or completing a stale claim raises `CacheConflictError`.
+
+Schedule records, due indexes, and TTL-backed claim keys are private to the
+configured Redis namespace. They survive cache registry reconstruction and
+Redis restart according to the configured Redis persistence window. Redis
+server time controls claim eligibility, claim expiry, and recurring advancement.
+The `due()` boundary remains caller-supplied, so scheduler hosts should stay
+synchronised with Redis. Claim-expiry recovery is bounded per query. This
+feature stores opaque schedule payload bytes only; cron evaluation, task
+dispatch, and Taskiq schedule sources remain separate work.
 
 ### Redis streams
 
@@ -467,18 +505,6 @@ if lease is not None:
 
 An expired lease can be acquired by another holder with a newer fencing token.
 Renewing or releasing a stale token raises `CacheConflictError`.
-
-### Redis namespace migration
-
-Named Redis caches now prefix every baseline and advanced key with their
-resolved namespace. Existing values written by the earlier unnamespaced named
-Redis provider are not read or migrated automatically. Treat those entries as
-disposable cache state, expire old session keys according to policy, and plan
-for pending legacy queued messages to be cleared or drained before switching.
-
-Changing a configured namespace has the same effect as selecting a fresh cache
-partition. Keep it stable after deployment unless intentional invalidation is
-required.
 
 ### Work queue API
 

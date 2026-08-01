@@ -16,6 +16,8 @@ from testcontainers.core.wait_strategies import ExecWaitStrategy
 from tests.cache_feature_conformance import (
     assert_atomic_conformance,
     assert_lease_conformance,
+    assert_pubsub_conformance,
+    assert_schedule_conformance,
     assert_stream_conformance,
     assert_work_queue_conformance,
 )
@@ -25,10 +27,13 @@ from wybra.cache import (
     AtomicCacheCapability,
     CacheConflictError,
     CacheFeatureError,
+    CacheRevision,
     CacheSettings,
     CachesSettings,
     LeaseCacheCapability,
+    PubSubCacheCapability,
     RedisCache,
+    ScheduleCacheCapability,
     StreamCacheCapability,
     StreamPosition,
     WorkQueueCacheCapability,
@@ -36,6 +41,7 @@ from wybra.cache import (
 )
 from wybra.cache.feature_models import DEFAULT_STREAM_RETENTION_COUNT
 from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_schedules import RedisScheduleCache
 from wybra.cache.redis_streams import RedisStreamCache
 from wybra.config import MappingConfigSource
 from wybra.messages import MessagesCapability
@@ -163,7 +169,14 @@ async def test_redis_advanced_features_pass_shared_conformance(
         await asyncio.sleep(seconds + 0.05)
 
     try:
-        assert instance.features == ("atomic", "lease", "stream", "work-queue")
+        assert instance.features == (
+            "atomic",
+            "lease",
+            "pub-sub",
+            "schedule",
+            "stream",
+            "work-queue",
+        )
         await assert_atomic_conformance(
             instance.require(AtomicCacheCapability),
             owner="redis-atomic",
@@ -174,6 +187,20 @@ async def test_redis_advanced_features_pass_shared_conformance(
             owner="redis-lease",
             lease_ttl=0.5,
             renewed_ttl=1.0,
+        )
+        await assert_pubsub_conformance(
+            instance.require(PubSubCacheCapability),
+            owner="redis-pubsub",
+        )
+        await assert_schedule_conformance(
+            instance.require(ScheduleCacheCapability),
+            time.time() - 1,
+            advance,
+            owner="redis-schedule",
+            claim_ttl=0.1,
+            recurring_interval=0.5,
+            recurring_advance=1.75,
+            due_tolerance=0.5,
         )
 
         async def advance_queue(seconds: float) -> None:
@@ -189,6 +216,440 @@ async def test_redis_advanced_features_pass_shared_conformance(
             retention_count=DEFAULT_STREAM_RETENTION_COUNT,
             owner="redis-stream",
         )
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_delivers_across_registries_and_isolates_namespaces(
+    redis_url: str,
+) -> None:
+    namespace = f"pubsub_{uuid4().hex}"
+    first = await build_caches(redis_settings(redis_url, namespace))
+    second = await build_caches(redis_settings(redis_url, namespace))
+    isolated = await build_caches(redis_settings(redis_url, f"{namespace}_other"))
+    publisher = first.require("default").require(PubSubCacheCapability)
+    subscriber = second.require("default").require(PubSubCacheCapability)
+    other = isolated.require("default").require(PubSubCacheCapability)
+    subscription = await subscriber.subscribe("events", "updates")
+    other_owner = await subscriber.subscribe("other-events", "updates")
+    other_topic = await subscriber.subscribe("events", "other-updates")
+    isolated_subscription = await other.subscribe("events", "updates")
+    try:
+        assert await publisher.publish("events", "updates", b"shared") == 1
+        assert await subscription.receive(timeout=1) == b"shared"
+        for unrelated in (other_owner, other_topic, isolated_subscription):
+            with pytest.raises(TimeoutError):
+                await unrelated.receive(timeout=0.1)
+    finally:
+        await subscription.close()
+        await other_owner.close()
+        await other_topic.close()
+        await isolated_subscription.close()
+        await first.close()
+        await second.close()
+        await isolated.close()
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_registry_close_wakes_receive_and_iteration(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"pubsub_close_{uuid4().hex}",
+            features=("pub-sub",),
+        )
+    )
+    pubsub = caches.require("default").require(PubSubCacheCapability)
+    receiving = await pubsub.subscribe("events", "receive")
+    iterating = await pubsub.subscribe("events", "iterate")
+    receive_task = asyncio.create_task(receiving.receive())
+    iteration_task = asyncio.create_task(anext(iterating))
+    await asyncio.sleep(0)
+
+    await caches.close()
+
+    with pytest.raises(CacheFeatureError, match="subscription is closed"):
+        await receive_task
+    with pytest.raises(StopAsyncIteration):
+        await iteration_task
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_reports_a_safe_error_after_outage(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"pubsub_outage_{uuid4().hex}",
+            features=("pub-sub",),
+        )
+    )
+    pubsub = caches.require("default").require(PubSubCacheCapability)
+    subscription = await pubsub.subscribe("integration", "outage")
+    try:
+        container.get_wrapped_container().stop()
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await subscription.receive(timeout=1)
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await pubsub.publish("integration", "outage", b"payload")
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedules_preserve_revisions_and_fenced_claims(
+    redis_url: str,
+) -> None:
+    namespace = f"schedule_{uuid4().hex}"
+    settings = redis_settings(redis_url, namespace, features=("schedule",))
+    first_caches = await build_caches(settings)
+    second_caches = await build_caches(settings)
+    first = first_caches.require("default").require(ScheduleCacheCapability)
+    second = second_caches.require("default").require(ScheduleCacheCapability)
+    try:
+        created = await first.create(
+            "tasks",
+            "once",
+            b"first",
+            next_due_at=time.time() - 1,
+        )
+        assert created is not None
+        assert (
+            await second.update(
+                "tasks",
+                "once",
+                created.revision,
+                b"second",
+                next_due_at=time.time() - 1,
+            )
+            is not None
+        )
+        assert (
+            await first.update(
+                "tasks",
+                "once",
+                created.revision,
+                b"stale",
+                next_due_at=time.time(),
+            )
+            is None
+        )
+
+        claims = await asyncio.gather(
+            first.claim("tasks", "once", "scheduler-one", ttl=0.05),
+            second.claim("tasks", "once", "scheduler-two", ttl=0.05),
+        )
+        winner = next(claim for claim in claims if claim is not None)
+        assert sum(claim is not None for claim in claims) == 1
+
+        await asyncio.sleep(0.1)
+        recovered = await second.claim("tasks", "once", "scheduler-three", ttl=1)
+        assert recovered is not None
+        assert recovered.fencing_token > winner.fencing_token
+        with pytest.raises(CacheConflictError, match="Schedule claim is stale"):
+            await first.release(winner)
+        assert await second.complete(recovered) is None
+        assert await first.due("tasks", before=time.time()) == ()
+
+        recurring = await first.create(
+            "tasks",
+            "recurring",
+            b"recurring",
+            next_due_at=time.time() - 1,
+            interval_seconds=1,
+        )
+        assert recurring is not None
+        recurring_claim = await first.claim("tasks", "recurring", "scheduler", ttl=1)
+        assert recurring_claim is not None
+        advanced = await first.complete(recurring_claim)
+        assert advanced is not None
+        assert advanced.revision > recurring.revision
+        assert await first.due(
+            "tasks",
+            before=advanced.next_due_at,
+        ) == (advanced,)
+    finally:
+        await first_caches.close()
+        await second_caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_capacity_is_namespace_wide(redis_url: str) -> None:
+    runtime = RedisCacheRuntime(redis_url, f"schedule_capacity_{uuid4().hex}")
+    schedules = RedisScheduleCache(runtime, max_records=2)
+    try:
+        assert await schedules.create(
+            "first-owner",
+            "first",
+            b"first",
+            next_due_at=time.time(),
+        )
+        assert await schedules.create(
+            "second-owner",
+            "second",
+            b"second",
+            next_due_at=time.time(),
+        )
+        with pytest.raises(CacheFeatureError, match="record capacity"):
+            await schedules.create(
+                "third-owner",
+                "third",
+                b"third",
+                next_due_at=time.time(),
+            )
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_due_recovery_is_bounded(redis_url: str) -> None:
+    runtime = RedisCacheRuntime(redis_url, f"schedule_recovery_{uuid4().hex}")
+    schedules = RedisScheduleCache(runtime)
+    try:
+        visible = await schedules.create(
+            "tasks",
+            "aaa-visible",
+            b"visible",
+            next_due_at=time.time() - 1,
+        )
+        assert visible is not None
+        for index in range(101):
+            identity = f"claimed-{index:03}"
+            created = await schedules.create(
+                "tasks",
+                identity,
+                b"claimed",
+                next_due_at=time.time() - 1,
+            )
+            assert created is not None
+            assert await schedules.claim("tasks", identity, "scheduler", ttl=0.01)
+        await asyncio.sleep(0.05)
+
+        first = await schedules.due("tasks", before=time.time(), limit=1)
+        assert [record.identity for record in first] == ["aaa-visible"]
+        recovered = await schedules.due("tasks", before=time.time(), limit=100)
+        assert len(recovered) == 100
+        assert recovered[0].identity == "aaa-visible"
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_orders_equal_due_times_by_identity(
+    redis_url: str,
+) -> None:
+    runtime = RedisCacheRuntime(redis_url, f"schedule_order_{uuid4().hex}")
+    schedules = RedisScheduleCache(runtime)
+    try:
+        due_at = time.time() - 1
+        assert await schedules.create(
+            "tasks",
+            "a:",
+            b"colon",
+            next_due_at=due_at,
+        )
+        assert await schedules.create(
+            "tasks",
+            "a0",
+            b"zero",
+            next_due_at=due_at,
+        )
+        due = await schedules.due("tasks", before=time.time(), limit=2)
+        assert [record.identity for record in due] == ["a0", "a:"]
+        assert [
+            record.identity
+            for record in await schedules.due("tasks", before=time.time(), limit=1)
+        ] == ["a0"]
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_preserves_large_revisions_and_fencing_tokens(
+    redis_url: str,
+) -> None:
+    runtime = RedisCacheRuntime(redis_url, f"schedule_sequence_{uuid4().hex}")
+    schedules = RedisScheduleCache(runtime)
+    client = redis.from_url(redis_url, decode_responses=False)
+    boundary = 2**53
+    try:
+        await client.set(runtime.sequence_key("schedule-revision"), boundary - 1)
+        created = await schedules.create(
+            "tasks",
+            "sequence",
+            b"created",
+            next_due_at=time.time() - 1,
+        )
+        assert created is not None
+        assert created.revision == CacheRevision(boundary)
+        updated = await schedules.update(
+            "tasks",
+            "sequence",
+            created.revision,
+            b"updated",
+            next_due_at=time.time() - 1,
+        )
+        assert updated is not None
+        assert updated.revision == CacheRevision(boundary + 1)
+        assert (
+            await schedules.update(
+                "tasks",
+                "sequence",
+                created.revision,
+                b"stale",
+                next_due_at=time.time() - 1,
+            )
+            is None
+        )
+
+        await client.set(runtime.sequence_key("schedule-fencing"), boundary - 1)
+        first = await schedules.claim("tasks", "sequence", "first", ttl=1)
+        assert first is not None
+        assert first.fencing_token.value == boundary
+        await schedules.release(first)
+        second = await schedules.claim("tasks", "sequence", "second", ttl=1)
+        assert second is not None
+        assert second.fencing_token.value == boundary + 1
+    finally:
+        await client.aclose()
+        await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_survives_registry_rebuild_and_namespace_isolation(
+    redis_url: str,
+) -> None:
+    namespace = f"schedule_rebuild_{uuid4().hex}"
+    first_settings = redis_settings(redis_url, namespace, features=("schedule",))
+    first_caches = await build_caches(first_settings)
+    first = first_caches.require("default").require(ScheduleCacheCapability)
+    try:
+        created = await first.create(
+            "tasks",
+            "persisted",
+            b"payload",
+            next_due_at=time.time() - 1,
+        )
+        assert created is not None
+    finally:
+        await first_caches.close()
+
+    rebuilt_caches = await build_caches(first_settings)
+    isolated_caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"schedule_isolated_{uuid4().hex}",
+            features=("schedule",),
+        )
+    )
+    rebuilt = rebuilt_caches.require("default").require(ScheduleCacheCapability)
+    isolated = isolated_caches.require("default").require(ScheduleCacheCapability)
+    try:
+        assert await rebuilt.due("tasks", before=time.time()) == (created,)
+        assert await isolated.due("tasks", before=time.time()) == ()
+    finally:
+        await rebuilt_caches.close()
+        await isolated_caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_readiness_isolated_from_application_owners(
+    redis_url: str,
+) -> None:
+    namespace = f"schedule_readiness_{uuid4().hex}"
+    settings = redis_settings(redis_url, namespace, features=("schedule",))
+    initial_caches = await build_caches(settings)
+    initial = initial_caches.require("default").require(ScheduleCacheCapability)
+    try:
+        created = await initial.create(
+            "readiness",
+            "application",
+            b"payload",
+            next_due_at=time.time() - 1,
+        )
+        assert created is not None
+    finally:
+        await initial_caches.close()
+
+    first, second = await asyncio.gather(
+        build_caches(settings),
+        build_caches(settings),
+    )
+    try:
+        schedules = first.require("default").require(ScheduleCacheCapability)
+        assert await schedules.due("readiness", before=time.time()) == (created,)
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_survives_redis_restart(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    namespace = f"schedule_restart_{uuid4().hex}"
+    settings = redis_settings(redis_url, namespace, features=("schedule",))
+    first_caches = await build_caches(settings)
+    first = first_caches.require("default").require(ScheduleCacheCapability)
+    try:
+        created = await first.create(
+            "tasks",
+            "restart",
+            b"payload",
+            next_due_at=time.time() - 1,
+        )
+        assert created is not None
+    finally:
+        await first_caches.close()
+
+    container.get_wrapped_container().restart()
+    restarted_url = (
+        f"redis://{container.get_container_host_ip()}:"
+        f"{container.get_exposed_port(6379)}/0"
+    )
+    await _wait_for_redis(restarted_url)
+    second_caches = await build_caches(
+        redis_settings(restarted_url, namespace, features=("schedule",))
+    )
+    second = second_caches.require("default").require(ScheduleCacheCapability)
+    try:
+        assert await second.due("tasks", before=time.time()) == (created,)
+    finally:
+        await second_caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_schedule_reports_a_safe_error_after_outage(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"schedule_outage_{uuid4().hex}",
+            features=("schedule",),
+        )
+    )
+    schedules = caches.require("default").require(ScheduleCacheCapability)
+    try:
+        container.get_wrapped_container().stop()
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await schedules.due("tasks", before=time.time())
     finally:
         await caches.close()
 

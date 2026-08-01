@@ -84,7 +84,7 @@ class InvalidPasswordException(Exception):
 
 
 class PasswordHelper:
-    """Password hashing boundary preserving existing hash compatibility."""
+    """Password hashing boundary."""
 
     def __init__(self, password_hash: PasswordHash | None = None) -> None:
         self.password_hash = password_hash or PasswordHash(

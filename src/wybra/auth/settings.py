@@ -491,7 +491,9 @@ def _reject_unknown_password_options(auth_config: Mapping[str, Any]) -> None:
             "Auth password config must be an [auth.password] table."
         )
 
-    unknown_fields = sorted(set(password_config) - PASSWORD_OPTION_FIELDS)
+    unknown_fields = sorted(
+        str(key) for key in password_config if key not in PASSWORD_OPTION_FIELDS
+    )
     if unknown_fields:
         unknown_list = ", ".join(unknown_fields)
         allowed_fields = ", ".join(sorted(PASSWORD_OPTION_FIELDS))
@@ -506,7 +508,9 @@ def _reject_unknown_password_options(auth_config: Mapping[str, Any]) -> None:
             "Auth password policy config must be an [auth.password.policy] table."
         )
 
-    unknown_policy_fields = sorted(set(policy_config) - set(PASSWORD_POLICY_OPTION_MAP))
+    unknown_policy_fields = sorted(
+        str(key) for key in policy_config if key not in PASSWORD_POLICY_OPTION_MAP
+    )
     if unknown_policy_fields:
         unknown_list = ", ".join(unknown_policy_fields)
         allowed_fields = ", ".join(sorted(PASSWORD_POLICY_OPTION_MAP))
@@ -526,7 +530,9 @@ def _reject_unknown_passkey_options(auth_config: Mapping[str, Any]) -> None:
             f"Auth passkey config must be an [auth.{PASSKEY_SECTION_FIELD}] table."
         )
 
-    unknown_fields = sorted(set(passkey_config) - set(PASSKEY_OPTION_MAP))
+    unknown_fields = sorted(
+        str(key) for key in passkey_config if key not in PASSKEY_OPTION_MAP
+    )
     if unknown_fields:
         unknown_list = ", ".join(unknown_fields)
         allowed_fields = ", ".join(sorted(PASSKEY_OPTION_MAP))
