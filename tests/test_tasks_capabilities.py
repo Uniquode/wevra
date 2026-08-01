@@ -8,13 +8,16 @@ import textwrap
 import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from typing import cast
 from unittest.mock import patch
 from uuid import uuid7
 
 import pytest
 from fastapi import FastAPI
+from taskiq import TaskiqResult
 
 import wybra.tasks.capabilities as task_capabilities_module
+from wybra.cache import InMemoryCache
 from wybra.config import ConfigSourceError, MappingConfigSource
 from wybra.core.exceptions import ConfigurationError
 from wybra.diagnostics.context import (
@@ -48,6 +51,7 @@ from wybra.tasks import (
 )
 from wybra.tasks.capabilities import ImmediateTasksCapability
 from wybra.tasks.lifecycle import TaskLifecycleEvent, TaskStatusProjection
+from wybra.tasks.taskiq_results import CacheTaskiqResultBackend, TaskiqResultPolicy
 from wybra.tasks.taskiq_runtime import load_taskiq
 from wybra.utils.safety import MAX_SAFE_METADATA_ITEMS
 
@@ -289,6 +293,233 @@ def test_taskiq_loader_bounds_unexpected_initialisation_failure(
 
 def test_taskiq_loader_returns_installed_package() -> None:
     assert load_taskiq().__name__ == "taskiq"
+
+
+@pytest.mark.parametrize(
+    ("retention_seconds", "maximum_serialised_bytes", "message"),
+    (
+        (0.0, 1, "retention"),
+        (float("inf"), 1, "retention"),
+        (60.0, 0, "byte limit"),
+    ),
+)
+def test_taskiq_result_policy_rejects_invalid_bounds(
+    retention_seconds: float,
+    maximum_serialised_bytes: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        TaskiqResultPolicy(
+            retention_seconds=retention_seconds,
+            maximum_serialised_bytes=maximum_serialised_bytes,
+        )
+
+
+@pytest.mark.parametrize(
+    ("encode", "decode", "message"),
+    (
+        (
+            cast(Callable[[TaskiqResult[object]], bytes] | None, object()),
+            None,
+            "encoder",
+        ),
+        (
+            None,
+            cast(Callable[[bytes], TaskiqResult[object]] | None, object()),
+            "decoder",
+        ),
+    ),
+)
+def test_taskiq_result_policy_rejects_non_callable_codecs(
+    encode: Callable[[TaskiqResult[object]], bytes] | None,
+    decode: Callable[[bytes], TaskiqResult[object]] | None,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        TaskiqResultPolicy(
+            retention_seconds=60,
+            maximum_serialised_bytes=1_024,
+            encode=encode,
+            decode=decode,
+        )
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_round_trips_default_json_result() -> None:
+    result = TaskiqResult(
+        is_err=False,
+        return_value={"status": "complete"},
+        execution_time=0.25,
+    )
+    policy = TaskiqResultPolicy(retention_seconds=60, maximum_serialised_bytes=1_024)
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+
+    await backend.set_result("task-123", result)
+
+    assert await backend.is_result_ready("task-123") is True
+    assert await backend.get_result("task-123") == result
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_preserves_taskiq_result_metadata() -> None:
+    result = TaskiqResult(
+        is_err=True,
+        log="worker log",
+        return_value={"message": "retry exhausted"},
+        execution_time=0.5,
+        labels={"queue": "critical"},
+    )
+    policy = TaskiqResultPolicy(retention_seconds=60, maximum_serialised_bytes=1_024)
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+
+    await backend.set_result("task-123", result)
+
+    assert await backend.get_result("task-123", with_logs=True) == result
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_expires_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 100.0
+    monkeypatch.setattr("wybra.cache.capabilities.time.monotonic", lambda: now)
+    policy = TaskiqResultPolicy(retention_seconds=60, maximum_serialised_bytes=1_024)
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+    result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
+
+    await backend.set_result("task-123", result)
+    now = 161.0
+
+    assert await backend.is_result_ready("task-123") is False
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_reports_never_written_result_as_missing() -> None:
+    backend = CacheTaskiqResultBackend(
+        InMemoryCache(),
+        TaskiqResultPolicy(retention_seconds=60, maximum_serialised_bytes=1_024),
+    )
+
+    assert await backend.is_result_ready("task-123") is False
+    with pytest.raises(KeyError, match="unavailable"):
+        await backend.get_result("task-123")
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_rejects_oversized_result_without_storing() -> None:
+    policy = TaskiqResultPolicy(
+        retention_seconds=60,
+        maximum_serialised_bytes=3,
+        encode=lambda _value: b"four",
+    )
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+    result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
+
+    with pytest.raises(ValueError, match="byte limit"):
+        await backend.set_result("task-123", result)
+
+    assert await backend.is_result_ready("task-123") is False
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_rejects_non_byte_encoder_output() -> None:
+    policy = TaskiqResultPolicy(
+        retention_seconds=60,
+        maximum_serialised_bytes=1_024,
+        encode=lambda _value: cast(bytes, bytearray(b"result")),
+    )
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+    result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
+
+    with pytest.raises(TypeError, match="must return bytes"):
+        await backend.set_result("task-123", result)
+
+    assert await backend.is_result_ready("task-123") is False
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_does_not_store_after_encoder_failure() -> None:
+    secret = "TOP_SECRET_RESULT"
+
+    def encode(_result: TaskiqResult[object]) -> bytes:
+        raise RuntimeError(secret)
+
+    policy = TaskiqResultPolicy(
+        retention_seconds=60,
+        maximum_serialised_bytes=1_024,
+        encode=encode,
+    )
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+    result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
+
+    with pytest.raises(RuntimeError, match=secret):
+        await backend.set_result("task-123", result)
+
+    assert await backend.is_result_ready("task-123") is False
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_propagates_decoder_failure() -> None:
+    secret = "TOP_SECRET_RESULT"
+
+    def decode(_payload: bytes) -> TaskiqResult[object]:
+        raise RuntimeError(secret)
+
+    policy = TaskiqResultPolicy(
+        retention_seconds=60,
+        maximum_serialised_bytes=1_024,
+        decode=decode,
+    )
+    backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
+    result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
+
+    await backend.set_result("task-123", result)
+
+    with pytest.raises(RuntimeError, match=secret):
+        await backend.get_result("task-123")
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_propagates_cache_write_failure() -> None:
+    secret = "cache unavailable"
+
+    class FailingCache(InMemoryCache):
+        async def set(
+            self,
+            _owner: str,
+            _key: str,
+            _value: bytes,
+            *,
+            ttl: float,
+        ) -> None:
+            del ttl
+            raise RuntimeError(secret)
+
+    policy = TaskiqResultPolicy(retention_seconds=60, maximum_serialised_bytes=1_024)
+    backend = CacheTaskiqResultBackend(FailingCache(), policy)
+    result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
+
+    with pytest.raises(RuntimeError, match=secret):
+        await backend.set_result("task-123", result)
+
+
+@pytest.mark.anyio
+async def test_taskiq_result_backend_propagates_cache_read_failure() -> None:
+    secret = "cache unavailable"
+
+    class FailingCache(InMemoryCache):
+        async def get(self, _owner: str, _key: str) -> bytes | None:
+            raise RuntimeError(secret)
+
+    backend = CacheTaskiqResultBackend(
+        FailingCache(),
+        TaskiqResultPolicy(retention_seconds=60, maximum_serialised_bytes=1_024),
+    )
+
+    with pytest.raises(RuntimeError, match=secret):
+        await backend.is_result_ready("task-123")
+    with pytest.raises(RuntimeError, match=secret):
+        await backend.get_result("task-123")
 
 
 def test_baseline_task_paths_do_not_import_taskiq() -> None:
