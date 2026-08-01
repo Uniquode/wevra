@@ -199,14 +199,6 @@ class CsrfProtector:
 
     def validate_token(self, token: str, cookie_nonce: str) -> bool:
         parts = token.split(CSRF_TOKEN_SEPARATOR)
-        if len(parts) == 2:
-            nonce, signature = parts
-            if nonce != cookie_nonce:
-                return False
-            # Rollout compatibility for pre-expiry tokens. These validate only
-            # against the current secret, so CSRF secret rotation retires them.
-            return hmac.compare_digest(signature, self._signature(nonce))
-
         if len(parts) != 3:
             return False
 

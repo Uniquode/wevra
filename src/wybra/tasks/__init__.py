@@ -33,7 +33,7 @@ from wybra.tasks.models import (
 )
 from wybra.tasks.registry import TaskRegistry
 from wybra.tasks.settings import TasksSettings
-from wybra.tasks.setup import setup_site
+from wybra.tasks.setup import post_setup_site, setup_site
 
 __all__ = (
     "RetryPolicy",
@@ -64,6 +64,7 @@ __all__ = (
     "current_task_context",
     "dispatch",
     "module_config",
+    "post_setup_site",
     "setup_site",
     "task",
 )

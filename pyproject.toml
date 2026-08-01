@@ -79,6 +79,9 @@ databases = [
     "pyodbc",
     "psycopg[binary,pool]>=3.3.4,<4.0.0",
 ]
+tasks = [
+    "taskiq>=0.12.4,<0.13.0",
+]
 
 [project.scripts]
 wybra-authmgr = "wybra.auth.cli.authmgr:main"
@@ -109,6 +112,7 @@ dev = [
     "pytest>=9.1.1",
     "redis>=8.0.1",
     "ruff>=0.15.22",
+    "taskiq>=0.12.4,<0.13.0",
     "testcontainers[mssql,mysql]>=4.14.2",
     "ty>=0.0.60",
 ]

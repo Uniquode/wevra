@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import sys
+import textwrap
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from unittest.mock import patch
@@ -12,6 +16,7 @@ from fastapi import FastAPI
 
 import wybra.tasks.capabilities as task_capabilities_module
 from wybra.config import ConfigSourceError, MappingConfigSource
+from wybra.core.exceptions import ConfigurationError
 from wybra.diagnostics.context import (
     reset_current_diagnostics,
     set_current_diagnostics,
@@ -19,7 +24,7 @@ from wybra.diagnostics.context import (
 from wybra.diagnostics.event_projection import DiagnosticsEventProjection
 from wybra.diagnostics.records import RequestDiagnostics
 from wybra.events import EventsCapability
-from wybra.site import Site, start
+from wybra.site import Site, SiteCapabilityError, start
 from wybra.tasks import (
     TASK_EVENT_SCOPE,
     RetryPolicy,
@@ -43,7 +48,24 @@ from wybra.tasks import (
 )
 from wybra.tasks.capabilities import ImmediateTasksCapability
 from wybra.tasks.lifecycle import TaskLifecycleEvent, TaskStatusProjection
+from wybra.tasks.taskiq_runtime import load_taskiq
 from wybra.utils.safety import MAX_SAFE_METADATA_ITEMS
+
+
+def _exception_nodes(error: BaseException) -> tuple[BaseException, ...]:
+    nodes: list[BaseException] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        nodes.append(node)
+        for linked in (node.__cause__, node.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return tuple(nodes)
 
 
 def test_task_settings_default_to_immediate_backend() -> None:
@@ -101,6 +123,243 @@ def test_task_settings_can_disable_module() -> None:
 def test_task_settings_reject_unimplemented_durable_backend() -> None:
     with pytest.raises(ConfigSourceError, match="tasks.backend"):
         TasksSettings.load_settings({"tasks": {"backend": "taskiq-redis"}})
+
+
+def test_task_settings_accept_taskiq_backend_and_named_cache() -> None:
+    settings = TasksSettings.load_settings(
+        {"tasks": {"backend": "taskiq", "cache_name": "task_work"}}
+    )
+
+    assert settings.backend == "taskiq"
+    assert settings.cache_name == "task_work"
+
+
+@pytest.mark.parametrize(
+    "cache_name",
+    ("", " ", " task_work ", "invalid-name", "Default"),
+)
+def test_task_settings_immediate_backend_ignores_cache_name(cache_name: str) -> None:
+    loaded = TasksSettings.load_settings(
+        {"tasks": {"backend": "immediate", "cache_name": cache_name}}
+    )
+    constructed = TasksSettings(backend="immediate", cache_name=cache_name)
+
+    assert loaded.cache_name == cache_name
+    assert constructed.cache_name == cache_name
+
+
+def test_task_settings_immediate_cache_name_must_remain_a_string() -> None:
+    with pytest.raises(ConfigSourceError, match="tasks.cache_name"):
+        TasksSettings.load_settings(
+            {"tasks": {"backend": "immediate", "cache_name": 42}}
+        )
+    with pytest.raises(ConfigurationError, match="cache_name must be a string"):
+        TasksSettings(backend="immediate", cache_name=42)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "cache_name",
+    ("", " ", " task_work ", "invalid-name", "Default"),
+)
+def test_task_settings_reject_invalid_taskiq_cache_name(cache_name: str) -> None:
+    with pytest.raises(
+        (ConfigSourceError, ConfigurationError),
+        match="cache_name|invalid cache name",
+    ):
+        TasksSettings.load_settings(
+            {"tasks": {"backend": "taskiq", "cache_name": cache_name}}
+        )
+
+
+def test_taskiq_cache_name_diagnostic_is_bounded_and_secret_safe() -> None:
+    marker = "TOP_SECRET"
+    cache_name = f"{marker}-" + ("x" * 10_000)
+
+    with pytest.raises(ConfigurationError) as raised:
+        TasksSettings.load_settings(
+            {"tasks": {"backend": "taskiq", "cache_name": cache_name}}
+        )
+
+    for node in _exception_nodes(raised.value):
+        diagnostic = str(node)
+        assert marker not in diagnostic
+        assert cache_name not in diagnostic
+        assert len(diagnostic) <= 400
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert marker not in rendered
+    assert cache_name not in rendered
+    assert len(rendered) <= 1_200
+
+
+@pytest.mark.anyio
+async def test_taskiq_invalid_cache_name_startup_chain_is_secret_safe() -> None:
+    marker = "STARTUP_SECRET"
+    cache_name = f"{marker}-" + ("x" * 10_000)
+
+    with pytest.raises(SiteCapabilityError) as raised:
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.tasks",)},
+                    "tasks": {"backend": "taskiq", "cache_name": cache_name},
+                }
+            ),
+        )
+
+    for node in _exception_nodes(raised.value):
+        diagnostic = str(node)
+        assert marker not in diagnostic
+        assert cache_name not in diagnostic
+        assert len(diagnostic) <= 600
+
+
+def test_taskiq_loader_reports_missing_optional_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_import(name: str) -> object:
+        raise ModuleNotFoundError(name=name)
+
+    monkeypatch.setattr(
+        "wybra.tasks.taskiq_runtime.importlib.import_module",
+        missing_import,
+    )
+
+    with pytest.raises(ConfigurationError, match=r"Install wybra\[tasks\]"):
+        load_taskiq()
+
+
+def test_taskiq_loader_reports_broken_installed_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_import(name: str) -> object:
+        raise ImportError("missing transitive dependency")
+
+    monkeypatch.setattr(
+        "wybra.tasks.taskiq_runtime.importlib.import_module",
+        broken_import,
+    )
+
+    with pytest.raises(ConfigurationError, match="could not be loaded"):
+        load_taskiq()
+
+
+def test_taskiq_loader_reports_missing_transitive_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_import(name: str) -> object:
+        raise ModuleNotFoundError(
+            "No module named 'taskiq_dependency'",
+            name="taskiq_dependency",
+        )
+
+    monkeypatch.setattr(
+        "wybra.tasks.taskiq_runtime.importlib.import_module",
+        broken_import,
+    )
+
+    with pytest.raises(ConfigurationError, match="could not be loaded") as raised:
+        load_taskiq()
+
+    assert "taskiq_dependency" not in str(raised.value)
+
+
+def test_taskiq_loader_bounds_unexpected_initialisation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_secret = "redis://user:secret@example.invalid/0"
+
+    def broken_import(name: str) -> object:
+        raise RuntimeError(provider_secret)
+
+    monkeypatch.setattr(
+        "wybra.tasks.taskiq_runtime.importlib.import_module",
+        broken_import,
+    )
+
+    with pytest.raises(ConfigurationError, match="could not be loaded") as raised:
+        load_taskiq()
+
+    diagnostic = str(raised.value)
+    assert provider_secret not in diagnostic
+    assert "secret" not in diagnostic
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_taskiq_loader_returns_installed_package() -> None:
+    assert load_taskiq().__name__ == "taskiq"
+
+
+def test_baseline_task_paths_do_not_import_taskiq() -> None:
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import sys
+
+        from fastapi import FastAPI
+
+
+        class RejectTaskiqImports:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "taskiq" or fullname.startswith("taskiq."):
+                    raise AssertionError(f"unexpected Taskiq import: {fullname}")
+                return None
+
+
+        sys.meta_path.insert(0, RejectTaskiqImports())
+
+        from wybra.config import MappingConfigSource
+        from wybra.site import start
+        from wybra.tasks import TaskRegistry, TasksCapability, task
+
+        registry = TaskRegistry()
+
+
+        @task(name="tests.import_boundary", registry=registry)
+        async def operation():
+            return "complete"
+
+
+        async def main():
+            assert await operation.run() == "complete"
+            for task_config in (
+                {"enabled": False, "backend": "taskiq"},
+                {"backend": "immediate"},
+            ):
+                site = await start(
+                    FastAPI(),
+                    config_source=MappingConfigSource(
+                        {
+                            "app": {"modules": ("wybra.tasks",)},
+                            "tasks": task_config,
+                        }
+                    ),
+                )
+                try:
+                    if task_config.get("enabled", True):
+                        assert site.optional_capability(TasksCapability) is not None
+                    else:
+                        assert site.optional_capability(TasksCapability) is None
+                finally:
+                    await site.close()
+
+
+        asyncio.run(main())
+        assert not any(
+            name == "taskiq" or name.startswith("taskiq.") for name in sys.modules
+        )
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.anyio
@@ -173,6 +432,209 @@ async def test_configured_tasks_module_provides_immediate_capability() -> None:
         assert (await handle.status()).state is TaskState.SUCCEEDED  # type: ignore[union-attr]
     finally:
         await site.close()
+
+
+@pytest.mark.anyio
+async def test_immediate_tasks_do_not_load_taskiq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_load() -> object:
+        pytest.fail("Immediate tasks must not load Taskiq.")
+
+    monkeypatch.setattr("wybra.tasks.setup.load_taskiq", unexpected_load)
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.tasks",)},
+                "tasks": {"backend": "immediate"},
+            }
+        ),
+    )
+
+    try:
+        assert isinstance(
+            site.require_capability(TasksCapability),
+            ImmediateTasksCapability,
+        )
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_disabled_taskiq_backend_does_not_load_taskiq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_load() -> object:
+        pytest.fail("Disabled tasks must not load Taskiq.")
+
+    monkeypatch.setattr("wybra.tasks.setup.load_taskiq", unexpected_load)
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.tasks",)},
+                "tasks": {"enabled": False, "backend": "taskiq"},
+            }
+        ),
+    )
+
+    try:
+        assert site.optional_capability(TasksCapability) is None
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_taskiq_backend_requires_configured_caches_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_load() -> object:
+        pytest.fail("Taskiq loader must run after cache selection.")
+
+    monkeypatch.setattr("wybra.tasks.setup.load_taskiq", unexpected_load)
+    with pytest.raises(SiteCapabilityError, match="require wybra.cache"):
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.tasks",)},
+                    "tasks": {"backend": "taskiq"},
+                }
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_taskiq_backend_preflight_runs_after_cache_finalisation() -> None:
+    with pytest.raises(SiteCapabilityError, match="no cache-backed Taskiq broker"):
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.tasks", "wybra.cache")},
+                    "tasks": {"backend": "taskiq"},
+                }
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_taskiq_backend_requires_configured_named_cache() -> None:
+    with pytest.raises(SiteCapabilityError, match="configured cache 'task_work'"):
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                    "tasks": {"backend": "taskiq", "cache_name": "task_work"},
+                }
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_taskiq_missing_cache_diagnostic_bounds_long_name() -> None:
+    marker = "missing_secret_cache"
+    cache_name = ("a" * 10_000) + marker
+
+    with pytest.raises(SiteCapabilityError) as raised:
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                    "tasks": {"backend": "taskiq", "cache_name": cache_name},
+                }
+            ),
+        )
+
+    nodes = _exception_nodes(raised.value)
+    assert nodes
+    for node in nodes:
+        diagnostic = str(node)
+        assert marker not in diagnostic
+        assert cache_name not in diagnostic
+        assert len(diagnostic) <= 600
+    assert "..." in str(raised.value)
+
+
+@pytest.mark.anyio
+async def test_taskiq_backend_reports_missing_optional_dependency_at_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_taskiq() -> object:
+        raise ConfigurationError(
+            "Taskiq tasks require the wybra[tasks] optional dependency."
+        )
+
+    monkeypatch.setattr("wybra.tasks.setup.load_taskiq", missing_taskiq)
+    with pytest.raises(SiteCapabilityError, match=r"wybra\[tasks\]"):
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                    "tasks": {"backend": "taskiq"},
+                }
+            ),
+        )
+
+
+@pytest.mark.anyio
+async def test_taskiq_preflight_never_provides_tasks_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provided_types: list[type[object]] = []
+    provide_capability = Site.provide_capability
+
+    def recording_provide(
+        site: Site,
+        capability_type: type[object],
+        capability: object,
+    ) -> None:
+        provided_types.append(capability_type)
+        provide_capability(site, capability_type, capability)
+
+    monkeypatch.setattr(Site, "provide_capability", recording_provide)
+    configurations = (
+        {
+            "app": {"modules": ("wybra.tasks",)},
+            "tasks": {"backend": "taskiq"},
+        },
+        {
+            "app": {"modules": ("wybra.cache", "wybra.tasks")},
+            "tasks": {"backend": "taskiq", "cache_name": "task_work"},
+        },
+        {
+            "app": {"modules": ("wybra.cache", "wybra.tasks")},
+            "tasks": {"backend": "taskiq"},
+        },
+    )
+
+    for configuration in configurations:
+        with pytest.raises(SiteCapabilityError):
+            await start(
+                FastAPI(),
+                config_source=MappingConfigSource(configuration),
+            )
+
+    def missing_taskiq() -> object:
+        raise ConfigurationError("Taskiq optional dependency is unavailable.")
+
+    monkeypatch.setattr("wybra.tasks.setup.load_taskiq", missing_taskiq)
+    with pytest.raises(SiteCapabilityError):
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                    "tasks": {"backend": "taskiq"},
+                }
+            ),
+        )
+
+    assert TasksCapability not in provided_types
 
 
 def test_immediate_provider_rejects_scheduling_features() -> None:

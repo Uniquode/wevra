@@ -54,7 +54,6 @@ from wybra.messages.storage import (
     CacheMessagesStorage,
     DatabaseMessagesStorage,
     NamedCacheQueueBackend,
-    RedisCacheQueueBackend,
     SessionMessagesStorage,
     storage_from_settings,
 )
@@ -99,14 +98,11 @@ def _cache_validation_settings(
     *,
     modules: tuple[str, ...],
     cache_name: str | None = None,
-    cache_url: str | None = None,
     named_caches: dict[str, dict[str, object]] | None = None,
 ) -> SimpleNamespace:
     message_values: dict[str, object] = {"storage_backend": "cache"}
     if cache_name is not None:
         message_values["cache_name"] = cache_name
-    if cache_url is not None:
-        message_values["cache_url"] = cache_url
     values: dict[str, dict[str, object]] = {
         "cache": {},
         "wybra.messages": message_values,
@@ -198,7 +194,6 @@ def test_cache_messages_settings_default_to_named_default_cache() -> None:
 
     assert settings.cache_name is None
     assert settings.resolved_cache_name == "default"
-    assert settings.cache_url is None
 
 
 def test_cache_messages_settings_accept_explicit_cache_name() -> None:
@@ -223,26 +218,6 @@ def test_cache_messages_settings_support_cache_name_environment_override() -> No
 def test_cache_messages_settings_reject_invalid_cache_name() -> None:
     with pytest.raises(ConfigSourceError, match="cache_name"):
         _settings({"storage_backend": "cache", "cache_name": "Message Cache"})
-
-
-def test_messages_settings_reject_ambiguous_cache_selection() -> None:
-    with pytest.raises(ConfigurationError, match="cache_name.*cache_url"):
-        _settings(
-            {
-                "storage_backend": "cache",
-                "cache_name": "default",
-                "cache_url": "memory://alerts",
-            }
-        )
-
-
-def test_cache_messages_settings_preserve_legacy_url_compatibility() -> None:
-    settings = _settings(
-        {"storage_backend": "cache", "cache_url": "memory://alerts"},
-    )
-
-    assert settings.cache_name is None
-    assert settings.cache_url == "memory://alerts"
 
 
 def test_named_cache_messages_settings_reject_oversized_queue_bound() -> None:
@@ -358,57 +333,6 @@ async def test_queue_depth_discards_oldest_session_alerts() -> None:
     alerts = await capability.consume_alerts(request)
 
     assert [alert.message for alert in alerts] == ["Two", "Three"]
-
-
-@pytest.mark.anyio
-async def test_memory_cache_storage_persists_and_pops_alerts() -> None:
-    settings = _settings({"storage_backend": "cache", "cache_url": "memory://alerts"})
-    with pytest.warns(DeprecationWarning, match="cache_name"):
-        storage = storage_from_settings(
-            Site(FastAPI(), ConfigService([], discover_module_config=False)),
-            settings,
-        )
-    capability = DefaultMessagesCapability(settings, storage)
-    session: dict[str, object] = {}
-    first_request = _request(session)
-    second_request = _request(session)
-
-    await capability.success(first_request, "Cached")
-
-    alerts = await capability.consume_alerts(second_request)
-    empty_alerts = await capability.consume_alerts(_request(session))
-
-    assert [alert.message for alert in alerts] == ["Cached"]
-    assert empty_alerts == ()
-
-
-@pytest.mark.anyio
-async def test_legacy_messages_cache_url_warns_without_exposing_url(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    warning_messages: list[str] = []
-    storage_module = importlib.import_module("wybra.messages.storage")
-
-    def record_warning(message: str, *args: object) -> None:
-        warning_messages.append(message % args)
-
-    monkeypatch.setattr(storage_module.logger, "warning", record_warning)
-    legacy_url = "redis://user:secret@cache.internal/1"
-    settings = _settings({"storage_backend": "cache", "cache_url": legacy_url})
-
-    with pytest.warns(DeprecationWarning, match="cache_name"):
-        storage = storage_from_settings(
-            Site(FastAPI(), ConfigService([], discover_module_config=False)),
-            settings,
-        )
-
-    try:
-        assert isinstance(storage, CacheMessagesStorage)
-        assert any("cache_url is deprecated" in message for message in warning_messages)
-        assert legacy_url not in repr(warning_messages)
-        assert "secret" not in repr(warning_messages)
-    finally:
-        await storage.close()
 
 
 def test_non_cache_messages_warn_about_ignored_cache_selection(
@@ -1017,75 +941,6 @@ async def test_named_atomic_cache_queue_ignores_malformed_utf8() -> None:
 
 
 @pytest.mark.anyio
-async def test_cache_storage_reports_unavailable_backend() -> None:
-    class BrokenRedisClient:
-        async def ping(self) -> None:
-            raise OSError("cache unavailable")
-
-    backend = RedisCacheQueueBackend("redis://cache.example/0")
-    backend._client = BrokenRedisClient()
-
-    with pytest.raises(MessageStorageError, match="unavailable"):
-        await backend.validate()
-
-
-@pytest.mark.anyio
-async def test_redis_cache_storage_clamps_subsecond_ttl() -> None:
-    class FakeRedisClient:
-        def __init__(self) -> None:
-            self.expires: list[int] = []
-
-        async def eval(
-            self,
-            script: str,
-            key_count: int,
-            queue_key: str,
-            payload: str,
-            queue_depth: str,
-            ttl_seconds: str,
-        ) -> int:
-            self.expires.append(int(ttl_seconds))
-            return 1
-
-    client = FakeRedisClient()
-    backend = RedisCacheQueueBackend("redis://cache.example/0")
-    backend._client = client
-
-    await backend.append(
-        "queue",
-        {"severity": SUCCESS_ALERT, "message": "Saved", "created_at": 1.0},
-        queue_depth=1,
-        ttl_seconds=0.5,
-    )
-
-    assert client.expires == [1]
-
-
-@pytest.mark.anyio
-async def test_redis_cache_storage_pops_queue_with_atomic_script() -> None:
-    class FakeRedisClient:
-        def __init__(self) -> None:
-            self.calls: list[tuple[int, str]] = []
-
-        async def eval(self, script: str, key_count: int, queue_key: str) -> str:
-            self.calls.append((key_count, queue_key))
-            return json.dumps(
-                [{"severity": SUCCESS_ALERT, "message": "Saved", "created_at": 1.0}]
-            )
-
-    client = FakeRedisClient()
-    backend = RedisCacheQueueBackend("redis://cache.example/0")
-    backend._client = client
-
-    alerts = await backend.pop("queue")
-
-    assert client.calls == [(1, "queue")]
-    assert alerts == (
-        {"severity": SUCCESS_ALERT, "message": "Saved", "created_at": 1.0},
-    )
-
-
-@pytest.mark.anyio
 async def test_database_storage_persists_and_pops_alerts() -> None:
     settings = _settings({"storage_backend": "database"})
     async with _database_site() as (site, _db_capability):
@@ -1428,20 +1283,3 @@ def test_validate_alerts_rejects_missing_named_cache() -> None:
     assert result.is_ok is False
     assert any("missing" in error for error in result.errors)
     assert any("queued request messages" in error for error in result.errors)
-
-
-def test_validate_alerts_reports_legacy_cache_without_exposing_url() -> None:
-    legacy_url = "redis://user:secret@cache.internal/1"
-
-    result = validate_alerts(
-        _cache_validation_settings(
-            modules=("wybra.messages",),
-            cache_url=legacy_url,
-        )
-    )
-
-    rendered = repr(result)
-    assert result.is_ok
-    assert "legacy" in rendered
-    assert legacy_url not in rendered
-    assert "secret" not in rendered

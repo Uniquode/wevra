@@ -90,21 +90,13 @@ def _record_settings_check(
             error="Database-backed messages require wybra.db in configured modules.",
         )
     if messages_settings.resolved_storage_backend is MessageStorageBackend.CACHE:
-        if messages_settings.cache_url is not None:
-            record_check(
-                checks,
-                errors,
-                passed=True,
-                description="cache messages storage uses deprecated legacy cache URL",
-            )
-        else:
-            _record_named_cache_check(
-                config,
-                settings.modules,
-                messages_settings.resolved_cache_name,
-                checks,
-                errors,
-            )
+        _record_named_cache_check(
+            config,
+            settings.modules,
+            messages_settings.resolved_cache_name,
+            checks,
+            errors,
+        )
 
 
 def _record_named_cache_check(

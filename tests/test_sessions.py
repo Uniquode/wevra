@@ -60,7 +60,7 @@ from wybra.sessions import (
 )
 from wybra.sessions.middleware import SESSION_CLEANUP_INTERVAL_SECONDS
 from wybra.sessions.setup import session_storage_from_site
-from wybra.sessions.storage import CacheSessionStorage, SessionStorageError
+from wybra.sessions.storage import SessionStorageError
 from wybra.site import Site, SiteCapabilityError, start, start_site
 from wybra.testing import (
     WybraTestClient,
@@ -181,7 +181,6 @@ def test_cache_session_settings_default_to_named_default_cache() -> None:
 
     assert settings.cache_name is None
     assert settings.resolved_cache_name == "default"
-    assert settings.cache_url is None
 
 
 def test_cache_session_settings_accept_explicit_cache_name() -> None:
@@ -206,37 +205,6 @@ def test_cache_session_settings_support_cache_name_environment_override() -> Non
 def test_cache_session_settings_reject_invalid_cache_name() -> None:
     with pytest.raises(ConfigSourceError, match="cache_name"):
         _settings({"storage_backend": "cache", "cache_name": "Session Cache"})
-
-
-def test_cache_session_settings_reject_name_with_legacy_url() -> None:
-    with pytest.raises(ConfigurationError, match="cache_name.*cache_url"):
-        _settings(
-            {
-                "storage_backend": "cache",
-                "cache_name": "default",
-                "cache_url": "memory://sessions",
-            }
-        )
-
-
-def test_session_settings_always_reject_ambiguous_cache_selection() -> None:
-    with pytest.raises(ConfigurationError, match="cache_name.*cache_url"):
-        _settings(
-            {
-                "storage_backend": "database",
-                "cache_name": "default",
-                "cache_url": "memory://sessions",
-            }
-        )
-
-
-def test_cache_session_settings_preserve_legacy_url_compatibility() -> None:
-    settings = _settings(
-        {"storage_backend": "cache", "cache_url": "memory://sessions"},
-    )
-
-    assert settings.cache_name is None
-    assert settings.cache_url == "memory://sessions"
 
 
 def test_sessions_settings_resolves_file_directory_against_project_root(
@@ -358,22 +326,6 @@ def test_cookie_storage_encrypts_and_validates_payloads() -> None:
     assert loaded == ("session", record)
     assert storage.load_cookie("not-an-envelope", now=5.0) is None
     assert storage.load_cookie(cookie_value, now=25.0) is None
-
-
-@pytest.mark.anyio
-async def test_cache_storage_supports_memory_url() -> None:
-    storage = CacheSessionStorage(
-        url="memory://sessions",
-        key_prefix="test:",
-        payload_max_bytes=1024,
-    )
-
-    await storage.save("session", _record(data={"value": "cached"}))
-
-    assert await storage.load("session", now=2.0) == _record(data={"value": "cached"})
-
-    await storage.delete("session")
-    assert await storage.load("session", now=2.0) is None
 
 
 @pytest.mark.anyio
@@ -650,22 +602,6 @@ def test_sessions_validation_retries_cache_provider_import_after_failure(
     assert import_attempts == 2
 
 
-def test_sessions_validation_reports_legacy_cache_without_exposing_url() -> None:
-    legacy_url = "redis://user:secret@cache.internal/1"
-    settings = SimpleNamespace(
-        config=_config(sessions={"storage_backend": "cache", "cache_url": legacy_url}),
-        deployment_environment="local",
-    )
-
-    result = validate_sessions(settings)
-
-    rendered = repr(result)
-    assert result.is_ok
-    assert "legacy" in rendered
-    assert legacy_url not in rendered
-    assert "secret" not in rendered
-
-
 @pytest.mark.anyio
 async def test_start_registers_core_session_storage_capability() -> None:
     site = await start(
@@ -786,40 +722,6 @@ async def test_cache_sessions_reject_missing_named_cache_at_startup() -> None:
             ),
             environ={},
         )
-
-
-@pytest.mark.anyio
-async def test_legacy_cache_url_still_starts_with_operator_warnings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    warning_messages: list[str] = []
-    storage_module = importlib.import_module("wybra.sessions.storage")
-
-    def record_warning(message: str, *args: object) -> None:
-        warning_messages.append(message % args)
-
-    monkeypatch.setattr(storage_module.logger, "warning", record_warning)
-
-    with pytest.warns(DeprecationWarning, match="cache_name"):
-        site = await start(
-            FastAPI(),
-            config_source=MappingConfigSource(
-                {
-                    "app": {"modules": ()},
-                    "wybra.sessions": {
-                        "storage_backend": "cache",
-                        "cache_url": "memory://sessions",
-                    },
-                }
-            ),
-            environ={},
-        )
-
-    try:
-        assert isinstance(session_storage_from_site(site), CacheSessionStorage)
-        assert any("cache_url is deprecated" in message for message in warning_messages)
-    finally:
-        await site.close()
 
 
 @pytest.mark.anyio

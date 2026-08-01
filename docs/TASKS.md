@@ -17,7 +17,7 @@ Wybra's task platform covers three application use cases:
 | --- | --- | --- |
 | Direct task call | Available | Runs in the caller, returns the function result, and propagates the original exception. |
 | On-demand submission | Available with the immediate backend | Uses task validation, retry, lifecycle, status, correlation, and idempotency metadata, but executes inline in the submitting process. |
-| Durable background submission | Planned | Will publish to the Taskiq/Redis provider and return before worker execution. |
+| Durable background submission | Planned | Will publish through a cache-backed provider and return before worker execution. |
 | One-time deferred task | Planned | Will submit one ordinary task command for a validated future time. |
 | Recurring interval or cron task | Planned | Will be discovered declaratively and published by a separately operated scheduler. |
 
@@ -75,11 +75,46 @@ jitter_seconds = 0.5
 status_retention_seconds = 3600
 ```
 
-`backend = "immediate"` is the default and currently the only available
-backend. The module registers `TasksCapability` during site composition.
+`backend = "immediate"` is the default and the only execution backend currently
+available. The module registers `TasksCapability` during site composition.
 Without `wybra.tasks` in `[app].modules`, the capability is absent but declared
 tasks remain directly executable. The same is true when the module is present
 with `enabled = false`.
+
+### Taskiq preflight
+
+Install the optional dependency before selecting the future Taskiq backend:
+
+```sh
+uv add 'wybra[tasks]'
+```
+
+Taskiq configuration selects a named provider-neutral cache. It intentionally
+performs startup preflight only in the current release; it does not register a
+`TasksCapability`, broker, result backend, worker, or scheduler yet.
+
+```toml
+[app]
+modules = [
+  "wybra.cache",
+  "wybra.tasks",
+  "example.application",
+]
+
+[tasks]
+backend = "taskiq"
+cache_name = "default"
+```
+
+`cache_name` defaults to `"default"`; its cache-name format is validated only
+for the Taskiq backend, while the immediate backend ignores it. The selected
+name must correspond to `[cache]` for `default`, or to a configured named cache
+such as `[cache.task_work]` when `cache_name = "task_work"`. Taskiq preflight
+runs after cache setup finalisation and checks that `wybra.cache` provides the
+selected cache. It then stops startup with an explicit message that no
+cache-backed Taskiq broker is available yet. This protects applications from
+silently falling back to inline execution while durable task integration is
+incomplete.
 
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
@@ -509,7 +544,8 @@ does not create a timer or lifecycle record.
 
 ## Current limitations
 
-- Only the immediate backend is available.
+- Only the immediate backend executes tasks; Taskiq configuration currently
+  preflights then stops before registering a capability.
 - Submission is inline rather than worker-backed.
 - Immediate status and lifecycle are process-local.
 - Deferred and recurring schedules are not available.

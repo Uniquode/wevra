@@ -69,20 +69,12 @@ def validate_sessions(settings: SessionsValidationSettings) -> ValidationResult:
             error="Memory session storage is only valid locally.",
         )
     if session_settings.resolved_storage_backend is SessionStorageBackend.CACHE:
-        if session_settings.cache_url is not None:
-            record_check(
-                checks,
-                errors,
-                passed=True,
-                description="cache session storage uses deprecated legacy cache URL",
-            )
-        else:
-            _record_named_cache_check(
-                settings.config,
-                session_settings.resolved_cache_name,
-                checks,
-                errors,
-            )
+        _record_named_cache_check(
+            settings.config,
+            session_settings.resolved_cache_name,
+            checks,
+            errors,
+        )
     if session_settings.resolved_storage_backend is SessionStorageBackend.FILE:
         record_check(
             checks,

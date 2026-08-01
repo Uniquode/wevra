@@ -2780,14 +2780,14 @@ class TestAuthmgrBehaviour:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        database_path = tmp_path / "legacy-identity.sqlite3"
+        database_path = tmp_path / "outdated-identity.sqlite3"
         initialise_legacy_identity_database(database_path)
         set_authmgr_database_url(monkeypatch, tmp_path, sqlite_file_url(database_path))
         stdin = io.StringIO(f"{STRONG_TEST_PASSWORD}\n")
         monkeypatch.setattr(sys, "stdin", stdin)
 
         exit_code = authmgr.main(
-            ["user", "create", "legacy@example.com", "--password", "-"]
+            ["user", "create", "outdated@example.com", "--password", "-"]
         )
 
         assert exit_code == 1

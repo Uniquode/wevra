@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar, Self, cast
-from urllib.parse import urlparse
 
 from wybra.cache import DEFAULT_CACHE_NAME, MAX_CACHE_FEATURE_PAYLOAD_BYTES
 from wybra.config import BaseSettings, ConfigDef, ConfigService
@@ -19,7 +18,6 @@ from wybra.messages.config import (
     module_config,
     to_non_blank_string,
     to_optional_cache_name,
-    to_optional_non_blank_string,
     to_positive_float,
     to_positive_int,
     to_storage_backend,
@@ -39,7 +37,6 @@ class MessagesSettings(BaseSettings):
     message_max_length: int | str = DEFAULT_MESSAGE_MAX_LENGTH
     message_ttl_seconds: float | str = DEFAULT_MESSAGE_TTL_SECONDS
     cache_name: str | None = None
-    cache_url: str | None = None
     cache_key_prefix: str = DEFAULT_CACHE_KEY_PREFIX
     database_connection_name: str = DEFAULT_DATABASE_CONNECTION_NAME
 
@@ -76,11 +73,6 @@ class MessagesSettings(BaseSettings):
             self.cache_name,
             "cache_name",
         )
-        cache_url = _configuration_value(
-            to_optional_non_blank_string,
-            self.cache_url,
-            "cache_url",
-        )
         cache_key_prefix = _configuration_value(
             to_non_blank_string,
             self.cache_key_prefix,
@@ -91,14 +83,7 @@ class MessagesSettings(BaseSettings):
             self.database_connection_name,
             "database_connection_name",
         )
-        if cache_name is not None and cache_url is not None:
-            raise ConfigurationError(
-                "wybra.messages.cache_name and wybra.messages.cache_url "
-                "cannot both be configured."
-            )
-        if storage_backend is MessageStorageBackend.CACHE and cache_url is not None:
-            _validate_cache_url(cache_url)
-        if storage_backend is MessageStorageBackend.CACHE and cache_url is None:
+        if storage_backend is MessageStorageBackend.CACHE:
             _validate_named_cache_queue_size(queue_depth, message_max_length)
 
         object.__setattr__(self, "storage_backend", storage_backend)
@@ -106,7 +91,6 @@ class MessagesSettings(BaseSettings):
         object.__setattr__(self, "message_max_length", message_max_length)
         object.__setattr__(self, "message_ttl_seconds", message_ttl_seconds)
         object.__setattr__(self, "cache_name", cache_name)
-        object.__setattr__(self, "cache_url", cache_url)
         object.__setattr__(self, "cache_key_prefix", cache_key_prefix)
         object.__setattr__(
             self,
@@ -144,15 +128,6 @@ def _configuration_value[ValueT](
         return normalise(value)
     except ValueError as exc:
         raise ConfigurationError(f"wybra.messages.{setting_name}: {exc}") from exc
-
-
-def _validate_cache_url(value: str) -> None:
-    parsed = urlparse(value)
-    if parsed.scheme in {"memory", "redis", "rediss"}:
-        return
-    raise ConfigurationError(
-        "wybra.messages.cache_url must use memory://, redis://, or rediss://."
-    )
 
 
 def _validate_named_cache_queue_size(

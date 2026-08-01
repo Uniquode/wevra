@@ -7,7 +7,6 @@ from wybra.cache import to_cache_name
 from wybra.config import ConfigDef, ConfigField, ConfigGroup
 from wybra.config.transforms import (
     to_non_blank_string,
-    to_optional_non_blank_string,
     to_positive_float,
     to_positive_int,
 )
@@ -18,7 +17,6 @@ ENV_MESSAGES_QUEUE_DEPTH: Final = "MESSAGES_QUEUE_DEPTH"
 ENV_MESSAGES_MESSAGE_MAX_LENGTH: Final = "MESSAGES_MESSAGE_MAX_LENGTH"
 ENV_MESSAGES_TTL_SECONDS: Final = "MESSAGES_TTL_SECONDS"
 ENV_MESSAGES_CACHE_NAME: Final = "MESSAGES_CACHE_NAME"
-ENV_MESSAGES_CACHE_URL: Final = "MESSAGES_CACHE_URL"
 ENV_MESSAGES_CACHE_KEY_PREFIX: Final = "MESSAGES_CACHE_KEY_PREFIX"
 ENV_MESSAGES_DATABASE_CONNECTION: Final = "MESSAGES_DATABASE_CONNECTION"
 DEFAULT_QUEUE_DEPTH: Final = 20
@@ -92,12 +90,6 @@ module_config: Final = ConfigDef(
                     transform=to_optional_cache_name,
                 ),
                 ConfigField(
-                    name="cache_url",
-                    default=None,
-                    env=ENV_MESSAGES_CACHE_URL,
-                    transform=to_optional_non_blank_string,
-                ),
-                ConfigField(
                     name="cache_key_prefix",
                     default=DEFAULT_CACHE_KEY_PREFIX,
                     env=ENV_MESSAGES_CACHE_KEY_PREFIX,
@@ -123,7 +115,6 @@ __all__ = (
     "DEFAULT_QUEUE_DEPTH",
     "ENV_MESSAGES_CACHE_KEY_PREFIX",
     "ENV_MESSAGES_CACHE_NAME",
-    "ENV_MESSAGES_CACHE_URL",
     "ENV_MESSAGES_DATABASE_CONNECTION",
     "ENV_MESSAGES_MESSAGE_MAX_LENGTH",
     "ENV_MESSAGES_QUEUE_DEPTH",
@@ -135,7 +126,6 @@ __all__ = (
     "storage_backend_choices",
     "to_non_blank_string",
     "to_optional_cache_name",
-    "to_optional_non_blank_string",
     "to_positive_float",
     "to_positive_int",
     "to_storage_backend",
