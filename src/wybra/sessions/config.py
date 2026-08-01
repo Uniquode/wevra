@@ -23,7 +23,6 @@ ENV_SESSIONS_COOKIE_SECURE: Final = "SESSIONS_COOKIE_SECURE"
 ENV_SESSIONS_COOKIE_SAME_SITE: Final = "SESSIONS_COOKIE_SAME_SITE"
 ENV_SESSIONS_FILE_DIRECTORY: Final = "SESSIONS_FILE_DIRECTORY"
 ENV_SESSIONS_CACHE_NAME: Final = "SESSIONS_CACHE_NAME"
-ENV_SESSIONS_CACHE_URL: Final = "SESSIONS_CACHE_URL"
 ENV_SESSIONS_CACHE_KEY_PREFIX: Final = "SESSIONS_CACHE_KEY_PREFIX"
 ENV_SESSIONS_DATABASE_CONNECTION: Final = "SESSIONS_DATABASE_CONNECTION"
 ENV_SESSIONS_PAYLOAD_MAX_BYTES: Final = "SESSIONS_PAYLOAD_MAX_BYTES"
@@ -162,12 +161,6 @@ module_config: Final = ConfigDef(
                     transform=to_optional_cache_name,
                 ),
                 ConfigField(
-                    name="cache_url",
-                    default=None,
-                    env=ENV_SESSIONS_CACHE_URL,
-                    transform=to_optional_non_blank_string,
-                ),
-                ConfigField(
                     name="cache_key_prefix",
                     default=DEFAULT_SESSION_CACHE_KEY_PREFIX,
                     env=ENV_SESSIONS_CACHE_KEY_PREFIX,
@@ -209,7 +202,6 @@ __all__ = (
     "DEFAULT_SESSION_PAYLOAD_MAX_BYTES",
     "ENV_SESSIONS_CACHE_KEY_PREFIX",
     "ENV_SESSIONS_CACHE_NAME",
-    "ENV_SESSIONS_CACHE_URL",
     "ENV_SESSIONS_COOKIE_DOMAIN",
     "ENV_SESSIONS_COOKIE_NAME",
     "ENV_SESSIONS_COOKIE_PATH",

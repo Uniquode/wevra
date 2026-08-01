@@ -6,7 +6,6 @@ from importlib import import_module
 from typing import Any
 
 _EXPORT_MODULES = {
-    "CacheSessionStorage": "wybra.sessions.storage",
     "SessionCleanupRegistry": "wybra.sessions.cleanup",
     "CookieSessionStorage": "wybra.sessions.storage",
     "DatabaseSessionStorage": "wybra.sessions.storage",

@@ -159,7 +159,7 @@ full URL is already a complete connection. If a configured secret source or
 key cannot be resolved, startup fails before serving requests and never falls
 back to a raw URL.
 
-A raw credential-bearing URL remains accepted only for backwards compatibility:
+A raw credential-bearing URL is accepted only as a last resort:
 
 ```toml
 [cache]
@@ -221,8 +221,7 @@ cache_name = "session"
 
 Session startup fails before serving requests when `wybra.cache` is absent or
 the selected name is not configured. Session diagnostics report only the cache
-name or legacy compatibility mode, never provider URLs or credentials. See
-[`SESSION.md`](SESSION.md) for legacy `cache_url` migration guidance.
+name, never provider URLs or credentials.
 
 Cache-backed queued messages require `AtomicCacheCapability`. Select an
 isolated cache with `wybra.messages.cache_name`, or omit the setting to use
@@ -246,9 +245,7 @@ cache_name = "messages"
 ```
 
 Messages startup fails when the cache module, selected name, or required atomic
-feature is unavailable. Both memory and Redis supply the feature. See
-[`MESSAGES.md`](MESSAGES.md) for legacy `cache_url` migration guidance and the
-queued-alert key change.
+feature is unavailable. Both memory and Redis supply the feature.
 
 Every cache operation requires an owner and a logical key. Owners must be
 non-blank and cannot contain `:`; the owner prefixes the backend key and keeps
@@ -508,18 +505,6 @@ if lease is not None:
 
 An expired lease can be acquired by another holder with a newer fencing token.
 Renewing or releasing a stale token raises `CacheConflictError`.
-
-### Redis namespace migration
-
-Named Redis caches now prefix every baseline and advanced key with their
-resolved namespace. Existing values written by the earlier unnamespaced named
-Redis provider are not read or migrated automatically. Treat those entries as
-disposable cache state, expire old session keys according to policy, and plan
-for pending legacy queued messages to be cleared or drained before switching.
-
-Changing a configured namespace has the same effect as selecting a fresh cache
-partition. Keep it stable after deployment unless intentional invalidation is
-required.
 
 ### Work queue API
 

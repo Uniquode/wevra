@@ -96,30 +96,6 @@ The memory backend is process-local: sessions are not shared between workers or
 application instances and are lost on restart. Use it for local development,
 tests, or a deliberately single-process deployment.
 
-### Legacy Cache URL Migration
-
-The previous module-owned URL remains available for one compatibility window:
-
-```toml
-[wybra.sessions]
-storage_backend = "cache"
-cache_url = "redis://localhost:6379/0"
-```
-
-This path emits a `DeprecationWarning` and logs an operator-visible warning at
-startup. Do not configure `cache_name` and `cache_url` together; Wybra rejects
-that combination as ambiguous. Migrate the URL into `[cache]` or
-`[cache.<name>]`, include `wybra.cache`, and select the named instance from
-`[wybra.sessions]`.
-
-`cache_name` and `cache_url` are ignored, with a startup warning, when
-`storage_backend` selects a non-cache backend.
-
-Named caches use provider-neutral owner and key namespacing. Moving from the
-legacy URL path may therefore invalidate existing sessions even when the new
-cache points to the same provider partition. Plan the migration as a session
-rotation unless the physical key layout has been verified.
-
 Use `file` only when a single host or shared filesystem is appropriate:
 
 ```toml

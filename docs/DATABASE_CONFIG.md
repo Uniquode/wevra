@@ -19,9 +19,7 @@ Wybra resolves the effective database connection in this order:
 3. `[app.database]`.
 4. `[app].database_url`.
 
-If `[app.database]` and `[app].database_url` are both configured,
-`[app.database]` is used. Wybra logs an info-level message telling you that
-`[app].database_url` is overridden and should be removed.
+`[app.database]` and `[app].database_url` are mutually exclusive.
 
 `AUTH_DATABASE_URL` is not supported. Authentication uses the same application
 database configuration as the rest of the app.

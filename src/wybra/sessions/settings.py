@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self, cast
-from urllib.parse import urlparse
 
 from wybra.cache import DEFAULT_CACHE_NAME
 from wybra.config import BaseSettings, ConfigDef, ConfigService
@@ -46,7 +45,6 @@ class SessionsSettings(BaseSettings):
     cookie_same_site: str = "lax"
     file_directory: Path | str | None = None
     cache_name: str | None = None
-    cache_url: str | None = None
     cache_key_prefix: str = "wybra:sessions:"
     database_connection_name: str = "default"
     payload_max_bytes: int | str = 65_536
@@ -148,11 +146,6 @@ class SessionsSettings(BaseSettings):
             self.cache_name,
             "cache_name",
         )
-        cache_url = _configuration_value(
-            to_optional_non_blank_string,
-            self.cache_url,
-            "cache_url",
-        )
         cache_key_prefix = _configuration_value(
             to_non_blank_string,
             self.cache_key_prefix,
@@ -174,15 +167,6 @@ class SessionsSettings(BaseSettings):
             "cookie_payload_max_bytes",
         )
 
-        if cache_name is not None and cache_url is not None:
-            raise ConfigurationError(
-                "wybra.sessions.cache_name and wybra.sessions.cache_url "
-                "cannot both be configured."
-            )
-        if storage_backend is SessionStorageBackend.CACHE:
-            if cache_url is not None:
-                _validate_cache_url(cache_url)
-
         object.__setattr__(self, "deployment_environment", deployment_environment)
         object.__setattr__(self, "storage_backend", storage_backend)
         object.__setattr__(self, "lifetime_seconds", lifetime_seconds)
@@ -194,7 +178,6 @@ class SessionsSettings(BaseSettings):
         object.__setattr__(self, "project_root", project_root)
         object.__setattr__(self, "file_directory", file_directory.resolve())
         object.__setattr__(self, "cache_name", cache_name)
-        object.__setattr__(self, "cache_url", cache_url)
         object.__setattr__(self, "cache_key_prefix", cache_key_prefix)
         object.__setattr__(self, "database_connection_name", database_connection_name)
         object.__setattr__(self, "payload_max_bytes", payload_max_bytes)
@@ -250,15 +233,6 @@ def _project_root(value: object) -> Path:
     if isinstance(value, str) and value.strip():
         return Path(value).resolve()
     raise ConfigurationError("wybra.sessions project_root must be a path.")
-
-
-def _validate_cache_url(value: str) -> None:
-    parsed = urlparse(value)
-    if parsed.scheme in {"memory", "redis", "rediss"}:
-        return
-    raise ConfigurationError(
-        "wybra.sessions.cache_url must use memory://, redis://, or rediss://."
-    )
 
 
 __all__ = ("SessionsSettings",)

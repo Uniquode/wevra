@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import isfinite
 from typing import ClassVar
 
+from wybra.cache import to_cache_name
 from wybra.config import BaseSettings, ConfigDef, to_bool
 from wybra.core.exceptions import ConfigurationError
 from wybra.tasks.config import (
     DEFAULT_TASK_BACKEND,
+    DEFAULT_TASK_CACHE_NAME,
     DEFAULT_TASK_QUEUE,
     DEFAULT_TASK_STATUS_RETENTION_SECONDS,
     DEFAULT_TASK_WORKER_CONCURRENCY,
@@ -25,6 +27,7 @@ class TasksSettings(BaseSettings):
 
     enabled: bool = True
     backend: str = DEFAULT_TASK_BACKEND
+    cache_name: str = DEFAULT_TASK_CACHE_NAME
     default_queue: str = DEFAULT_TASK_QUEUE
     max_attempts: int = 1
     initial_delay_seconds: float = 0.0
@@ -35,12 +38,17 @@ class TasksSettings(BaseSettings):
     worker_id: str | None = None
     worker_concurrency: int = DEFAULT_TASK_WORKER_CONCURRENCY
     scheduler_owner: str | None = None
-    broker_url: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         try:
             enabled = to_bool(self.enabled)
             backend = to_task_backend(self.backend)
+            if backend == "taskiq":
+                cache_name = _validated_taskiq_cache_name(self.cache_name)
+            else:
+                if not isinstance(self.cache_name, str):
+                    raise ValueError("cache_name must be a string.")
+                cache_name = self.cache_name
             if (
                 not isinstance(self.default_queue, str)
                 or not self.default_queue.strip()
@@ -74,11 +82,13 @@ class TasksSettings(BaseSettings):
                 self.scheduler_owner,
                 "scheduler_owner",
             )
-            broker_url = _optional_string(self.broker_url, "broker_url")
+        except ConfigurationError:
+            raise
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"tasks: {exc}") from exc
         object.__setattr__(self, "enabled", enabled)
         object.__setattr__(self, "backend", backend)
+        object.__setattr__(self, "cache_name", cache_name)
         object.__setattr__(self, "default_queue", default_queue)
         object.__setattr__(self, "max_attempts", retry.max_attempts)
         object.__setattr__(
@@ -108,11 +118,6 @@ class TasksSettings(BaseSettings):
             "scheduler_owner",
             scheduler_owner,
         )
-        object.__setattr__(
-            self,
-            "broker_url",
-            broker_url,
-        )
 
     @property
     def retry_policy(self) -> RetryPolicy:
@@ -131,6 +136,16 @@ def _optional_string(value: object, field_name: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-blank string when configured.")
     return value.strip()
+
+
+def _validated_taskiq_cache_name(value: object) -> str:
+    try:
+        cache_name = to_cache_name(value)
+    except TypeError, ValueError:
+        pass
+    else:
+        return cache_name
+    raise ConfigurationError("tasks.cache_name must be a valid cache name.")
 
 
 __all__ = ("TasksSettings",)

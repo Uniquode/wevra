@@ -188,21 +188,6 @@ def test_csrf_protector_rejects_invalid_previous_secret_entries() -> None:
         CsrfProtector("current-secret", previous_secrets=("   ",))
 
 
-def test_csrf_legacy_token_compatibility_is_current_secret_only() -> None:
-    nonce = "a" * 32
-    current = CsrfProtector("current-secret")
-    previous = CsrfProtector("previous-secret")
-    validator = CsrfProtector(
-        "current-secret",
-        previous_secrets=("previous-secret",),
-    )
-    current_legacy_token = f"{nonce}.{current._signature(nonce)}"
-    previous_legacy_token = f"{nonce}.{previous._signature(nonce)}"
-
-    assert validator.validate_token(current_legacy_token, nonce) is True
-    assert validator.validate_token(previous_legacy_token, nonce) is False
-
-
 def test_plan_csrf_token_secret_rotation_prepends_retired_current_secret() -> None:
     plan = plan_csrf_token_secret_rotation(
         current="current-csrf-secret",

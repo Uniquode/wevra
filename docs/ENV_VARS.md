@@ -102,7 +102,6 @@ Configured secret-source keys may also point at environment variables:
 | `SESSIONS_COOKIE_SAME_SITE` | Overrides request-session cookie SameSite policy. |
 | `SESSIONS_FILE_DIRECTORY` | Overrides the file-session storage directory. |
 | `SESSIONS_CACHE_NAME` | Overrides the named Wybra cache selected for cache-backed sessions. |
-| `SESSIONS_CACHE_URL` | Deprecated compatibility override for the module-owned cache/Redis URL. |
 | `SESSIONS_CACHE_KEY_PREFIX` | Overrides the cache key prefix for cache-backed sessions. |
 | `SESSIONS_DATABASE_CONNECTION` | Overrides the database connection name for database-backed sessions. |
 | `SESSIONS_PAYLOAD_MAX_BYTES` | Overrides the maximum server-side session payload size. |
@@ -117,7 +116,6 @@ Configured secret-source keys may also point at environment variables:
 | `MESSAGES_MESSAGE_MAX_LENGTH` | Overrides the maximum length of an individual message. |
 | `MESSAGES_TTL_SECONDS` | Overrides queued message time-to-live in seconds. |
 | `MESSAGES_CACHE_NAME` | Selects the named Wybra cache for cache-backed messages; defaults to `default`. |
-| `MESSAGES_CACHE_URL` | Deprecated direct cache/Redis URL for cache-backed messages. |
 | `MESSAGES_CACHE_KEY_PREFIX` | Overrides the cache key prefix for cache-backed messages. |
 | `MESSAGES_DATABASE_CONNECTION` | Overrides the database connection name for database-backed messages. |
 

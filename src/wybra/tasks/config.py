@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from typing import Final
 
+from wybra.cache import DEFAULT_CACHE_NAME
 from wybra.config import ConfigDef, ConfigField, ConfigGroup, to_bool
 from wybra.config.transforms import (
     to_non_blank_string,
@@ -14,6 +15,7 @@ from wybra.config.transforms import (
 
 TASKS_CONFIG_SECTION: Final = "tasks"
 DEFAULT_TASK_BACKEND: Final = "immediate"
+DEFAULT_TASK_CACHE_NAME: Final = DEFAULT_CACHE_NAME
 DEFAULT_TASK_QUEUE: Final = "default"
 DEFAULT_TASK_STATUS_RETENTION_SECONDS: Final = 3600.0
 DEFAULT_TASK_WORKER_CONCURRENCY: Final = 1
@@ -21,8 +23,8 @@ DEFAULT_TASK_WORKER_CONCURRENCY: Final = 1
 
 def to_task_backend(value: object) -> str:
     backend = to_non_blank_string(value).lower()
-    if backend != "immediate":
-        raise ValueError("tasks backend must be 'immediate'.")
+    if backend not in {"immediate", "taskiq"}:
+        raise ValueError("tasks backend must be 'immediate' or 'taskiq'.")
     return backend
 
 
@@ -38,6 +40,12 @@ def to_non_negative_float(value: object) -> float:
     return parsed
 
 
+def _to_task_cache_reference(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("must be a string.")
+    return value
+
+
 module_config: Final = ConfigDef(
     {
         TASKS_CONFIG_SECTION: ConfigGroup(
@@ -51,6 +59,11 @@ module_config: Final = ConfigDef(
                     name="backend",
                     default=DEFAULT_TASK_BACKEND,
                     transform=to_task_backend,
+                ),
+                ConfigField(
+                    name="cache_name",
+                    default=DEFAULT_TASK_CACHE_NAME,
+                    transform=_to_task_cache_reference,
                 ),
                 ConfigField(
                     name="default_queue",
@@ -102,11 +115,6 @@ module_config: Final = ConfigDef(
                     default=None,
                     transform=to_optional_non_blank_string,
                 ),
-                ConfigField(
-                    name="broker_url",
-                    default=None,
-                    transform=to_optional_non_blank_string,
-                ),
             )
         )
     }
@@ -115,6 +123,7 @@ module_config: Final = ConfigDef(
 
 __all__ = (
     "DEFAULT_TASK_BACKEND",
+    "DEFAULT_TASK_CACHE_NAME",
     "DEFAULT_TASK_QUEUE",
     "DEFAULT_TASK_STATUS_RETENTION_SECONDS",
     "DEFAULT_TASK_WORKER_CONCURRENCY",
