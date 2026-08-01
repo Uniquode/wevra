@@ -19,7 +19,7 @@ dependencies = [
     "dateparser>=1.4.1",
     "email-validator>=2.3.0",
     "envex>=5.0.0",
-    "fastapi>=0.140.8",
+    "fastapi>=0.140.13",
     "inflect>=7.5.0",
     "jinja2>=3.1.6",
     "phonenumbers>=9.0.35",
@@ -38,10 +38,10 @@ dependencies = [
 
 [project.optional-dependencies]
 aws = [
-    "boto3>=1.43.57",
+    "boto3>=1.43.58",
 ]
 kms = [
-    "boto3>=1.43.57",
+    "boto3>=1.43.58",
 ]
 keychain = [
     "keyring>=25.7.0",
@@ -94,7 +94,7 @@ wybra-secret = "wybra.secrets.cli:main"
 wybra-validate = "wybra.tools.validate:main"
 
 [build-system]
-requires = ["uv_build>=0.11.33,<0.12.0"]
+requires = ["uv_build>=0.12.0,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -112,9 +112,9 @@ dev = [
     "pytest>=9.1.1",
     "redis>=8.0.1",
     "ruff>=0.16.0",
+    "taskiq>=0.12.4,<0.13.0",
     "testcontainers[mssql,mysql]>=4.15.0",
     "ty>=0.0.64",
-    "taskiq>=0.12.4,<0.13.0",
 ]
 
 [tool.ruff]
