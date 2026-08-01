@@ -375,6 +375,9 @@ async def test_taskiq_result_backend_preserves_taskiq_result_metadata() -> None:
     await backend.set_result("task-123", result)
 
     assert await backend.get_result("task-123", with_logs=True) == result
+    assert await backend.get_result("task-123") == result.model_copy(
+        update={"log": None}
+    )
 
 
 @pytest.mark.anyio
@@ -415,7 +418,10 @@ async def test_taskiq_result_backend_rejects_oversized_result_without_storing() 
     backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
     result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
 
-    with pytest.raises(ValueError, match="byte limit"):
+    with pytest.raises(
+        ValueError,
+        match=r"task_id='task-123', payload_bytes=4, max_bytes=3",
+    ):
         await backend.set_result("task-123", result)
 
     assert await backend.is_result_ready("task-123") is False
@@ -431,7 +437,7 @@ async def test_taskiq_result_backend_rejects_non_byte_encoder_output() -> None:
     backend = CacheTaskiqResultBackend(InMemoryCache(), policy)
     result = TaskiqResult(is_err=False, return_value="complete", execution_time=0.25)
 
-    with pytest.raises(TypeError, match="must return bytes"):
+    with pytest.raises(TypeError, match=r"got bytearray for task_id='task-123'"):
         await backend.set_result("task-123", result)
 
     assert await backend.is_result_ready("task-123") is False

@@ -136,6 +136,10 @@ Readiness uses the baseline cache read operation, so each wait poll reads the
 stored result envelope. Configure the result byte limit and future worker poll
 interval together to control result-wait cache traffic.
 
+`get_result(..., with_logs=False)` omits the result's worker log. Request logs
+explicitly with `with_logs=True`; this controls the returned result, not the
+cache read, because Taskiq stores the log in its result envelope.
+
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
 remain available for `status_retention_seconds`; each task's visible lifecycle

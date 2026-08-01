@@ -69,9 +69,17 @@ class CacheTaskiqResultBackend(AsyncResultBackend[Any]):
     async def set_result(self, task_id: str, result: TaskiqResult[Any]) -> None:
         payload = self._policy.serialise(result)
         if not isinstance(payload, bytes):
-            raise TypeError("Taskiq result encoder must return bytes.")
-        if len(payload) > self._policy.maximum_serialised_bytes:
-            raise ValueError("Taskiq result exceeds the configured byte limit.")
+            raise TypeError(
+                "Taskiq result encoder must return bytes, "
+                f"got {type(payload).__name__} for task_id={task_id!r}."
+            )
+        payload_bytes = len(payload)
+        if payload_bytes > self._policy.maximum_serialised_bytes:
+            raise ValueError(
+                "Taskiq result exceeds the configured byte limit: "
+                f"task_id={task_id!r}, payload_bytes={payload_bytes}, "
+                f"max_bytes={self._policy.maximum_serialised_bytes}."
+            )
         await self._cache.set(
             _TASKIQ_RESULT_OWNER,
             task_id,
@@ -87,11 +95,13 @@ class CacheTaskiqResultBackend(AsyncResultBackend[Any]):
         task_id: str,
         with_logs: bool = False,
     ) -> TaskiqResult[Any]:
-        del with_logs
         payload = await self._cache.get(_TASKIQ_RESULT_OWNER, task_id)
         if payload is None:
             raise KeyError("Task result is unavailable.")
-        return self._policy.deserialise(payload)
+        result = self._policy.deserialise(payload)
+        if with_logs:
+            return result
+        return result.model_copy(update={"log": None})
 
 
 __all__ = ("CacheTaskiqResultBackend", "TaskiqResultPolicy")
