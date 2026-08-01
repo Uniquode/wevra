@@ -314,7 +314,8 @@ class CompositeForm(Form):
         unknown = set(self.instances) - set(valid)
         if unknown:
             raise ModelBindingError(
-                "Unknown composite instance member(s): " + ", ".join(sorted(unknown))
+                "Unknown composite instance member(s): "
+                + ", ".join(sorted(str(name) for name in unknown))
             )
         for name, instance in self.instances.items():
             if not isinstance(instance, valid[name]):

@@ -1771,7 +1771,7 @@ def _required_aws_managed_target(value: object) -> AwsManagedTarget:
     if isinstance(value, str):
         target = value.strip().lower()
         if target in {"rds", "aurora"}:
-            return cast(AwsManagedTarget, target)
+            return target
     raise ConfigurationError("AWS database managed target must be rds or aurora.")
 
 
