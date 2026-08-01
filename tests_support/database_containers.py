@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Final
 
 import pytest
+from testcontainers.community.mysql import MySqlContainer
+from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import ExecWaitStrategy
-from testcontainers.mysql import MySqlContainer
-from testcontainers.postgres import PostgresContainer
 
 from wybra.db.provisioning.mysql import quote_mysql_identifier
 from wybra.db.sql import ident, render_sql, trusted_sql
