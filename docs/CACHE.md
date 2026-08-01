@@ -392,8 +392,9 @@ Task handlers and other consumers must be idempotent: a worker can complete an
 external side effect before it loses its delivery receipt, so exactly-once
 execution is not promised. Startup probes Redis Streams consumer groups,
 claims, scripts, sorted sets, and settlement operations; a server that lacks
-that command surface cannot advertise the feature. Taskiq adapters and JetStream
-remain separate future work.
+that command surface cannot advertise the feature. The generic cache-backed
+Taskiq result adapter uses only the baseline byte-value cache; Taskiq broker and
+schedule adapters and the JetStream provider remain separate work.
 
 ### Redis pub/sub
 

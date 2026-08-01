@@ -116,6 +116,30 @@ cache-backed Taskiq broker is available yet. This protects applications from
 silently falling back to inline execution while durable task integration is
 incomplete.
 
+### Cache-backed Taskiq results
+
+`CacheTaskiqResultBackend` is the reusable Taskiq adapter for retaining result
+envelopes through a selected cache's baseline byte-value capability. It is not
+activated by `[tasks]` configuration yet; a future broker runtime will create
+and register it.
+
+The runtime supplies an immutable `TaskiqResultPolicy` with a positive result
+retention period, maximum serialised byte size, and encoder/decoder callables.
+When either codec is `None`, the policy uses Taskiq's standard JSON model codec.
+The encoder is responsible for producing a safe byte representation and runs
+before any cache write. Encoder, decoder, and cache-operation failures
+propagate to Taskiq; the adapter does not redact, wrap, or silently retain
+unsafe return values. This keeps the safe-result and redaction policy owned by
+the task runtime rather than by a particular cache provider.
+
+Readiness uses the baseline cache read operation, so each wait poll reads the
+stored result envelope. Configure the result byte limit and future worker poll
+interval together to control result-wait cache traffic.
+
+`get_result(..., with_logs=False)` omits the result's worker log. Request logs
+explicitly with `with_logs=True`; this controls the returned result, not the
+cache read, because Taskiq stores the log in its result envelope.
+
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
 remain available for `status_retention_seconds`; each task's visible lifecycle
@@ -550,7 +574,7 @@ does not create a timer or lifecycle record.
 - Immediate status and lifecycle are process-local.
 - Deferred and recurring schedules are not available.
 - Worker and scheduler commands are not available.
-- Persisted task return values and cancellation are not part of the initial
-  delivery.
+- Persisted task return values and cancellation are not yet available through
+  the configured task capability.
 - A complete transactional outbox is deferred; future after-commit publication
   will still document the remaining database-commit-to-broker gap.

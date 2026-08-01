@@ -52,6 +52,9 @@ _.wybra_test_client
 _._clear_wybra_test_database
 _._before_cursor_execute
 _._after_cursor_execute
+_.set_result
+_.is_result_ready
+_.get_result
 _.session
 _.transaction
 _.close
