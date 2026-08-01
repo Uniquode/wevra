@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from asyncio import CancelledError
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
@@ -19,6 +19,7 @@ from wybra.cache.feature_models import (
     CacheFeatureRegistration,
     CacheFeatureUnavailableError,
 )
+from wybra.cache.lifecycle import close_all
 from wybra.cache.memory_features import InMemoryCacheFeatures
 from wybra.cache.redis_features import RedisCacheFeatures
 from wybra.cache.redis_runtime import RedisCacheRuntime
@@ -153,6 +154,11 @@ class DefaultCachesCapability:
     _instances: Mapping[str, CacheInstance]
     _closers: tuple[CacheBackendCloser, ...] = field(repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
 
     def require(
         self,
@@ -195,12 +201,31 @@ class DefaultCachesCapability:
         )
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        errors = await _close_all(self._closers)
-        if errors:
-            raise BaseExceptionGroup("Named cache shutdown failed.", errors)
+        async with self._close_lock:
+            if self._closed:
+                return
+            closers = tuple(enumerate(self._closers))
+            completed: set[int] = set()
+
+            async def tracked_close(
+                index: int,
+                close: CacheBackendCloser,
+            ) -> None:
+                await close()
+                completed.add(index)
+
+            try:
+                errors = await close_all(
+                    (lambda index=index, close=close: tracked_close(index, close))
+                    for index, close in reversed(closers)
+                )
+            finally:
+                self._closers = tuple(
+                    close for index, close in closers if index not in completed
+                )
+                self._closed = not self._closers
+            if errors:
+                raise BaseExceptionGroup("Named cache shutdown failed.", errors)
 
 
 async def build_caches(
@@ -270,7 +295,7 @@ async def build_caches(
                 _feature_implementations=feature_implementations,
             )
     except BaseException as startup_error:
-        cleanup_errors = await _close_all(tuple(closers))
+        cleanup_errors = await close_all(reversed(closers))
         if cleanup_errors:
             raise BaseExceptionGroup(
                 "Named cache startup and cleanup failed.",
@@ -382,12 +407,19 @@ async def _redis_backend(
             ) from startup_error
         raise
     cache = RedisCache.from_runtime(runtime)
+    close_lock = asyncio.Lock()
+    features_closed = False
+    runtime_closed = False
 
     async def close() -> None:
-        try:
-            await features.close()
-        finally:
-            await runtime.close()
+        nonlocal features_closed, runtime_closed
+        async with close_lock:
+            if not features_closed:
+                await features.close()
+                features_closed = True
+            if not runtime_closed:
+                await runtime.close()
+                runtime_closed = True
 
     return CacheBackend(
         cache,
@@ -413,28 +445,6 @@ def _register_backend_closer(
         return
     lifecycle_owners.append(lifecycle_owner)
     closers.append(backend.close)
-
-
-async def _close_all(
-    closers: tuple[CacheBackendCloser, ...],
-) -> list[BaseException]:
-    errors: list[BaseException] = []
-    cancellation: CancelledError | None = None
-    for close in reversed(closers):
-        try:
-            await close()
-        except CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-        except BaseException as exc:
-            errors.append(exc)
-    if cancellation is not None:
-        if errors:
-            cancellation.add_note(
-                f"{len(errors)} cache backend error(s) also occurred during shutdown."
-            )
-        raise cancellation
-    return errors
 
 
 _DEFAULT_FACTORIES: Mapping[str, CacheBackendFactory] = {

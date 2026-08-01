@@ -33,8 +33,8 @@ Repository: <https://github.com/Uniquode/wybra>
   context construction, and template validation.
 - `wybra.cache`: optional named cache registry with a common byte-store
   baseline, typed advanced memory features, and Redis-backed baseline, atomic,
-  counter, lease, fencing, durable work-queue, durable stream, and revisioned
-  schedule support, including Jinja template-fragment caching.
+  counter, lease, fencing, durable work-queue, durable stream, live pub/sub,
+  and revisioned schedule support, including Jinja template-fragment caching.
 - `wybra.forms`: form settings, CSRF protection, request form parsing, form
   safety helpers, form response finalisation, and forms validation.
 - `wybra.security`: web-facing security policy, COOP/security headers, CORS

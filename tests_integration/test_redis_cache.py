@@ -16,6 +16,7 @@ from testcontainers.core.wait_strategies import ExecWaitStrategy
 from tests.cache_feature_conformance import (
     assert_atomic_conformance,
     assert_lease_conformance,
+    assert_pubsub_conformance,
     assert_schedule_conformance,
     assert_stream_conformance,
     assert_work_queue_conformance,
@@ -30,6 +31,7 @@ from wybra.cache import (
     CacheSettings,
     CachesSettings,
     LeaseCacheCapability,
+    PubSubCacheCapability,
     RedisCache,
     ScheduleCacheCapability,
     StreamCacheCapability,
@@ -170,6 +172,7 @@ async def test_redis_advanced_features_pass_shared_conformance(
         assert instance.features == (
             "atomic",
             "lease",
+            "pub-sub",
             "schedule",
             "stream",
             "work-queue",
@@ -184,6 +187,10 @@ async def test_redis_advanced_features_pass_shared_conformance(
             owner="redis-lease",
             lease_ttl=0.5,
             renewed_ttl=1.0,
+        )
+        await assert_pubsub_conformance(
+            instance.require(PubSubCacheCapability),
+            owner="redis-pubsub",
         )
         await assert_schedule_conformance(
             instance.require(ScheduleCacheCapability),
@@ -209,6 +216,93 @@ async def test_redis_advanced_features_pass_shared_conformance(
             retention_count=DEFAULT_STREAM_RETENTION_COUNT,
             owner="redis-stream",
         )
+    finally:
+        await caches.close()
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_delivers_across_registries_and_isolates_namespaces(
+    redis_url: str,
+) -> None:
+    namespace = f"pubsub_{uuid4().hex}"
+    first = await build_caches(redis_settings(redis_url, namespace))
+    second = await build_caches(redis_settings(redis_url, namespace))
+    isolated = await build_caches(redis_settings(redis_url, f"{namespace}_other"))
+    publisher = first.require("default").require(PubSubCacheCapability)
+    subscriber = second.require("default").require(PubSubCacheCapability)
+    other = isolated.require("default").require(PubSubCacheCapability)
+    subscription = await subscriber.subscribe("events", "updates")
+    other_owner = await subscriber.subscribe("other-events", "updates")
+    other_topic = await subscriber.subscribe("events", "other-updates")
+    isolated_subscription = await other.subscribe("events", "updates")
+    try:
+        assert await publisher.publish("events", "updates", b"shared") == 1
+        assert await subscription.receive(timeout=1) == b"shared"
+        for unrelated in (other_owner, other_topic, isolated_subscription):
+            with pytest.raises(TimeoutError):
+                await unrelated.receive(timeout=0.1)
+    finally:
+        await subscription.close()
+        await other_owner.close()
+        await other_topic.close()
+        await isolated_subscription.close()
+        await first.close()
+        await second.close()
+        await isolated.close()
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_registry_close_wakes_receive_and_iteration(
+    redis_url: str,
+) -> None:
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"pubsub_close_{uuid4().hex}",
+            features=("pub-sub",),
+        )
+    )
+    pubsub = caches.require("default").require(PubSubCacheCapability)
+    receiving = await pubsub.subscribe("events", "receive")
+    iterating = await pubsub.subscribe("events", "iterate")
+    receive_task = asyncio.create_task(receiving.receive())
+    iteration_task = asyncio.create_task(anext(iterating))
+    await asyncio.sleep(0)
+
+    await caches.close()
+
+    with pytest.raises(CacheFeatureError, match="subscription is closed"):
+        await receive_task
+    with pytest.raises(StopAsyncIteration):
+        await iteration_task
+
+
+@pytest.mark.anyio
+async def test_redis_pubsub_reports_a_safe_error_after_outage(
+    isolated_redis_container: tuple[str, DockerContainer],
+) -> None:
+    redis_url, container = isolated_redis_container
+    caches = await build_caches(
+        redis_settings(
+            redis_url,
+            f"pubsub_outage_{uuid4().hex}",
+            features=("pub-sub",),
+        )
+    )
+    pubsub = caches.require("default").require(PubSubCacheCapability)
+    subscription = await pubsub.subscribe("integration", "outage")
+    try:
+        container.get_wrapped_container().stop()
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await subscription.receive(timeout=1)
+        with pytest.raises(
+            CacheFeatureError,
+            match="Redis cache feature operation failed",
+        ):
+            await pubsub.publish("integration", "outage", b"payload")
     finally:
         await caches.close()
 

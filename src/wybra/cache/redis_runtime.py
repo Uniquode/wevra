@@ -39,7 +39,10 @@ ResultT = TypeVar("ResultT")
 logger = logging.getLogger(__name__)
 MAX_REDIS_TTL_MILLISECONDS = 2**62
 
-_ADVANCED_FEATURES = frozenset({"atomic", "lease", "schedule", "stream", "work-queue"})
+_ADVANCED_FEATURES = frozenset(
+    {"atomic", "lease", "pub-sub", "schedule", "stream", "work-queue"}
+)
+_DURABLE_FEATURES = frozenset({"atomic", "lease", "schedule", "stream", "work-queue"})
 _ATOMIC_READINESS_SCRIPT = """
 if redis.call('exists', KEYS[1]) ~= 0 then
     return {0}
@@ -148,7 +151,8 @@ class RedisCacheRuntime:
         suffix = uuid4().hex
         try:
             client = self.client()
-            await self._validate_advanced_configuration(client)
+            if features & _DURABLE_FEATURES:
+                await self._validate_advanced_configuration(client)
             if "atomic" in features:
                 result = await client.eval(
                     _ATOMIC_READINESS_SCRIPT,
@@ -173,6 +177,39 @@ class RedisCacheRuntime:
                     1_000,
                 )
                 _validate_readiness_result(result)
+            if "pub-sub" in features:
+                channel = self.key("readiness", "pub-sub", suffix)
+                subscription = await self.open_pubsub()
+                try:
+                    await self.subscribe_pubsub(subscription, channel)
+                    await client.publish(channel, b"readiness")
+                    message = await self.subscription_call(
+                        lambda: subscription.get_message(
+                            ignore_subscribe_messages=True,
+                            timeout=1,
+                        )
+                    )
+                    _validate_pubsub_readiness_result(message, channel)
+                except asyncio.CancelledError as cancellation:
+                    try:
+                        await self.subscription_call(subscription.aclose)
+                    except BaseException as cleanup_error:
+                        cancellation.add_note(
+                            "Redis pub/sub readiness cleanup after cancellation "
+                            f"failed ({type(cleanup_error).__name__})."
+                        )
+                    raise
+                except BaseException as readiness_error:
+                    try:
+                        await self.subscription_call(subscription.aclose)
+                    except BaseException as cleanup_error:
+                        raise BaseExceptionGroup(
+                            "Redis pub/sub readiness and cleanup failed.",
+                            [readiness_error, cleanup_error],
+                        ) from readiness_error
+                    raise
+                else:
+                    await self.subscription_call(subscription.aclose)
             if "work-queue" in features:
                 queue_key = self.key("readiness", "cache", f"queue-{suffix}")
                 delayed_key = self.key("readiness", "cache", f"queue-delay-{suffix}")
@@ -492,6 +529,38 @@ class RedisCacheRuntime:
             _log_failure("feature operation", exc)
             raise CacheFeatureError("Redis cache feature operation failed.") from None
 
+    async def open_pubsub(self) -> Any:
+        async def create_subscription(client: Any) -> Any:
+            return client.pubsub()
+
+        return await self.feature_call(create_subscription)
+
+    async def subscribe_pubsub(self, subscription: Any, channel: str) -> None:
+        await self.subscription_call(lambda: subscription.subscribe(channel))
+        result = await self.subscription_call(
+            lambda: subscription.get_message(
+                ignore_subscribe_messages=False,
+                timeout=1,
+            )
+        )
+        _validate_pubsub_subscription_result(result, channel)
+
+    async def subscription_call(
+        self,
+        operation: Callable[[], Awaitable[ResultT]],
+    ) -> ResultT:
+        try:
+            return await operation()
+        except asyncio.CancelledError:
+            raise
+        except ConfigurationError:
+            raise
+        except CacheFeatureError:
+            raise
+        except Exception as exc:
+            _log_failure("pub/sub operation", exc)
+            raise CacheFeatureError("Redis cache feature operation failed.") from None
+
     def baseline_key(self, owner: str, key: str) -> str:
         owner = validate_resource(owner, label="cache owner").strip()
         if ":" in owner:
@@ -614,6 +683,36 @@ def _validate_stream_result(result: object) -> None:
     raise ConfigurationError(
         "Redis cache backend cannot provide the configured advanced features."
     )
+
+
+def _validate_pubsub_readiness_result(result: object, channel: str) -> None:
+    if not isinstance(result, dict):
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+    message_type = result.get("type")
+    received_channel = result.get("channel")
+    payload = result.get("data")
+    if (
+        message_type not in ("message", b"message")
+        or received_channel not in (channel, channel.encode())
+        or payload != b"readiness"
+    ):
+        raise ConfigurationError(
+            "Redis cache backend cannot provide the configured advanced features."
+        )
+
+
+def _validate_pubsub_subscription_result(result: object, channel: str) -> None:
+    if not isinstance(result, dict):
+        raise CacheFeatureError("Redis pub/sub subscription returned invalid state.")
+    message_type = result.get("type")
+    received_channel = result.get("channel")
+    if message_type not in ("subscribe", b"subscribe") or received_channel not in (
+        channel,
+        channel.encode(),
+    ):
+        raise CacheFeatureError("Redis pub/sub subscription returned invalid state.")
 
 
 def _validate_stream_readiness_result(result: object) -> None:
