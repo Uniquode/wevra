@@ -6,11 +6,13 @@ from uuid import uuid4
 
 from wybra.cache.feature_models import (
     DEFAULT_SCHEDULE_MAX_RECORDS,
+    MAX_CACHE_FEATURE_LIMIT,
     CacheConflictError,
     CacheFeatureError,
     CacheRevision,
     FencingToken,
     ScheduleClaim,
+    ScheduleCursor,
     ScheduleRecord,
     validate_finite,
     validate_limit,
@@ -21,11 +23,20 @@ from wybra.cache.feature_models import (
     validate_schedule_values,
 )
 from wybra.cache.redis_runtime import RedisCacheRuntime
+from wybra.cache.redis_schedule_ordering import (
+    due_boundary_member,
+    due_member,
+    encode_due_order,
+)
 from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_ADVANCE_SCRIPT,
     SCHEDULE_CLAIM_SCRIPT,
     SCHEDULE_COMPLETE_SCRIPT,
     SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DELETE_SCRIPT,
+    SCHEDULE_DISCARD_SCRIPT,
     SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_HELD_SCRIPT,
     SCHEDULE_RELEASE_SCRIPT,
     SCHEDULE_UPDATE_SCRIPT,
 )
@@ -35,6 +46,7 @@ from wybra.cache.redis_schedule_scripts import (
 class _ScheduleKeys:
     record: str
     due: str
+    due_lex: str
     claim: str
     claims: str
     index: str
@@ -52,6 +64,15 @@ class RedisScheduleCache:
 
     def __post_init__(self) -> None:
         validate_positive_integer(self.max_records, label="maximum schedule records")
+        if self.max_records > MAX_CACHE_FEATURE_LIMIT:
+            raise ValueError(
+                f"Maximum schedule records cannot exceed {MAX_CACHE_FEATURE_LIMIT}."
+            )
+
+    @property
+    def maximum_records(self) -> int:
+        """Return the bounded capacity required by the schedule feature."""
+        return self.max_records
 
     async def create(
         self,
@@ -72,17 +93,19 @@ class RedisScheduleCache:
         async def create_record(client: Any) -> object:
             return await client.eval(
                 SCHEDULE_CREATE_SCRIPT,
-                5,
+                6,
                 keys.record,
                 keys.due,
                 keys.revision,
                 keys.index,
                 keys.count,
+                keys.due_lex,
                 identity,
                 next_due_at,
                 payload,
                 _interval_value(interval_seconds),
                 self.max_records,
+                due_member(next_due_at, identity),
             )
 
         result = _script_result(await self.runtime.feature_call(create_record))
@@ -122,16 +145,18 @@ class RedisScheduleCache:
         async def update_record(client: Any) -> object:
             return await client.eval(
                 SCHEDULE_UPDATE_SCRIPT,
-                4,
+                5,
                 keys.record,
                 keys.claim,
                 keys.due,
                 keys.revision,
+                keys.due_lex,
                 expected.value,
                 next_due_at,
                 payload,
                 _interval_value(interval_seconds),
                 identity,
+                due_member(next_due_at, identity),
             )
 
         result = _script_result(await self.runtime.feature_call(update_record))
@@ -152,27 +177,55 @@ class RedisScheduleCache:
         *,
         before: float,
         limit: int = 100,
+        after: ScheduleCursor | None = None,
     ) -> tuple[ScheduleRecord, ...]:
         owner = validate_resource(owner, label="cache owner")
         before = validate_finite(before, label="schedule due boundary")
         limit = validate_limit(limit)
+        if after is not None and not isinstance(after, ScheduleCursor):
+            raise TypeError("Schedule due cursor must be a ScheduleCursor.")
         due_key = self.runtime.key("schedule-due", owner, "records")
 
         async def due_records(client: Any) -> object:
             return await client.eval(
                 SCHEDULE_DUE_SCRIPT,
-                3,
+                4,
                 due_key,
                 self.runtime.key("schedule-claims", owner, "records"),
                 self.runtime.key("schedule-index", owner, "records"),
+                self.runtime.key("schedule-due-lex", owner, "records"),
                 before,
                 limit,
+                due_boundary_member(before),
+                "" if after is None else due_member(after.next_due_at, after.identity),
             )
 
         result = await self.runtime.feature_call(due_records)
         if not isinstance(result, list | tuple):
             raise CacheFeatureError("Redis schedule due query returned invalid state.")
         return tuple(_record(entry) for entry in result)
+
+    async def delete(self, owner: str, identity: str) -> bool:
+        keys = self._keys(owner, identity)
+
+        async def delete_record(client: Any) -> object:
+            return await client.eval(
+                SCHEDULE_DELETE_SCRIPT,
+                7,
+                keys.record,
+                keys.due,
+                keys.claim,
+                keys.claims,
+                keys.index,
+                keys.count,
+                keys.due_lex,
+                identity,
+            )
+
+        result = _script_result(await self.runtime.feature_call(delete_record))
+        if len(result) != 1 or result[0] not in (0, 1):
+            raise CacheFeatureError("Redis schedule deletion returned invalid state.")
+        return result[0] == 1
 
     async def claim(
         self,
@@ -190,12 +243,13 @@ class RedisScheduleCache:
         async def claim_record(client: Any) -> object:
             return await client.eval(
                 SCHEDULE_CLAIM_SCRIPT,
-                5,
+                6,
                 keys.record,
                 keys.claim,
                 keys.fencing,
                 keys.due,
                 keys.claims,
+                keys.due_lex,
                 claimant,
                 token,
                 ttl_ms,
@@ -224,7 +278,7 @@ class RedisScheduleCache:
         async def complete_record(client: Any) -> object:
             return await client.eval(
                 SCHEDULE_COMPLETE_SCRIPT,
-                7,
+                8,
                 keys.record,
                 keys.due,
                 keys.claim,
@@ -232,6 +286,7 @@ class RedisScheduleCache:
                 keys.count,
                 keys.claims,
                 keys.index,
+                keys.due_lex,
                 claim.claimant,
                 claim.token,
                 claim.fencing_token.value,
@@ -248,6 +303,103 @@ class RedisScheduleCache:
         _require_success(result, length=7, label="completion")
         return _record(result[2:])
 
+    async def discard(self, claim: ScheduleClaim) -> None:
+        claim = _claim(claim)
+        keys = self._keys(claim.owner, claim.record.identity)
+
+        async def discard_record(client: Any) -> object:
+            return await client.eval(
+                SCHEDULE_DISCARD_SCRIPT,
+                7,
+                keys.record,
+                keys.due,
+                keys.claim,
+                keys.claims,
+                keys.index,
+                keys.count,
+                keys.due_lex,
+                claim.claimant,
+                claim.token,
+                claim.fencing_token.value,
+                claim.record.revision.value,
+                claim.record.identity,
+            )
+
+        result = _script_result(await self.runtime.feature_call(discard_record))
+        if result[0] == 0:
+            raise CacheConflictError("Schedule claim is stale or no longer held.")
+        _require_success(result, length=1, label="discard")
+
+    async def advance(
+        self,
+        claim: ScheduleClaim,
+        payload: bytes,
+        *,
+        next_due_at: float,
+    ) -> ScheduleRecord:
+        claim = _claim(claim)
+        payload, next_due_at, _interval_seconds = validate_schedule_values(
+            payload,
+            next_due_at,
+            None,
+        )
+        keys = self._keys(claim.owner, claim.record.identity)
+
+        async def advance_record(client: Any) -> object:
+            return await client.eval(
+                SCHEDULE_ADVANCE_SCRIPT,
+                6,
+                keys.record,
+                keys.due,
+                keys.claim,
+                keys.revision,
+                keys.claims,
+                keys.due_lex,
+                claim.claimant,
+                claim.token,
+                claim.fencing_token.value,
+                claim.record.revision.value,
+                next_due_at,
+                payload,
+                claim.record.identity,
+                due_member(next_due_at, claim.record.identity),
+            )
+
+        result = _script_result(await self.runtime.feature_call(advance_record))
+        if result[0] == 0:
+            raise CacheConflictError("Schedule claim is stale or no longer held.")
+        _require_success(result, length=2, label="advance")
+        return ScheduleRecord(
+            identity=claim.record.identity,
+            revision=CacheRevision(_integer(result[1], label="schedule revision")),
+            payload=payload,
+            next_due_at=next_due_at,
+            interval_seconds=claim.record.interval_seconds,
+        )
+
+    async def held(self, claim: ScheduleClaim) -> bool:
+        claim = _claim(claim)
+        keys = self._keys(claim.owner, claim.record.identity)
+
+        async def held_claim(client: Any) -> object:
+            return await client.eval(
+                SCHEDULE_HELD_SCRIPT,
+                2,
+                keys.record,
+                keys.claim,
+                claim.claimant,
+                claim.token,
+                claim.fencing_token.value,
+                claim.record.revision.value,
+            )
+
+        result = _script_result(await self.runtime.feature_call(held_claim))
+        if len(result) != 1 or result[0] not in (0, 1):
+            raise CacheFeatureError(
+                "Redis schedule claim check returned invalid state."
+            )
+        return result[0] == 1
+
     async def release(self, claim: ScheduleClaim) -> None:
         claim = _claim(claim)
         keys = self._keys(claim.owner, claim.record.identity)
@@ -255,11 +407,12 @@ class RedisScheduleCache:
         async def release_claim(client: Any) -> object:
             return await client.eval(
                 SCHEDULE_RELEASE_SCRIPT,
-                4,
+                5,
                 keys.record,
                 keys.claim,
                 keys.due,
                 keys.claims,
+                keys.due_lex,
                 claim.claimant,
                 claim.token,
                 claim.fencing_token.value,
@@ -278,6 +431,7 @@ class RedisScheduleCache:
         return _ScheduleKeys(
             record=self.runtime.key("schedule", owner, identity),
             due=self.runtime.key("schedule-due", owner, "records"),
+            due_lex=self.runtime.key("schedule-due-lex", owner, "records"),
             claim=self.runtime.key("schedule-claim", owner, identity),
             claims=self.runtime.key("schedule-claims", owner, "records"),
             index=self.runtime.key("schedule-index", owner, "records"),
@@ -399,4 +553,4 @@ def _interval(value: object) -> float | None:
         raise CacheFeatureError("Redis schedule interval is invalid.") from exc
 
 
-__all__ = ("RedisScheduleCache",)
+__all__ = ("RedisScheduleCache", "encode_due_order")

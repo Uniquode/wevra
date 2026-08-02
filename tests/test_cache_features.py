@@ -14,6 +14,7 @@ from cache_feature_conformance import (
     assert_work_queue_conformance,
 )
 from wybra.cache import (
+    MAX_CACHE_FEATURE_LIMIT,
     MAX_STREAM_POSITION,
     AtomicCacheCapability,
     AtomicCacheValue,
@@ -53,10 +54,14 @@ from wybra.cache.redis_pubsub import RedisPubSubCache, RedisPubSubSubscription
 from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_ADVANCE_SCRIPT,
     SCHEDULE_CLAIM_SCRIPT,
     SCHEDULE_COMPLETE_SCRIPT,
     SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DELETE_SCRIPT,
+    SCHEDULE_DISCARD_SCRIPT,
     SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_HELD_SCRIPT,
     SCHEDULE_RELEASE_SCRIPT,
     SCHEDULE_UPDATE_SCRIPT,
 )
@@ -1143,10 +1148,18 @@ async def test_redis_registers_schedule_feature_metadata(
                     b"1",
                     b"0.5",
                 ]
+            if script is SCHEDULE_HELD_SCRIPT:
+                return [1]
             if script is SCHEDULE_RELEASE_SCRIPT:
                 return [1]
             if script is SCHEDULE_COMPLETE_SCRIPT:
                 return [1, 0]
+            if script is SCHEDULE_ADVANCE_SCRIPT:
+                return [1, b"3"]
+            if script is SCHEDULE_DELETE_SCRIPT:
+                return [1]
+            if script is SCHEDULE_DISCARD_SCRIPT:
+                return [1]
             raise AssertionError("Unexpected schedule readiness script.")
 
         async def delete(self, *_keys: str) -> None:
@@ -1186,16 +1199,26 @@ async def test_redis_registers_schedule_feature_metadata(
         SCHEDULE_CREATE_SCRIPT,
         SCHEDULE_UPDATE_SCRIPT,
         SCHEDULE_DUE_SCRIPT,
+        SCHEDULE_DUE_SCRIPT,
         SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_HELD_SCRIPT,
         SCHEDULE_RELEASE_SCRIPT,
         SCHEDULE_CLAIM_SCRIPT,
         SCHEDULE_COMPLETE_SCRIPT,
+        SCHEDULE_CREATE_SCRIPT,
+        SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_ADVANCE_SCRIPT,
+        SCHEDULE_DELETE_SCRIPT,
+        SCHEDULE_CREATE_SCRIPT,
+        SCHEDULE_CLAIM_SCRIPT,
+        SCHEDULE_DISCARD_SCRIPT,
     ]
-    due_call = next(
-        args for script, args in client.calls if script is SCHEDULE_DUE_SCRIPT
-    )
-    assert due_call[0] == 3
-    assert all("readiness-" in key for key in due_call[1:4])
+    due_calls = [args for script, args in client.calls if script is SCHEDULE_DUE_SCRIPT]
+    assert len(due_calls) == 2
+    assert all(call[0] == 4 for call in due_calls)
+    assert all("readiness-" in key for call in due_calls for key in call[1:5])
+    assert due_calls[0][-1] == ""
+    assert due_calls[1][-1] != ""
 
     await caches.close()
 
@@ -2583,6 +2606,21 @@ async def test_schedule_store_rejects_creation_at_capacity() -> None:
         await schedules.create("tasks", "two", b"two", next_due_at=100)
 
 
+@pytest.mark.parametrize(
+    "factory",
+    (
+        InMemoryScheduleCache,
+        lambda *, max_records: RedisScheduleCache(
+            RedisCacheRuntime("redis://cache", "safe"),
+            max_records=max_records,
+        ),
+    ),
+)
+def test_schedule_capacity_cannot_exceed_the_due_query_bound(factory) -> None:
+    with pytest.raises(ValueError, match="cannot exceed"):
+        factory(max_records=MAX_CACHE_FEATURE_LIMIT + 1)
+
+
 @pytest.mark.anyio
 async def test_schedule_due_queries_and_claims_are_competition_safe() -> None:
     clock = FakeClock()
@@ -2690,6 +2728,56 @@ async def test_schedule_completion_removes_once_and_advances_recurring() -> None
     assert recurring is not None
     assert recurring.next_due_at == 110
     assert await schedules.due("tasks", before=100) == ()
+
+
+@pytest.mark.anyio
+async def test_schedule_advance_replaces_claimed_record_and_releases_claim() -> None:
+    clock = FakeClock()
+    schedules = InMemoryScheduleCache(clock)
+    record = await schedules.create(
+        "tasks",
+        "hourly",
+        b"original",
+        next_due_at=100,
+        interval_seconds=60,
+    )
+    assert record is not None
+    claim = await schedules.claim("tasks", "hourly", "scheduler", ttl=5)
+    assert claim is not None
+
+    advanced = await schedules.advance(
+        claim,
+        b"retained",
+        next_due_at=160,
+    )
+
+    assert advanced.payload == b"retained"
+    assert advanced.next_due_at == 160
+    assert advanced.interval_seconds == 60
+    assert advanced.revision > record.revision
+    assert await schedules.claim("tasks", "hourly", "other", ttl=5) is None
+    clock.value = 160
+    recurring_claim = await schedules.claim("tasks", "hourly", "other", ttl=5)
+    assert recurring_claim is not None
+    recurring = await schedules.complete(recurring_claim)
+    assert recurring is not None
+    assert recurring.interval_seconds == 60
+    assert recurring.next_due_at == 220
+
+
+@pytest.mark.anyio
+async def test_schedule_deletion_invalidates_a_live_claim() -> None:
+    schedules = InMemoryScheduleCache(FakeClock())
+    await schedules.create("tasks", "once", b"payload", next_due_at=100)
+    claim = await schedules.claim("tasks", "once", "scheduler", ttl=5)
+    assert claim is not None
+
+    assert await schedules.delete("tasks", "once")
+    assert not await schedules.delete("tasks", "once")
+    assert not await schedules.held(claim)
+    assert await schedules.due("tasks", before=100) == ()
+    with pytest.raises(CacheConflictError, match="claim.*stale"):
+        await schedules.complete(claim)
 
 
 @pytest.mark.anyio

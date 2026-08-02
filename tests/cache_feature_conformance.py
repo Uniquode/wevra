@@ -13,6 +13,7 @@ from wybra.cache import (
     LeaseCacheCapability,
     PubSubCacheCapability,
     ScheduleCacheCapability,
+    ScheduleCursor,
     StreamCacheCapability,
     WorkQueueCacheCapability,
 )
@@ -364,6 +365,23 @@ async def assert_schedule_conformance(
     )
     assert await feature.due(owner, before=current_time) == (updated,)
 
+    following = await feature.create(
+        owner,
+        "zz-following",
+        b"following",
+        next_due_at=current_time,
+    )
+    assert following is not None
+    first_page = await feature.due(owner, before=current_time, limit=1)
+    assert first_page == (updated,)
+    assert await feature.due(
+        owner,
+        before=current_time,
+        limit=1,
+        after=ScheduleCursor(updated.next_due_at, updated.identity),
+    ) == (following,)
+    assert await feature.delete(owner, following.identity)
+
     claim = await feature.claim(owner, "once", "scheduler", ttl=claim_ttl)
     assert claim is not None
     assert (
@@ -397,6 +415,46 @@ async def assert_schedule_conformance(
     with pytest.raises(CacheConflictError):
         await feature.release(first)
     assert await feature.complete(second) is None
+
+    advanceable = await feature.create(
+        owner,
+        "advanceable",
+        b"original",
+        next_due_at=current_time,
+        interval_seconds=recurring_interval,
+    )
+    assert advanceable is not None
+    advance_claim = await feature.claim(owner, "advanceable", "scheduler", ttl=60)
+    assert advance_claim is not None
+    assert await feature.held(advance_claim)
+    advanced_record = await feature.advance(
+        advance_claim,
+        b"advanced",
+        next_due_at=current_time + recurring_interval,
+    )
+    assert advanced_record.payload == b"advanced"
+    assert advanced_record.interval_seconds == recurring_interval
+    assert advanced_record.revision > advanceable.revision
+    assert not await feature.held(advance_claim)
+    assert await feature.delete(owner, "advanceable")
+    assert not await feature.held(advance_claim)
+    assert not await feature.delete(owner, "advanceable")
+
+    discardable = await feature.create(
+        owner,
+        "discardable",
+        b"discardable",
+        next_due_at=current_time,
+        interval_seconds=recurring_interval,
+    )
+    assert discardable is not None
+    discard_claim = await feature.claim(owner, "discardable", "scheduler", ttl=60)
+    assert discard_claim is not None
+    await feature.discard(discard_claim)
+    assert not await feature.held(discard_claim)
+    assert await feature.due(owner, before=current_time) == ()
+    with pytest.raises(CacheConflictError):
+        await feature.discard(discard_claim)
 
     recurring = await feature.create(
         owner,

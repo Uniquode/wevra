@@ -19,11 +19,16 @@ from wybra.cache.feature_models import (
     validate_positive_integer,
     validate_resource,
 )
+from wybra.cache.redis_schedule_ordering import due_boundary_member, due_member
 from wybra.cache.redis_schedule_scripts import (
+    SCHEDULE_ADVANCE_SCRIPT,
     SCHEDULE_CLAIM_SCRIPT,
     SCHEDULE_COMPLETE_SCRIPT,
     SCHEDULE_CREATE_SCRIPT,
+    SCHEDULE_DELETE_SCRIPT,
+    SCHEDULE_DISCARD_SCRIPT,
     SCHEDULE_DUE_SCRIPT,
+    SCHEDULE_HELD_SCRIPT,
     SCHEDULE_RELEASE_SCRIPT,
     SCHEDULE_UPDATE_SCRIPT,
 )
@@ -367,8 +372,13 @@ class RedisCacheRuntime:
                 fencing_key = self.sequence_key(f"schedule-fencing-{suffix}")
                 count_key = self.sequence_key(f"schedule-count-{suffix}")
                 due_key = self.key("schedule-due", owner, "records")
+                due_lex_key = self.key("schedule-due-lex", owner, "records")
                 claims_key = self.key("schedule-claims", owner, "records")
                 index_key = self.key("schedule-index", owner, "records")
+                zero_member = due_member(0, identity)
+                one_member = due_member(1, identity)
+                zero_boundary = due_boundary_member(0)
+                negative_member = due_member(-1, "before")
                 schedule_keys = (
                     record_key,
                     claim_key,
@@ -376,59 +386,81 @@ class RedisCacheRuntime:
                     fencing_key,
                     count_key,
                     due_key,
+                    due_lex_key,
                     claims_key,
                     index_key,
                 )
                 try:
                     result = await client.eval(
                         SCHEDULE_CREATE_SCRIPT,
-                        5,
+                        6,
                         record_key,
                         due_key,
                         revision_key,
                         index_key,
                         count_key,
+                        due_lex_key,
                         identity,
                         0,
                         b"readiness",
                         "",
                         1,
+                        zero_member,
                     )
                     _validate_schedule_result(result, length=2)
                     revision = result[1]
                     result = await client.eval(
                         SCHEDULE_UPDATE_SCRIPT,
-                        4,
+                        5,
                         record_key,
                         claim_key,
                         due_key,
                         revision_key,
+                        due_lex_key,
                         revision,
                         0,
                         b"updated",
                         "",
                         identity,
+                        zero_member,
                     )
                     _validate_schedule_result(result, length=2)
                     revision = result[1]
                     result = await client.eval(
                         SCHEDULE_DUE_SCRIPT,
-                        3,
+                        4,
                         due_key,
                         claims_key,
                         index_key,
+                        due_lex_key,
                         0,
                         1,
+                        zero_boundary,
+                        "",
+                    )
+                    _validate_schedule_due_result(result)
+                    result = await client.eval(
+                        SCHEDULE_DUE_SCRIPT,
+                        4,
+                        due_key,
+                        claims_key,
+                        index_key,
+                        due_lex_key,
+                        0,
+                        1,
+                        zero_boundary,
+                        negative_member,
                     )
                     _validate_schedule_due_result(result)
                     result = await client.eval(
                         SCHEDULE_CLAIM_SCRIPT,
-                        5,
+                        6,
                         record_key,
                         claim_key,
                         fencing_key,
                         due_key,
                         claims_key,
+                        due_lex_key,
                         "readiness",
                         suffix,
                         1_000,
@@ -436,12 +468,24 @@ class RedisCacheRuntime:
                     _validate_schedule_result(result, length=8)
                     fencing_token = result[6]
                     result = await client.eval(
+                        SCHEDULE_HELD_SCRIPT,
+                        2,
+                        record_key,
+                        claim_key,
+                        "readiness",
+                        suffix,
+                        fencing_token,
+                        revision,
+                    )
+                    _validate_schedule_result(result, length=1)
+                    result = await client.eval(
                         SCHEDULE_RELEASE_SCRIPT,
-                        4,
+                        5,
                         record_key,
                         claim_key,
                         due_key,
                         claims_key,
+                        due_lex_key,
                         "readiness",
                         suffix,
                         fencing_token,
@@ -451,12 +495,13 @@ class RedisCacheRuntime:
                     _validate_schedule_result(result, length=1)
                     result = await client.eval(
                         SCHEDULE_CLAIM_SCRIPT,
-                        5,
+                        6,
                         record_key,
                         claim_key,
                         fencing_key,
                         due_key,
                         claims_key,
+                        due_lex_key,
                         "readiness",
                         suffix,
                         1_000,
@@ -464,7 +509,7 @@ class RedisCacheRuntime:
                     _validate_schedule_result(result, length=8)
                     result = await client.eval(
                         SCHEDULE_COMPLETE_SCRIPT,
-                        7,
+                        8,
                         record_key,
                         due_key,
                         claim_key,
@@ -472,12 +517,126 @@ class RedisCacheRuntime:
                         count_key,
                         claims_key,
                         index_key,
+                        due_lex_key,
                         "readiness",
                         suffix,
                         result[6],
                         revision,
                     )
                     _validate_schedule_result(result, length=2)
+                    result = await client.eval(
+                        SCHEDULE_CREATE_SCRIPT,
+                        6,
+                        record_key,
+                        due_key,
+                        revision_key,
+                        index_key,
+                        count_key,
+                        due_lex_key,
+                        identity,
+                        0,
+                        b"advance",
+                        1,
+                        1,
+                        zero_member,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    revision = result[1]
+                    result = await client.eval(
+                        SCHEDULE_CLAIM_SCRIPT,
+                        6,
+                        record_key,
+                        claim_key,
+                        fencing_key,
+                        due_key,
+                        claims_key,
+                        due_lex_key,
+                        "readiness",
+                        suffix,
+                        1_000,
+                    )
+                    _validate_schedule_result(result, length=8)
+                    result = await client.eval(
+                        SCHEDULE_ADVANCE_SCRIPT,
+                        6,
+                        record_key,
+                        due_key,
+                        claim_key,
+                        revision_key,
+                        claims_key,
+                        due_lex_key,
+                        "readiness",
+                        suffix,
+                        result[6],
+                        revision,
+                        1,
+                        b"advanced",
+                        identity,
+                        one_member,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    result = await client.eval(
+                        SCHEDULE_DELETE_SCRIPT,
+                        7,
+                        record_key,
+                        due_key,
+                        claim_key,
+                        claims_key,
+                        index_key,
+                        count_key,
+                        due_lex_key,
+                        identity,
+                    )
+                    _validate_schedule_result(result, length=1)
+                    result = await client.eval(
+                        SCHEDULE_CREATE_SCRIPT,
+                        6,
+                        record_key,
+                        due_key,
+                        revision_key,
+                        index_key,
+                        count_key,
+                        due_lex_key,
+                        identity,
+                        0,
+                        b"discard",
+                        1,
+                        1,
+                        zero_member,
+                    )
+                    _validate_schedule_result(result, length=2)
+                    revision = result[1]
+                    result = await client.eval(
+                        SCHEDULE_CLAIM_SCRIPT,
+                        6,
+                        record_key,
+                        claim_key,
+                        fencing_key,
+                        due_key,
+                        claims_key,
+                        due_lex_key,
+                        "readiness",
+                        suffix,
+                        1_000,
+                    )
+                    _validate_schedule_result(result, length=8)
+                    result = await client.eval(
+                        SCHEDULE_DISCARD_SCRIPT,
+                        7,
+                        record_key,
+                        due_key,
+                        claim_key,
+                        claims_key,
+                        index_key,
+                        count_key,
+                        due_lex_key,
+                        "readiness",
+                        suffix,
+                        result[6],
+                        revision,
+                        identity,
+                    )
+                    _validate_schedule_result(result, length=1)
                 finally:
                     try:
                         await client.delete(*schedule_keys)

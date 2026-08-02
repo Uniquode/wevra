@@ -9,11 +9,13 @@ from uuid import uuid4
 
 from wybra.cache.feature_models import (
     DEFAULT_SCHEDULE_MAX_RECORDS,
+    MAX_CACHE_FEATURE_LIMIT,
     CacheConflictError,
     CacheFeatureError,
     CacheRevision,
     FencingToken,
     ScheduleClaim,
+    ScheduleCursor,
     ScheduleRecord,
     validate_finite,
     validate_limit,
@@ -54,6 +56,15 @@ class InMemoryScheduleCache:
             self.max_records,
             label="maximum schedule records",
         )
+        if self.max_records > MAX_CACHE_FEATURE_LIMIT:
+            raise ValueError(
+                f"Maximum schedule records cannot exceed {MAX_CACHE_FEATURE_LIMIT}."
+            )
+
+    @property
+    def maximum_records(self) -> int:
+        """Return the bounded capacity required by the schedule feature."""
+        return self.max_records
 
     async def create(
         self,
@@ -123,16 +134,25 @@ class InMemoryScheduleCache:
             self._records[schedule_key] = record
             return record
 
+    async def delete(self, owner: str, identity: str) -> bool:
+        schedule_key = _schedule_key(owner, identity)
+        async with self._lock:
+            self._claims.pop(schedule_key, None)
+            return self._records.pop(schedule_key, None) is not None
+
     async def due(
         self,
         owner: str,
         *,
         before: float,
         limit: int = 100,
+        after: ScheduleCursor | None = None,
     ) -> tuple[ScheduleRecord, ...]:
         owner = validate_resource(owner, label="cache owner")
         before = validate_finite(before, label="schedule due boundary")
         limit = validate_limit(limit)
+        if after is not None and not isinstance(after, ScheduleCursor):
+            raise TypeError("Schedule due cursor must be a ScheduleCursor.")
         async with self._lock:
             self._recover_claims()
             records = [
@@ -141,6 +161,11 @@ class InMemoryScheduleCache:
                 if schedule_key[0] == owner
                 and record.next_due_at <= before
                 and schedule_key not in self._claims
+                and (
+                    after is None
+                    or (record.next_due_at, record.identity)
+                    > (after.next_due_at, after.identity)
+                )
             ]
             records.sort(key=lambda record: (record.next_due_at, record.identity))
             return tuple(records[:limit])
@@ -195,6 +220,45 @@ class InMemoryScheduleCache:
             self._claims.pop(schedule_key, None)
             self._records[schedule_key] = updated
             return updated
+
+    async def discard(self, claim: ScheduleClaim) -> None:
+        async with self._lock:
+            schedule_key, _record = self._required_claim(claim)
+            self._claims.pop(schedule_key, None)
+            self._records.pop(schedule_key, None)
+
+    async def advance(
+        self,
+        claim: ScheduleClaim,
+        payload: bytes,
+        *,
+        next_due_at: float,
+    ) -> ScheduleRecord:
+        payload, next_due_at, _interval_seconds = validate_schedule_values(
+            payload,
+            next_due_at,
+            None,
+        )
+        async with self._lock:
+            schedule_key, record = self._required_claim(claim)
+            updated = ScheduleRecord(
+                identity=record.identity,
+                revision=self._revision(),
+                payload=payload,
+                next_due_at=next_due_at,
+                interval_seconds=record.interval_seconds,
+            )
+            self._claims.pop(schedule_key, None)
+            self._records[schedule_key] = updated
+            return updated
+
+    async def held(self, claim: ScheduleClaim) -> bool:
+        async with self._lock:
+            try:
+                self._required_claim(claim)
+            except CacheConflictError:
+                return False
+            return True
 
     async def release(self, claim: ScheduleClaim) -> None:
         async with self._lock:

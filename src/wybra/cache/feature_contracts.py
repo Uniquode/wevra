@@ -9,6 +9,7 @@ from wybra.cache.feature_models import (
     CounterCacheValue,
     LeaseToken,
     ScheduleClaim,
+    ScheduleCursor,
     ScheduleRecord,
     StreamPosition,
     StreamRecord,
@@ -171,6 +172,9 @@ class PubSubCacheCapability(Protocol):
 
 @runtime_checkable
 class ScheduleCacheCapability(Protocol):
+    @property
+    def maximum_records(self) -> int: ...
+
     async def create(
         self,
         owner: str,
@@ -192,12 +196,15 @@ class ScheduleCacheCapability(Protocol):
         interval_seconds: float | None = None,
     ) -> ScheduleRecord | None: ...
 
+    async def delete(self, owner: str, identity: str) -> bool: ...
+
     async def due(
         self,
         owner: str,
         *,
         before: float,
         limit: int = 100,
+        after: ScheduleCursor | None = None,
     ) -> tuple[ScheduleRecord, ...]: ...
 
     async def claim(
@@ -210,6 +217,18 @@ class ScheduleCacheCapability(Protocol):
     ) -> ScheduleClaim | None: ...
 
     async def complete(self, claim: ScheduleClaim) -> ScheduleRecord | None: ...
+
+    async def discard(self, claim: ScheduleClaim) -> None: ...
+
+    async def held(self, claim: ScheduleClaim) -> bool: ...
+
+    async def advance(
+        self,
+        claim: ScheduleClaim,
+        payload: bytes,
+        *,
+        next_due_at: float,
+    ) -> ScheduleRecord: ...
 
     async def release(self, claim: ScheduleClaim) -> None: ...
 
