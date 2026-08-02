@@ -163,7 +163,7 @@ async def test_redis_schedule_cursor_pages_equal_times_and_recurring() -> None:
             for index in range(64):
                 record = await schedules.create(
                     "tasks",
-                    f"schedule-{index:03d}",
+                    f"schedule:{index:03d}",
                     b"payload",
                     next_due_at=now - 1,
                 )
@@ -178,7 +178,7 @@ async def test_redis_schedule_cursor_pages_equal_times_and_recurring() -> None:
                 identities.extend(record.identity for record in page)
                 cursor = ScheduleCursor(page[-1].next_due_at, page[-1].identity)
 
-            assert identities == [f"schedule-{index:03d}" for index in range(64)]
+            assert identities == [f"schedule:{index:03d}" for index in range(64)]
             for identity in identities:
                 assert await schedules.delete("tasks", identity)
 
@@ -201,7 +201,7 @@ async def test_redis_schedule_cursor_pages_equal_times_and_recurring() -> None:
                 "tasks",
                 before=advanced.next_due_at,
                 limit=1,
-                after=ScheduleCursor(now - 2, "schedule-999"),
+                after=ScheduleCursor(now - 2, "schedule:999"),
             )
             assert page == (advanced,)
         finally:

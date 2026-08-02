@@ -4,7 +4,12 @@ from __future__ import annotations
 
 
 def encode_due_order(value: float) -> str:
-    """Encode a finite due time into fixed-width Redis lexicographic order."""
+    """Encode a finite due time into fixed-width lexicographic numeric order.
+
+    This must remain semantically identical to ``SCHEDULE_DUE_ORDER_FUNCTION``.
+    ``due_member`` separates this fixed-width value from the opaque identity with
+    its first colon, so schedule identities may contain further colons.
+    """
     value = 0.0 if value == 0 else value
     if value == 0:
         return "1000" + "0" * 18

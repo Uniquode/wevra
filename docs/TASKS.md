@@ -237,7 +237,7 @@ use the same owner; independent schedule sets use different owners even when
 they share one cache instance. Durable adapter envelopes carry a private schema
 version. A source releases an unsupported version without changing or deleting
 it, allowing a compatible source to process it, while malformed envelopes for
-the current version are claim-fenced discarded.
+the current version are claim-fenced and discarded.
 
 For a one-time schedule, a naive `datetime` is interpreted in that timezone.
 Naive values that fall in a daylight-saving gap or overlap are rejected; pass

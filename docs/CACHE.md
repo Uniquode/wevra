@@ -420,10 +420,10 @@ eligible for a later scheduler with a newer fencing token.
 
 Completing a one-time schedule removes it. Completing an interval schedule
 advances its due time past missed intervals without creating a burst of historic
-emissions. A live claim can also atomically advance its record to a caller
-chosen due time while preserving its recurrence interval, or a schedule can be
-deleted; either operation prevents stale claim settlement. Consumers that hand
-schedule payloads to another system can check that a claim remains live
+emissions. A live claim can also atomically advance its record to a
+caller-chosen due time while preserving its recurrence interval, or a schedule
+can be deleted; either operation prevents stale claim settlement. Consumers
+that hand schedule payloads to another system can check that a claim remains live
 immediately before that hand-off. Updating a claimed schedule or using a stale
 revision returns no update; releasing, completing, or advancing a stale claim
 raises `CacheConflictError`.

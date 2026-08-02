@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 SCHEDULE_DUE_ORDER_FUNCTION = """
+-- Keep this ordering identical to redis_schedule_ordering.encode_due_order.
+-- It emits a fixed-width key whose lexicographic order matches numeric due time.
 local function due_order(value)
     if value == 0 then
         return '1000' .. string.rep('0', 18)
@@ -134,26 +136,33 @@ for _, entry in ipairs(entries) do
     local member = nil
     if after_member ~= '' then
         member = entry
-        identity = string.sub(member, 24)
+        local separator = string.find(member, ':', 1, true)
+        identity = separator and string.sub(member, separator + 1) or nil
     end
-    local record_key = redis.call('hget', KEYS[3], identity)
-    if record_key then
-        local record = redis.call('hmget', record_key, 'i', 'p', 'r', 'd', 'n', 'm')
-        if record[1] and (member == nil or record[6] == member) then
-            table.insert(
-                result, {record[1], record[2], record[3], record[4], record[5]}
+    if identity then
+        local record_key = redis.call('hget', KEYS[3], identity)
+        if record_key then
+            local record = redis.call(
+                'hmget', record_key, 'i', 'p', 'r', 'd', 'n', 'm'
             )
+            if record[1] and (member == nil or record[6] == member) then
+                table.insert(
+                    result, {record[1], record[2], record[3], record[4], record[5]}
+                )
+            else
+                redis.call('zrem', KEYS[1], identity)
+                if member then
+                    redis.call('zrem', KEYS[4], member)
+                end
+            end
         else
             redis.call('zrem', KEYS[1], identity)
             if member then
                 redis.call('zrem', KEYS[4], member)
             end
         end
-    else
-        redis.call('zrem', KEYS[1], identity)
-        if member then
-            redis.call('zrem', KEYS[4], member)
-        end
+    elseif member then
+        redis.call('zrem', KEYS[4], member)
     end
 end
 return result
