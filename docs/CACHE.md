@@ -420,17 +420,25 @@ eligible for a later scheduler with a newer fencing token.
 
 Completing a one-time schedule removes it. Completing an interval schedule
 advances its due time past missed intervals without creating a burst of historic
-emissions. Updating a claimed schedule or using a stale revision returns no
-update; releasing or completing a stale claim raises `CacheConflictError`.
+emissions. A live claim can also atomically advance its record to a
+caller-chosen due time while preserving its recurrence interval, or a schedule
+can be deleted; either operation prevents stale claim settlement. Consumers
+that hand schedule payloads to another system can check that a claim remains live
+immediately before that hand-off. Updating a claimed schedule or using a stale
+revision returns no update; releasing, completing, or advancing a stale claim
+raises `CacheConflictError`.
 
 Schedule records, due indexes, and TTL-backed claim keys are private to the
 configured Redis namespace. They survive cache registry reconstruction and
 Redis restart according to the configured Redis persistence window. Redis
 server time controls claim eligibility, claim expiry, and recurring advancement.
 The `due()` boundary remains caller-supplied, so scheduler hosts should stay
-synchronised with Redis. Claim-expiry recovery is bounded per query. This
-feature stores opaque schedule payload bytes only; cron evaluation, task
-dispatch, and Taskiq schedule sources remain separate work.
+synchronised with Redis. Claim-expiry recovery is bounded per query. `due()`
+also accepts a `ScheduleCursor` continuation so consumers can page through due
+records in due-time and identity order without materialising earlier payloads.
+Every schedule feature stores at most 10,000 records and opaque schedule payload
+bytes only; cron evaluation and task dispatch remain consumers of the schedule
+feature.
 
 ### Redis streams
 
@@ -629,9 +637,16 @@ for due in await schedules.due("tasks", before=current_timestamp):
 ```
 
 Completing a one-time schedule removes it. Completing a recurring schedule
-advances it to the first future interval. A stale claim cannot complete or
-release a newer scheduler's work. Updating a schedule with a live claim returns
-no update; release or complete the claim before retrying the revisioned update.
+advances it to the first future interval. A stale claim cannot complete,
+discard, or release a newer scheduler's work. `discard()` atomically removes a
+live claimed record regardless of its recurrence; use it only when the consumer
+cannot safely process its opaque payload. Updating a schedule with a live claim
+returns no update; release or complete the claim before retrying the revisioned
+update.
+
+The optional cache-backed Taskiq schedule source is documented in
+[`TASKS.md`](TASKS.md). It consumes only this generic schedule feature; Redis
+and other provider implementations remain internal.
 
 ## Template fragments
 

@@ -373,6 +373,11 @@ _.profile_picture_media
 # HTMLParser callback invoked by the standard library.
 _.handle_starttag
 
-# Taskiq broker hooks invoked by its worker runtime.
+# Taskiq broker and scheduler hooks invoked by its worker runtime.
 _.kick
 _.listen
+_.add_schedule
+_.delete_schedule
+_.get_schedules
+_.pre_send
+_.post_send

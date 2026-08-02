@@ -1,0 +1,74 @@
+sequenceDiagram
+    autonumber
+    participant App as "Application"
+    participant Source as "wybra.tasks CacheTaskiqScheduleSource"
+    participant Cache as "wybra.cache ScheduleCacheCapability"
+    participant Store as "Memory or Redis schedule store"
+    participant Taskiq as "Taskiq scheduler"
+    participant Broker as "Taskiq broker / worker queue"
+
+    App->>Source: add_schedule(ScheduledTask)
+    Source->>Source: Validate schedule and refresh cadence
+    Source->>Source: Encode private schedule envelope
+    Source->>Cache: create(owner, schedule_id, payload, next_due_at, interval)
+    Cache->>Store: Persist revisioned schedule record
+    Store-->>Cache: ScheduleRecord
+    Cache-->>Source: ScheduleRecord
+
+    loop Each Taskiq scheduler refresh
+        Taskiq->>Source: get_schedules()
+        Source->>Cache: due(owner, before=now, limit)
+        Cache->>Store: Find claimable due records
+        Store-->>Cache: Due records
+        Cache-->>Source: Due records
+
+        loop Each due record
+            Source->>Cache: claim(record, claimant, TTL)
+            Cache->>Store: Create fenced lease
+            Store-->>Cache: ScheduleClaim
+            Cache-->>Source: ScheduleClaim
+
+            alt Invalid or inconsistent envelope
+                Source->>Cache: discard(claim)
+                Cache->>Store: Claim-fenced delete
+            else Unsupported version or incompatible cadence
+                Source->>Cache: release(claim)
+                Cache->>Store: Retain record and due time
+                Source->>Source: Remember deferred identity and revision
+            else Cron schedule
+                Source->>Source: Calculate due cron times in configured timezone
+                alt Future tick only
+                    Source->>Cache: advance(claim, next_due_at)
+                    Cache->>Store: Claim-fenced update
+                else Matching execution(s)
+                    Source->>Source: Stage coalesced/catch-up due times
+                end
+            else One-off or fixed interval
+                Source->>Source: Create one-shot dispatch snapshot
+            end
+        end
+
+        Source-->>Taskiq: ScheduledTask snapshots
+        Taskiq->>Source: pre_send(task)
+        Source->>Cache: held(claim)
+        Cache->>Store: Verify lease remains valid
+        Store-->>Cache: Valid / invalid
+        Cache-->>Source: Valid / invalid
+
+        alt Lease still valid
+            Taskiq->>Broker: Publish task for execution
+            Taskiq->>Source: post_send(task)
+
+            alt More cron catch-up executions remain
+                Source->>Cache: advance(claim, remaining due time)
+            else Cron schedule
+                Source->>Cache: advance(claim, next actual cron occurrence)
+            else One-off or fixed interval
+                Source->>Cache: complete(claim)
+            end
+            Cache->>Store: Claim-fenced mutation
+        else Lease lost, record deleted, or replaced
+            Source-->>Taskiq: ScheduledTaskCancelledError
+            Note over Taskiq,Broker: Task is not sent
+        end
+    end

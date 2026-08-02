@@ -80,6 +80,8 @@ databases = [
     "psycopg[binary,pool]>=3.3.4,<4.0.0",
 ]
 tasks = [
+    "croniter>=6.2.4,<7.0.0",
+    "pytz>=2025.2,<2027.0",
     "taskiq>=0.12.4,<0.13.0",
 ]
 
@@ -110,6 +112,8 @@ dev = [
     "psycopg[binary,pool]>=3.3.4,<4.0.0",
     "pyodbc>=5.3.0",
     "pytest>=9.1.1",
+    "croniter>=6.2.4,<7.0.0",
+    "pytz>=2025.2,<2027.0",
     "redis>=8.0.1",
     "ruff>=0.16.0",
     "taskiq>=0.12.4,<0.13.0",

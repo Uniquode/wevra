@@ -165,6 +165,115 @@ The adapter does not activate `[tasks] backend = "taskiq"` itself; site
 capability, worker registration, lifecycle, and scheduling integration remain
 later work.
 
+### Cache-backed Taskiq schedules
+
+`CacheTaskiqScheduleSource` is the reusable optional adapter from Taskiq's
+schedule-source interface to a selected cache's `schedule` feature. It has no
+Redis or provider-specific dependency. Construct it with a stable scheduler
+claimant and a claim TTL that covers the complete broker-enqueue and
+post-enqueue settlement path:
+
+```python
+from wybra.cache import ScheduleCacheCapability
+from wybra.tasks.taskiq_schedule import (
+    CacheTaskiqScheduleSource,
+    TaskiqSchedulePolicy,
+)
+
+schedules = caches.require("tasks").require(
+    ScheduleCacheCapability,
+    consumer="task scheduler",
+)
+source = CacheTaskiqScheduleSource(
+    schedules,
+    policy=TaskiqSchedulePolicy(
+        claimant="scheduler-1",
+        claim_ttl_seconds=30,
+        owner="primary-schedules",
+        timezone="Australia/Melbourne",
+        source_refresh_interval_seconds=1,
+        scan_page_limit=100,
+        scan_limit=1_000,
+    ),
+)
+```
+
+The source persists one-time, fixed-interval, and five-field minute-resolution
+cron schedules as UTC Unix timestamps. Cron expressions use `croniter`'s
+supported five-field calendar syntax in the configured IANA `pytz` timezone.
+Taskiq `cron_offset` is deliberately rejected: use the named `timezone`
+instead so daylight-saving handling is explicit.
+
+`source_refresh_interval_seconds` declares the Taskiq source refresh cadence.
+It defaults to 60 seconds, matching Taskiq's default scheduler refresh. Fixed
+interval schedules shorter than that value are rejected rather than silently
+coalesced. When wiring Taskiq manually, configure its `--update-interval` to a
+whole-second value no greater than the policy value; the later Wybra scheduler
+runtime will own that wiring. If an existing schedule becomes incompatible after
+the source cadence changes, the source records that identity locally, releases
+its claim without changing the durable due time, warns without exposing schedule
+content, and skips the unchanged revision on later refreshes. Every schedule
+feature has a capacity no greater than 10,000 records. `due_limit` bounds the
+Taskiq snapshots returned for hand-off; `scan_page_limit` bounds each cache due
+page; and `scan_limit` bounds the total due records inspected in one refresh.
+If that scan budget is exhausted, the next refresh resumes after its final
+record. An all-deferred scan retains its continuation while it has more due
+records to inspect, so unchanged deferred records are not re-read on every
+poll. On reaching the end, the source wraps once within its remaining current
+refresh budget; a later refresh starts again from the earliest due record. This
+lets a cooperating source discover earlier peer-created, replaced, or
+claim-recovered work. While it tracks deferred revisions, successful ordinary
+work also retains its continuation so recurring work is not repeatedly delayed
+behind the same deferred prefix. A failed hand-off or lost pending claim resets
+the cursor for normal claim-TTL recovery. Adding or deleting a schedule through
+that source also starts a new scan. This preserves the durable schedule for a
+source with a compatible cadence without allowing incompatible records to hide
+later work or requiring one provider response to contain the entire schedule
+set.
+
+`owner` identifies one isolated durable schedule set within the selected cache
+and defaults to `"taskiq-scheduler"`. Schedulers that cooperate on the same set
+use the same owner; independent schedule sets use different owners even when
+they share one cache instance. Durable adapter envelopes carry a private schema
+version. A source releases an unsupported version without changing or deleting
+it, allowing a compatible source to process it, while malformed envelopes for
+the current version are claim-fenced and discarded.
+
+For a one-time schedule, a naive `datetime` is interpreted in that timezone.
+Naive values that fall in a daylight-saving gap or overlap are rejected; pass
+an aware `datetime` when the intended instant must select one occurrence.
+
+Cron schedules coalesce missed work by default: after an outage, only the
+latest matching occurrence is dispatched. Set `catch_up_limit` to a larger
+bounded value to dispatch the most recent matching occurrences one at a time;
+older occurrences are atomically discarded before hand-off. The cache remains
+the timing authority, while the adapter gives Taskiq a one-shot dispatch
+snapshot for each claimed occurrence.
+
+Deleting a schedule prevents a claim that has not yet passed the source's
+pre-send check from being handed to the broker. It cannot revoke a command the
+broker has already accepted; scheduled task handlers therefore retain the same
+at-least-once and idempotent-effect requirements as other durable tasks.
+If shutdown begins after the pre-send check while broker acceptance is still
+unknown, the source leaves that claim for normal TTL recovery rather than
+releasing it for a competing scheduler. Once shutdown begins, the source stops
+accepting new refreshes and pre-send checks, waits for an in-progress source
+operation to finish, then releases only claims that have not begun broker
+handoff.
+The source discards an invalid or internally inconsistent adapter-owned durable
+envelope through its live claim and emits a bounded warning with the internal
+schedule identity but without schedule payload content, so corrupt records
+cannot block later due work.
+The adapter validates the record identity, one-time due time, and every
+persisted cron catch-up instant before dispatching it.
+
+See the [scheduler/cache interaction diagram](TaskScheduler.mmd) for the
+durable schedule and broker hand-off flow.
+
+This adapter is not activated by `[tasks] backend = "taskiq"` yet. Site
+activation, worker registration, lifecycle integration, and scheduler runtime
+wiring remain later work.
+
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
 remain available for `status_retention_seconds`; each task's visible lifecycle

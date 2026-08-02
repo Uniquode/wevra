@@ -182,6 +182,18 @@ class ScheduleRecord:
             )
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class ScheduleCursor:
+    """An opaque continuation point in due-time schedule ordering."""
+
+    next_due_at: float
+    identity: str
+
+    def __post_init__(self) -> None:
+        validate_finite(self.next_due_at, label="schedule cursor due time")
+        validate_resource(self.identity, label="schedule cursor identity")
+
+
 @dataclass(frozen=True, slots=True)
 class ScheduleClaim:
     owner: str
@@ -295,6 +307,7 @@ __all__ = (
     "MAX_CACHE_FEATURE_PAYLOAD_BYTES",
     "MAX_STREAM_POSITION",
     "ScheduleClaim",
+    "ScheduleCursor",
     "ScheduleRecord",
     "StreamPosition",
     "StreamRecord",
