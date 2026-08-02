@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -14,6 +15,11 @@ from wybra.cache.redis_schedule_ordering import encode_due_order
 from wybra.cache.redis_schedule_scripts import SCHEDULE_DUE_ORDER_FUNCTION
 from wybra.cache.redis_schedules import RedisScheduleCache
 from wybra.tasks.taskiq_schedule import CacheTaskiqScheduleSource, TaskiqSchedulePolicy
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Redis Testcontainers require Linux containers.",
+)
 
 
 @pytest.mark.anyio

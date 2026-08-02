@@ -181,8 +181,6 @@ jobs:
         run: uv sync
 
       - name: Test
-        env:
-          TESTCONTAINERS_RYUK_DISABLED: ${{ matrix.os == 'windows-latest' && 'true' || 'false' }}
         run: uv run pytest -q
 
   pytest-integration:
