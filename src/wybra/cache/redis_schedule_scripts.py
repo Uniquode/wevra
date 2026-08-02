@@ -181,11 +181,6 @@ local now_seconds = tonumber(now[1]) + tonumber(now[2]) / 1000000
 if tonumber(record[4]) > now_seconds then
     return {0}
 end
-local member = record[6]
-if not member then
-    member = due_order(tonumber(record[4])) .. ':' .. record[1]
-    redis.call('hset', KEYS[1], 'm', member)
-end
 redis.call('incr', KEYS[3])
 local fencing_token = redis.call('get', KEYS[3])
 local expires_at = now_seconds + tonumber(ARGV[3]) / 1000
@@ -200,9 +195,7 @@ redis.call(
 )
 redis.call('pexpire', KEYS[2], ARGV[3])
 redis.call('zrem', KEYS[4], record[1])
-if member then
-    redis.call('zrem', KEYS[6], member)
-end
+redis.call('zrem', KEYS[6], record[6])
 redis.call('zadd', KEYS[5], expires_at_value, record[1])
 return {
     1,
@@ -227,16 +220,10 @@ then
 end
 local due_at = redis.call('hget', KEYS[1], 'd')
 local member = redis.call('hget', KEYS[1], 'm')
-if due_at and not member then
-    member = due_order(tonumber(due_at)) .. ':' .. ARGV[5]
-    redis.call('hset', KEYS[1], 'm', member)
-end
 redis.call('del', KEYS[2])
 redis.call('zrem', KEYS[4], ARGV[5])
 redis.call('zadd', KEYS[3], due_at, ARGV[5])
-if member then
-    redis.call('zadd', KEYS[5], 0, member)
-end
+redis.call('zadd', KEYS[5], 0, member)
 return {1}
 """
 
@@ -255,18 +242,12 @@ local record = redis.call('hmget', KEYS[1], 'i', 'p', 'r', 'd', 'n', 'm')
 if not record[1] then
     return {0}
 end
-local member = record[6]
-if not member then
-    member = due_order(tonumber(record[4])) .. ':' .. record[1]
-end
 if record[5] == '' then
     redis.call('del', KEYS[3], KEYS[1])
     redis.call('zrem', KEYS[2], record[1])
     redis.call('zrem', KEYS[6], record[1])
     redis.call('hdel', KEYS[7], record[1])
-    if member then
-        redis.call('zrem', KEYS[8], member)
-    end
+    redis.call('zrem', KEYS[8], record[6])
     redis.call('decr', KEYS[5])
     return {1, 0}
 end
