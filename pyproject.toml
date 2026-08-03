@@ -33,7 +33,7 @@ dependencies = [
     "tortoise-orm>=1.1.7,<1.2.0",
     "uvicorn>=0.51.0",
     "webauthn>=3.0.0",
-    "websockets>=16.1.1,<17.0",
+    "websockets>=17.0,<18.0",
 ]
 
 [project.optional-dependencies]
