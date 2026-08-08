@@ -104,7 +104,7 @@ class InMemoryWorkQueue:
         item = _WorkItem(identity, payload, max_attempts)
         async with self._condition:
             self._require_open()
-            self._recover()
+            self._promote_delayed()
             self._ensure_queue_capacity(queue_key)
             if self._active_count(queue_key) >= self.max_items_per_queue:
                 raise CacheWorkQueueRejectedError(
@@ -176,7 +176,7 @@ class InMemoryWorkQueue:
 
     async def acknowledge(self, delivery: WorkDelivery) -> None:
         async with self._condition:
-            self._recover()
+            self._promote_delayed()
             reservation = self._required_reservation(delivery)
             self._inflight.pop(reservation.receipt, None)
             self._prune_queue(reservation.queue_key)
@@ -192,7 +192,7 @@ class InMemoryWorkQueue:
             label="visibility timeout",
         )
         async with self._condition:
-            self._recover()
+            self._promote_delayed()
             reservation = self._required_reservation(delivery)
             reservation.visible_until = self.clock() + visibility_timeout
             return reservation.delivery()
@@ -200,7 +200,7 @@ class InMemoryWorkQueue:
     async def reject(self, delivery: WorkDelivery, *, delay: float = 0) -> None:
         delay = validate_non_negative_finite(delay, label="retry delay")
         async with self._condition:
-            self._recover()
+            self._promote_delayed()
             reservation = self._required_reservation(delivery)
             self._inflight.pop(reservation.receipt, None)
             self._retry_or_dead_letter(
@@ -212,7 +212,7 @@ class InMemoryWorkQueue:
 
     async def dead_letter(self, delivery: WorkDelivery) -> None:
         async with self._condition:
-            self._recover()
+            self._promote_delayed()
             reservation = self._required_reservation(delivery)
             self._inflight.pop(reservation.receipt, None)
             self._append_dead_letter(reservation.queue_key, reservation.item)
@@ -228,7 +228,7 @@ class InMemoryWorkQueue:
         queue_key = _queue_key(owner, queue)
         limit = validate_limit(limit)
         async with self._condition:
-            self._recover()
+            self._promote_delayed()
             dead_letters = self._dead.get(queue_key, ())
             return tuple(
                 WorkDelivery(
@@ -258,10 +258,17 @@ class InMemoryWorkQueue:
         )
 
     def _recover(self) -> None:
+        self._promote_delayed()
+        self._recover_expired()
+
+    def _promote_delayed(self) -> None:
         now = self.clock()
         while self._delayed and self._delayed[0][0] <= now:
             _available_at, _sequence, queue_key, item = heapq.heappop(self._delayed)
             self._ready.setdefault(queue_key, deque()).append(item)
+
+    def _recover_expired(self) -> None:
+        now = self.clock()
         expired = [
             receipt
             for receipt, reservation in self._inflight.items()

@@ -1109,7 +1109,7 @@ async def test_delivery_exhaustion_is_reconciled_to_terminal_lifecycle() -> None
     await sleep(0.15)
 
     with pytest.raises(TimeoutError):
-        await wait_for(anext(listener), timeout=0.1)
+        await wait_for(anext(listener), timeout=0.2)
 
     status = await handle.status()
     assert status is not None

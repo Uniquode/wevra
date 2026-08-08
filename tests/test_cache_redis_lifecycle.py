@@ -9,7 +9,6 @@ from taskiq import TaskiqMessage, TaskiqResult
 from testcontainers.community.redis import RedisContainer
 
 from cache_feature_conformance import assert_lease_fenced_mutation_conformance
-from wybra.cache import CacheConflictError
 from wybra.cache.redis_atomic import RedisAtomicCache
 from wybra.cache.redis_leases import RedisLeaseCache
 from wybra.cache.redis_queues import RedisWorkQueue
@@ -53,7 +52,7 @@ async def test_redis_fenced_mutations_reject_a_replaced_lease() -> None:
 
 
 @pytest.mark.anyio
-async def test_redis_work_queue_rejects_settlement_after_visibility_expiry() -> None:
+async def test_redis_queue_keeps_unclaimed_receipt_after_visibility_expiry() -> None:
     with RedisContainer("redis:7-alpine") as container:
         runtime = RedisCacheRuntime(
             f"redis://{container.get_container_host_ip()}:"
@@ -72,10 +71,75 @@ async def test_redis_work_queue_rejects_settlement_after_visibility_expiry() -> 
             assert delivery is not None
             await sleep(0.1)
 
-            with pytest.raises(CacheConflictError, match="stale or no longer reserved"):
-                await queue.renew(delivery, visibility_timeout=1)
-            with pytest.raises(CacheConflictError, match="stale or no longer reserved"):
-                await queue.acknowledge(delivery)
+            renewed = await queue.renew(delivery, visibility_timeout=1)
+            await queue.acknowledge(renewed)
+            assert (
+                await queue.reserve(
+                    "tasks",
+                    "default",
+                    "worker-b",
+                    visibility_timeout=1,
+                )
+                is None
+            )
+
+            retry_identity = await queue.publish("tasks", "default", b"retry")
+            retry_delivery = await queue.reserve(
+                "tasks",
+                "default",
+                "worker-a",
+                visibility_timeout=0.05,
+            )
+            assert retry_delivery is not None
+            await sleep(0.1)
+            await queue.reject(retry_delivery)
+            retried = await queue.reserve(
+                "tasks",
+                "default",
+                "worker-b",
+                visibility_timeout=1,
+            )
+            assert retried is not None
+            assert retried.identity == retry_identity
+            assert retried.attempt == 2
+            await queue.acknowledge(retried)
+
+            dead_identity = await queue.publish("tasks", "default", b"dead")
+            dead_delivery = await queue.reserve(
+                "tasks",
+                "default",
+                "worker-a",
+                visibility_timeout=0.05,
+            )
+            assert dead_delivery is not None
+            await sleep(0.1)
+            await queue.dead_letter(dead_delivery)
+            dead_letters = await queue.dead_letters("tasks", "default")
+            assert [entry.identity for entry in dead_letters] == [dead_identity]
+        finally:
+            await queue.close()
+            await runtime.close()
+
+
+@pytest.mark.anyio
+async def test_redis_work_queue_recovery_invalidates_expired_receipt() -> None:
+    with RedisContainer("redis:7-alpine") as container:
+        runtime = RedisCacheRuntime(
+            f"redis://{container.get_container_host_ip()}:"
+            f"{container.get_exposed_port(6379)}/0",
+            namespace=f"queue-test-{uuid4().hex}",
+        )
+        queue = RedisWorkQueue(runtime)
+        try:
+            await queue.publish("tasks", "default", b"payload")
+            delivery = await queue.reserve(
+                "tasks",
+                "default",
+                "worker-a",
+                visibility_timeout=0.05,
+            )
+            assert delivery is not None
+            await sleep(0.1)
 
             redelivered = await queue.reserve(
                 "tasks",

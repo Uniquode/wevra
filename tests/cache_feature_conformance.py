@@ -224,6 +224,18 @@ async def assert_work_queue_conformance(
         is None
     )
     await advance(5)
+    conditionally_renewed = await feature.renew(renewed, visibility_timeout=5)
+    assert conditionally_renewed.receipt == renewed.receipt
+    assert (
+        await feature.reserve(
+            owner,
+            "visibility",
+            "worker-2",
+            visibility_timeout=5,
+        )
+        is None
+    )
+    await advance(5)
     second = await feature.reserve(
         owner,
         "visibility",
@@ -233,6 +245,8 @@ async def assert_work_queue_conformance(
     assert second is not None
     assert second.identity == identity
     assert second.attempt == 2
+    with pytest.raises(CacheConflictError):
+        await feature.acknowledge(conditionally_renewed)
     await feature.reject(second, delay=5)
     assert (
         await feature.reserve(
@@ -254,6 +268,73 @@ async def assert_work_queue_conformance(
     assert third.identity == identity
     assert third.attempt == 3
     await feature.acknowledge(third)
+
+    acknowledged_identity = await feature.publish(
+        owner,
+        "conditional-acknowledgement",
+        b"acknowledged",
+    )
+    acknowledged = await feature.reserve(
+        owner,
+        "conditional-acknowledgement",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert acknowledged is not None
+    await advance(5)
+    await feature.acknowledge(acknowledged)
+    assert (
+        await feature.reserve(
+            owner,
+            "conditional-acknowledgement",
+            "worker",
+            visibility_timeout=5,
+        )
+        is None
+    )
+    assert acknowledged.identity == acknowledged_identity
+
+    retried_identity = await feature.publish(
+        owner,
+        "conditional-retry",
+        b"retried",
+    )
+    retried = await feature.reserve(
+        owner,
+        "conditional-retry",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert retried is not None
+    await advance(5)
+    await feature.reject(retried)
+    retried_again = await feature.reserve(
+        owner,
+        "conditional-retry",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert retried_again is not None
+    assert retried_again.identity == retried_identity
+    assert retried_again.attempt == 2
+    await feature.acknowledge(retried_again)
+
+    dead_identity = await feature.publish(
+        owner,
+        "conditional-dead-letter",
+        b"dead",
+    )
+    dead = await feature.reserve(
+        owner,
+        "conditional-dead-letter",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert dead is not None
+    await advance(5)
+    await feature.dead_letter(dead)
+    dead_letters = await feature.dead_letters(owner, "conditional-dead-letter")
+    assert [entry.identity for entry in dead_letters] == [dead_identity]
 
     delayed_identity = await feature.publish(
         owner,

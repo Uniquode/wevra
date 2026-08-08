@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
@@ -205,12 +205,6 @@ _ACKNOWLEDGE_SCRIPT = """
 if redis.call('hget', KEYS[5], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
     return 0
 end
-local now = redis.call('time')
-local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local deadline = redis.call('zscore', KEYS[6], ARGV[2])
-if deadline == false or tonumber(deadline) <= milliseconds then
-    return 0
-end
 redis.call('xack', KEYS[1], ARGV[1], ARGV[2])
 redis.call('xdel', KEYS[1], ARGV[2])
 redis.call('hdel', KEYS[2], ARGV[4])
@@ -226,10 +220,6 @@ if redis.call('hget', KEYS[1], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
 end
 local now = redis.call('time')
 local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local previous_deadline = redis.call('zscore', KEYS[2], ARGV[2])
-if previous_deadline == false or tonumber(previous_deadline) <= milliseconds then
-    return {}
-end
 local deadline = milliseconds
     + tonumber(ARGV[6])
 redis.call('zadd', KEYS[2], deadline, ARGV[2])
@@ -243,10 +233,6 @@ if redis.call('hget', KEYS[7], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
 end
 local now = redis.call('time')
 local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local deadline = redis.call('zscore', KEYS[8], ARGV[2])
-if deadline == false or tonumber(deadline) <= milliseconds then
-    return 0
-end
 local attempt = tonumber(redis.call('hget', KEYS[5], ARGV[4]))
 local maximum = tonumber(redis.call('hget', KEYS[4], ARGV[4]))
 local payload = redis.call('hget', KEYS[3], ARGV[4])
@@ -275,12 +261,6 @@ return 1
 """
 _DEAD_LETTER_SCRIPT = """
 if redis.call('hget', KEYS[6], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
-    return 0
-end
-local now = redis.call('time')
-local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local deadline = redis.call('zscore', KEYS[7], ARGV[2])
-if deadline == false or tonumber(deadline) <= milliseconds then
     return 0
 end
 local payload = redis.call('hget', KEYS[2], ARGV[4])
@@ -480,7 +460,6 @@ class RedisWorkQueue:
         deadline = monotonic() + wait_timeout
         final_check = False
         while True:
-            await self._prune_deliveries()
             await self._promote(keys)
             delivery = await self._claim_expired(
                 keys,
@@ -530,7 +509,6 @@ class RedisWorkQueue:
             visibility_timeout,
             label="visibility timeout",
         )
-        await self._prune_deliveries()
         state = self._state_for_delivery(delivery)
 
         async def renew(client: Any) -> object:
@@ -557,10 +535,6 @@ class RedisWorkQueue:
                 f"Delivery {delivery.identity.value!r} is stale or no longer reserved."
             )
         visible_until = _integer(renewed[0]) / 1_000
-        self._deliveries[delivery.receipt] = replace(
-            state,
-            expires_at=monotonic() + visibility_timeout,
-        )
         return WorkDelivery(
             queue=delivery.queue,
             identity=delivery.identity,
@@ -1014,7 +988,6 @@ class RedisWorkQueue:
             identity=identity,
             attempt=attempt,
             consumer=consumer,
-            expires_at=monotonic() + visibility_timeout,
         )
         if previous and _text(previous[0]):
             previous_consumer = _text(previous[0])
@@ -1032,7 +1005,6 @@ class RedisWorkQueue:
         action: str,
         delay_milliseconds: int,
     ) -> None:
-        await self._prune_deliveries()
         state = self._state_for_delivery(delivery)
         keys = state.keys
         entry_id = state.entry_id
@@ -1138,18 +1110,6 @@ class RedisWorkQueue:
             delay_signals=self.runtime.key("work-queue-delay-signal", owner, queue),
         )
 
-    async def _prune_deliveries(self) -> None:
-        now = monotonic()
-        expired = [
-            receipt
-            for receipt, state in self._deliveries.items()
-            if state.expires_at <= now
-        ]
-        for receipt in expired:
-            state = self._deliveries.pop(receipt)
-            await self._remove_consumer_if_idle(state.keys, state.consumer)
-            self._consumers.discard((state.keys, state.consumer))
-
 
 @dataclass(frozen=True, slots=True)
 class _QueueKeys:
@@ -1174,7 +1134,6 @@ class _DeliveryState:
     identity: WorkIdentity
     attempt: int
     consumer: str
-    expires_at: float
 
 
 def _queue(owner: str, queue: str) -> tuple[str, str]:

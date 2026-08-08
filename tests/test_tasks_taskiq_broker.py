@@ -912,6 +912,55 @@ async def test_cache_taskiq_broker_delivers_to_independent_consumers() -> None:
 
 
 @pytest.mark.anyio
+async def test_cache_taskiq_broker_renews_expired_delivery_until_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr("wybra.tasks.taskiq_broker.monotonic", clock)
+    work_queue = InMemoryWorkQueue(clock)
+    broker = CacheTaskiqBroker(
+        work_queue,
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=30,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=3,
+        ),
+    )
+    await broker.kick(
+        broker.formatter.dumps(
+            TaskiqMessage(
+                task_id="task-conditional-ownership",
+                task_name="tests.example",
+                labels={},
+                args=[],
+                kwargs={},
+            )
+        )
+    )
+    listener = broker.listen()
+    delivery = _require_ackable(await anext(listener))
+    message = broker.formatter.loads(message=delivery.data)
+    receipt = message.labels[DELIVERY_RECEIPT_LABEL]
+    assert isinstance(receipt, str)
+
+    clock.advance(30)
+    await broker.renew_delivery(receipt, visibility_timeout=30)
+    assert (
+        await work_queue.reserve(
+            "taskiq-broker",
+            "default",
+            "worker-2",
+            visibility_timeout=30,
+        )
+        is None
+    )
+    await _acknowledge(delivery)
+    await listener.aclose()
+
+
+@pytest.mark.anyio
 async def test_cache_taskiq_broker_redelivers_unacknowledged_work() -> None:
     clock = FakeClock()
     work_queue = InMemoryWorkQueue(clock)
@@ -1061,6 +1110,15 @@ async def test_broker_observes_retained_dead_letter_once() -> None:
     assert isinstance(await anext(first_listener), AckableMessage)
     await first_listener.aclose()
     clock.advance(30)
+    assert (
+        await work_queue.reserve(
+            "taskiq-broker",
+            "default",
+            "worker-2",
+            visibility_timeout=30,
+        )
+        is None
+    )
     assert await work_queue.dead_letters("taskiq-broker", "default")
 
     await broker._observe_delivery_exhaustion()

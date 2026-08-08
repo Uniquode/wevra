@@ -117,7 +117,7 @@ class WorkQueueCacheCapability(Protocol):
         *,
         visibility_timeout: float,
     ) -> WorkDelivery:
-        """Extend a live delivery lease and return its new visibility deadline."""
+        """Extend a current delivery receipt and return its visibility deadline."""
         ...
 
     async def acknowledge(self, delivery: WorkDelivery) -> None: ...

@@ -66,7 +66,6 @@ class _BrokerLifecycle:
 @dataclass(frozen=True, slots=True)
 class _OutstandingDelivery:
     delivery: WorkDelivery
-    expires_at: float
 
 
 @dataclass(slots=True)
@@ -148,7 +147,6 @@ class CacheTaskiqBroker(AsyncBroker):
     async def startup(self) -> None:
         async with self._lifecycle_lock:
             self._lifecycle.shutdown_requested.set()
-            self._prune_outstanding_deliveries()
             lifecycle = _BrokerLifecycle()
             try:
                 await super().startup()
@@ -236,7 +234,6 @@ class CacheTaskiqBroker(AsyncBroker):
                 self._lifecycle is lifecycle
                 and not lifecycle.shutdown_requested.is_set()
             ):
-                self._prune_outstanding_deliveries()
                 await self._observe_delivery_exhaustion(force=False)
                 delivery = await self._reserve_or_stop(shutdown)
                 if (
@@ -248,7 +245,6 @@ class CacheTaskiqBroker(AsyncBroker):
                     receipt = uuid4().hex
                     self._outstanding_deliveries[receipt] = _OutstandingDelivery(
                         delivery=delivery,
-                        expires_at=monotonic() + visibility_timeout,
                     )
                     if self.is_worker_process:
                         self._prefetch_renewals[receipt] = asyncio.create_task(
@@ -363,7 +359,11 @@ class CacheTaskiqBroker(AsyncBroker):
     async def _acknowledge(self, receipt: str) -> None:
         await self._stop_prefetch_renewal(receipt)
         delivery = self._delivery_for_receipt(receipt)
-        await self._work_queue.acknowledge(delivery)
+        try:
+            await self._work_queue.acknowledge(delivery)
+        except CacheConflictError:
+            self._outstanding_deliveries.pop(receipt, None)
+            raise
         self._outstanding_deliveries.pop(receipt, None)
 
     async def renew_delivery(
@@ -376,15 +376,18 @@ class CacheTaskiqBroker(AsyncBroker):
         _validate_positive_finite(visibility_timeout, label="Visibility timeout")
         await self._stop_prefetch_renewal(receipt)
         outstanding = self._outstanding_for_receipt(receipt)
-        renewed = await self._work_queue.renew(
-            outstanding.delivery,
-            visibility_timeout=visibility_timeout,
-        )
+        try:
+            renewed = await self._work_queue.renew(
+                outstanding.delivery,
+                visibility_timeout=visibility_timeout,
+            )
+        except CacheConflictError:
+            self._outstanding_deliveries.pop(receipt, None)
+            raise
         if self._outstanding_deliveries.get(receipt) is not outstanding:
             raise CacheConflictError("Delivery is stale or no longer reserved.")
         self._outstanding_deliveries[receipt] = _OutstandingDelivery(
             delivery=renewed,
-            expires_at=monotonic() + visibility_timeout,
         )
 
     def delivery_receipt(self, message: AckableMessage) -> str | None:
@@ -428,14 +431,17 @@ class CacheTaskiqBroker(AsyncBroker):
             while self._prefetch_renewals.get(receipt) is asyncio.current_task():
                 await asyncio.sleep(max(0.05, visibility_timeout / 2))
                 outstanding = self._outstanding_for_receipt(receipt)
-                renewed = await self._work_queue.renew(
-                    outstanding.delivery,
-                    visibility_timeout=visibility_timeout,
-                )
+                try:
+                    renewed = await self._work_queue.renew(
+                        outstanding.delivery,
+                        visibility_timeout=visibility_timeout,
+                    )
+                except CacheConflictError:
+                    self._outstanding_deliveries.pop(receipt, None)
+                    raise
                 if self._outstanding_deliveries.get(receipt) is outstanding:
                     self._outstanding_deliveries[receipt] = _OutstandingDelivery(
                         delivery=renewed,
-                        expires_at=monotonic() + visibility_timeout,
                     )
         except CacheConflictError, CacheFeatureError:
             return
@@ -474,21 +480,10 @@ class CacheTaskiqBroker(AsyncBroker):
         return self._outstanding_for_receipt(receipt).delivery
 
     def _outstanding_for_receipt(self, receipt: str) -> _OutstandingDelivery:
-        self._prune_outstanding_deliveries()
         outstanding = self._outstanding_deliveries.get(receipt)
-        if outstanding is None or outstanding.expires_at <= monotonic():
-            self._outstanding_deliveries.pop(receipt, None)
+        if outstanding is None:
             raise CacheConflictError("Delivery is stale or no longer reserved.")
         return outstanding
-
-    def _prune_outstanding_deliveries(self) -> None:
-        now = monotonic()
-        for receipt, outstanding in tuple(self._outstanding_deliveries.items()):
-            if outstanding.expires_at <= now:
-                self._outstanding_deliveries.pop(receipt, None)
-                renewal = self._prefetch_renewals.pop(receipt, None)
-                if renewal is not None:
-                    renewal.cancel()
 
 
 async def _cancel_task[T](task: asyncio.Task[T]) -> None:
