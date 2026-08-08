@@ -15,6 +15,7 @@ from taskiq.acks import AcknowledgeType
 from taskiq.message import TaskiqMessage
 from taskiq.receiver import Receiver
 
+from wybra.cache import CacheConflictError
 from wybra.tasks.taskiq_broker import CacheTaskiqBroker
 from wybra.tasks.taskiq_lifecycle import CacheTaskiqLifecycleMiddleware
 from wybra.tasks.taskiq_protocol import DELIVERY_RECEIPT_LABEL
@@ -371,6 +372,8 @@ class CacheTaskiqReceiver(Receiver):
                     )
                     if isinstance(execution_result, BaseException):
                         raise execution_result
+                    if isinstance(renewal_result, CacheConflictError):
+                        return
                     if isinstance(renewal_result, BaseException):
                         raise renewal_result
                 else:

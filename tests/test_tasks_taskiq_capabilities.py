@@ -1056,9 +1056,12 @@ async def test_cache_taskiq_receiver_renews_while_checking_obsolete_delivery(
     listener = broker.listen()
     received = await anext(listener)
     assert isinstance(received, AckableMessage)
+    renewal_started = asyncio.Event()
+    resume_renewal = asyncio.Event()
+    renewal_finished = asyncio.Event()
 
     async def slow_obsolete(_message: TaskiqMessage) -> bool:
-        await sleep(0.25)
+        await renewal_started.wait()
         return True
 
     renewals = 0
@@ -1067,7 +1070,21 @@ async def test_cache_taskiq_receiver_renews_while_checking_obsolete_delivery(
     async def count_renewals(*args: object, **kwargs: object) -> None:
         nonlocal renewals
         renewals += 1
-        await original_renew(*args, **kwargs)
+        if renewals == 2:
+            renewal_started.set()
+            await resume_renewal.wait()
+        try:
+            await original_renew(*args, **kwargs)
+        finally:
+            if renewals == 2:
+                renewal_finished.set()
+
+    original_acknowledge = received.ack
+
+    async def acknowledge() -> None:
+        await original_acknowledge()
+        resume_renewal.set()
+        await renewal_finished.wait()
 
     monkeypatch.setattr(
         capability.lifecycle_middleware,
@@ -1076,9 +1093,11 @@ async def test_cache_taskiq_receiver_renews_while_checking_obsolete_delivery(
     )
     monkeypatch.setattr(broker, "renew_delivery", count_renewals)
 
-    await capability.receiver(validate_params=False).callback(received)
+    await capability.receiver(validate_params=False).callback(
+        AckableMessage(data=received.data, ack=acknowledge)
+    )
 
-    assert renewals >= 3
+    assert renewals == 2
     await listener.aclose()
 
 
