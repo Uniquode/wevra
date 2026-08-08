@@ -214,10 +214,25 @@ redis.call('hdel', KEYS[5], ARGV[2])
 redis.call('zrem', KEYS[6], ARGV[2])
 return 1
 """
+_RENEW_SCRIPT = """
+if redis.call('hget', KEYS[1], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
+    return {}
+end
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local deadline = milliseconds
+    + tonumber(ARGV[6])
+redis.call('zadd', KEYS[2], deadline, ARGV[2])
+redis.call('hset', KEYS[3], ARGV[5], ARGV[6])
+redis.call('pexpire', KEYS[3], math.max(tonumber(ARGV[6]), 604800000))
+return {deadline}
+"""
 _REJECT_SCRIPT = """
 if redis.call('hget', KEYS[7], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
     return 0
 end
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 local attempt = tonumber(redis.call('hget', KEYS[5], ARGV[4]))
 local maximum = tonumber(redis.call('hget', KEYS[4], ARGV[4]))
 local payload = redis.call('hget', KEYS[3], ARGV[4])
@@ -239,10 +254,7 @@ if tonumber(ARGV[5]) == 0 then
     redis.call('xadd', KEYS[1], '*', 'i', ARGV[4])
     return 1
 end
-local now = redis.call('time')
-local due = tonumber(now[1]) * 1000
-    + math.floor(tonumber(now[2]) / 1000)
-    + tonumber(ARGV[5])
+local due = milliseconds + tonumber(ARGV[5])
 redis.call('zadd', KEYS[2], due, ARGV[4])
 redis.call('xadd', KEYS[9], 'MAXLEN', '~', ARGV[7], '*', 'i', ARGV[4])
 return 1
@@ -448,7 +460,6 @@ class RedisWorkQueue:
         deadline = monotonic() + wait_timeout
         final_check = False
         while True:
-            await self._prune_deliveries()
             await self._promote(keys)
             delivery = await self._claim_expired(
                 keys,
@@ -483,6 +494,55 @@ class RedisWorkQueue:
 
     async def acknowledge(self, delivery: WorkDelivery) -> None:
         await self._settle(delivery, action="acknowledge", delay_milliseconds=0)
+
+    async def renew(
+        self,
+        delivery: WorkDelivery,
+        *,
+        visibility_timeout: float,
+    ) -> WorkDelivery:
+        visibility_timeout = validate_positive_finite(
+            visibility_timeout,
+            label="visibility timeout",
+        )
+        visibility_milliseconds = self.runtime.duration_milliseconds(
+            visibility_timeout,
+            label="visibility timeout",
+        )
+        state = self._state_for_delivery(delivery)
+
+        async def renew(client: Any) -> object:
+            return await client.eval(
+                _RENEW_SCRIPT,
+                3,
+                state.keys.receipts,
+                state.keys.visible,
+                state.keys.consumers,
+                _GROUP,
+                state.entry_id,
+                delivery.receipt,
+                delivery.identity.value,
+                state.consumer,
+                visibility_milliseconds,
+            )
+
+        renewed = cast(tuple[Any, ...], await self.runtime.feature_call(renew))
+        if len(renewed) != 1:
+            self._deliveries.pop(delivery.receipt, None)
+            await self._remove_consumer_if_idle(state.keys, state.consumer)
+            self._consumers.discard((state.keys, state.consumer))
+            raise CacheConflictError(
+                f"Delivery {delivery.identity.value!r} is stale or no longer reserved."
+            )
+        visible_until = _integer(renewed[0]) / 1_000
+        return WorkDelivery(
+            queue=delivery.queue,
+            identity=delivery.identity,
+            payload=delivery.payload,
+            attempt=delivery.attempt,
+            visible_until=visible_until,
+            receipt=delivery.receipt,
+        )
 
     async def reject(self, delivery: WorkDelivery, *, delay: float = 0) -> None:
         delay = validate_non_negative_finite(delay, label="retry delay")
@@ -928,7 +988,6 @@ class RedisWorkQueue:
             identity=identity,
             attempt=attempt,
             consumer=consumer,
-            expires_at=monotonic() + visibility_timeout,
         )
         if previous and _text(previous[0]):
             previous_consumer = _text(previous[0])
@@ -946,7 +1005,6 @@ class RedisWorkQueue:
         action: str,
         delay_milliseconds: int,
     ) -> None:
-        await self._prune_deliveries()
         state = self._state_for_delivery(delivery)
         keys = state.keys
         entry_id = state.entry_id
@@ -1052,18 +1110,6 @@ class RedisWorkQueue:
             delay_signals=self.runtime.key("work-queue-delay-signal", owner, queue),
         )
 
-    async def _prune_deliveries(self) -> None:
-        now = monotonic()
-        expired = [
-            receipt
-            for receipt, state in self._deliveries.items()
-            if state.expires_at <= now
-        ]
-        for receipt in expired:
-            state = self._deliveries.pop(receipt)
-            await self._remove_consumer_if_idle(state.keys, state.consumer)
-            self._consumers.discard((state.keys, state.consumer))
-
 
 @dataclass(frozen=True, slots=True)
 class _QueueKeys:
@@ -1088,7 +1134,6 @@ class _DeliveryState:
     identity: WorkIdentity
     attempt: int
     consumer: str
-    expires_at: float
 
 
 def _queue(owner: str, queue: str) -> tuple[str, str]:

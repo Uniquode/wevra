@@ -19,12 +19,20 @@ end
 """
 
 STREAM_APPEND_SCRIPT = """
+if ARGV[4] ~= '' then
+    if redis.call('hget', KEYS[3], 'holder') ~= ARGV[4]
+        or redis.call('hget', KEYS[3], 'token') ~= ARGV[5]
+        or redis.call('hget', KEYS[3], 'fencing_token') ~= ARGV[6]
+    then
+        return 0
+    end
+end
 redis.call('incr', KEYS[2])
 local position = redis.call('get', KEYS[2])
 -- Redis entry IDs deliberately encode the private allocated position, not time.
 redis.call('xadd', KEYS[1], position .. '-0', 'p', position, 'd', ARGV[1])
 redis.call('xtrim', KEYS[1], 'MAXLEN', '=', ARGV[2])
-if ARGV[3] then
+if ARGV[3] ~= '' then
     redis.call('pexpire', KEYS[1], ARGV[3])
     redis.call('pexpire', KEYS[2], ARGV[3])
 end

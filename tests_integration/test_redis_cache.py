@@ -175,6 +175,7 @@ async def test_redis_advanced_features_pass_shared_conformance(
             "pub-sub",
             "schedule",
             "stream",
+            "time",
             "work-queue",
         )
         await assert_atomic_conformance(

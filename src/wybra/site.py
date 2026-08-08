@@ -63,6 +63,7 @@ AppT = TypeVar("AppT", bound=FastAPI)
 SETUP_SITE_ATTRIBUTE = "setup_site"
 POST_SETUP_SITE_ATTRIBUTE = "post_setup_site"
 SETUP_FINALISATION_ATTRIBUTE = "setup_finalisation"
+POST_SETUP_FINALISATION_ATTRIBUTE = "post_setup_finalisation"
 T = TypeVar("T")
 
 
@@ -109,7 +110,17 @@ class Site:
         init=False,
         repr=False,
     )
+    _post_setup_finalisers: deque[_DeferredSetupFinaliser] = field(
+        default_factory=deque,
+        init=False,
+        repr=False,
+    )
     _setup_finaliser_module: str | None = field(default=None, init=False, repr=False)
+    _post_setup_finaliser_module: str | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     @property
     def modules(self) -> tuple[str, ...]:
@@ -182,6 +193,47 @@ class Site:
             )
         await self._publish_pending_capability_events()
 
+    def defer_post_setup_finalisation(self, finaliser: SiteSetupFinaliser) -> None:
+        """Run an asynchronous finaliser after every module post-setup hook."""
+        if not callable(finaliser) or not (
+            iscoroutinefunction(finaliser)
+            or iscoroutinefunction(type(finaliser).__call__)
+        ):
+            raise SiteCapabilityError(
+                structured_error(
+                    "Deferred post-setup finaliser is invalid",
+                    finaliser_type=type(finaliser).__name__,
+                    expected="async_callable",
+                )
+            )
+        module_name = self._post_setup_finaliser_module
+        if module_name is None:
+            raise SiteCapabilityError(
+                "Deferred post-setup finalisers may only be registered from "
+                "post_setup_site."
+            )
+        self._post_setup_finalisers.append(
+            _DeferredSetupFinaliser(module_name, finaliser)
+        )
+
+    async def _finalise_deferred_post_setup(self) -> None:
+        while self._post_setup_finalisers:
+            deferred = self._post_setup_finalisers.popleft()
+
+            async def run_finaliser(
+                _site: Site,
+                finaliser: SiteSetupFinaliser = deferred.finaliser,
+            ) -> None:
+                await finaliser()
+
+            await _run_module_hook(
+                self,
+                module_name=deferred.module_name,
+                attribute=POST_SETUP_FINALISATION_ATTRIBUTE,
+                hook=run_finaliser,
+            )
+        await self._publish_pending_capability_events()
+
     @contextmanager
     def _registering_setup_finalisers(self, module_name: str) -> Iterator[None]:
         previous_module = self._setup_finaliser_module
@@ -190,6 +242,19 @@ class Site:
             yield
         finally:
             object.__setattr__(self, "_setup_finaliser_module", previous_module)
+
+    @contextmanager
+    def _registering_post_setup_finalisers(self, module_name: str) -> Iterator[None]:
+        previous_module = self._post_setup_finaliser_module
+        object.__setattr__(self, "_post_setup_finaliser_module", module_name)
+        try:
+            yield
+        finally:
+            object.__setattr__(
+                self,
+                "_post_setup_finaliser_module",
+                previous_module,
+            )
 
     async def _publish_pending_capability_events(self) -> None:
         """Publish capability registration observations at async boundaries."""
@@ -235,40 +300,18 @@ class Site:
             return
 
         from wybra.events import EventsCapability
+        from wybra.tasks import TasksCapability
 
         error_count = 0
         events = self.optional_capability(EventsCapability)
-        for capability in tuple(self._capabilities.values()):
-            if capability is events:
+        tasks = self.optional_capability(TasksCapability)
+        capabilities = tuple(self._capabilities.values())
+        if tasks is not None:
+            error_count += await self._close_capability(tasks)
+        for capability in capabilities:
+            if capability is events or capability is tasks:
                 continue
-            close = getattr(capability, "close", None)
-            if close is None:
-                continue
-            if not callable(close) or not iscoroutinefunction(close):
-                error_count += 1
-                logger.error(
-                    "Capability close hook must be async",
-                    extra={
-                        "capability": type(capability).__name__,
-                        "attribute": "close",
-                        "attribute_type": type(close).__name__,
-                    },
-                )
-                continue
-            try:
-                await close()
-            except BaseException as exc:
-                error_count += 1
-                logger.exception(
-                    "Capability close hook failed",
-                    extra={
-                        "capability": type(capability).__name__,
-                        "attribute": "close",
-                        "error_type": type(exc).__name__,
-                    },
-                )
-                if not isinstance(exc, Exception):
-                    raise
+            error_count += await self._close_capability(capability)
 
         await _publish_site_lifecycle(phase="shutdown", error_count=error_count)
         if events is not None:
@@ -285,6 +328,37 @@ class Site:
                     error_count=error_count,
                 )
             )
+
+    async def _close_capability(self, capability: object) -> int:
+        """Close one capability and return whether its hook failed."""
+        close = getattr(capability, "close", None)
+        if close is None:
+            return 0
+        if not callable(close) or not iscoroutinefunction(close):
+            logger.error(
+                "Capability close hook must be async",
+                extra={
+                    "capability": type(capability).__name__,
+                    "attribute": "close",
+                    "attribute_type": type(close).__name__,
+                },
+            )
+            return 1
+        try:
+            await close()
+        except BaseException as exc:
+            logger.exception(
+                "Capability close hook failed",
+                extra={
+                    "capability": type(capability).__name__,
+                    "attribute": "close",
+                    "error_type": type(exc).__name__,
+                },
+            )
+            if not isinstance(exc, Exception):
+                raise
+            return 1
+        return 0
 
 
 @dataclass(slots=True)
@@ -762,6 +836,7 @@ async def _compose_site(site: Site, module_loader: ModuleLoader) -> None:
     _register_configured_routes(site)
     _validate_registered_route_dependencies(site)
     await _post_setup_module_hooks(site, loaded_modules)
+    await site._finalise_deferred_post_setup()
 
 
 async def _setup_core_diagnostics(site: Site) -> None:
@@ -857,6 +932,17 @@ async def _run_module_hook(
     try:
         if attribute == SETUP_SITE_ATTRIBUTE:
             with site._registering_setup_finalisers(module_name):
+                await _invoke_module_hook(
+                    site,
+                    module_name=module_name,
+                    attribute=attribute,
+                    hook=async_hook,
+                )
+        elif attribute in {
+            POST_SETUP_SITE_ATTRIBUTE,
+            POST_SETUP_FINALISATION_ATTRIBUTE,
+        }:
+            with site._registering_post_setup_finalisers(module_name):
                 await _invoke_module_hook(
                     site,
                     module_name=module_name,

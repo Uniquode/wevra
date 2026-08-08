@@ -7,8 +7,16 @@ from taskiq import ScheduledTask
 from taskiq.cli.scheduler.run import is_time_task_now
 from taskiq.exceptions import ScheduledTaskCancelledError
 
-from wybra.cache import MAX_CACHE_FEATURE_LIMIT, InMemoryScheduleCache
-from wybra.tasks.taskiq_schedule import CacheTaskiqScheduleSource, TaskiqSchedulePolicy
+from wybra.cache import (
+    MAX_CACHE_FEATURE_LIMIT,
+    CacheTimeCapability,
+    InMemoryCacheTime,
+    InMemoryScheduleCache,
+)
+from wybra.tasks.taskiq_schedule import (
+    CacheTaskiqScheduleSource as _CacheTaskiqScheduleSource,
+)
+from wybra.tasks.taskiq_schedule import TaskiqSchedulePolicy
 
 
 class Clock:
@@ -17,6 +25,19 @@ class Clock:
 
     def __call__(self) -> float:
         return self.value
+
+
+def CacheTaskiqScheduleSource(
+    schedules: object,
+    *,
+    policy: TaskiqSchedulePolicy,
+    cache_time: CacheTimeCapability | None = None,
+) -> _CacheTaskiqScheduleSource:
+    return _CacheTaskiqScheduleSource(
+        schedules,
+        policy=policy,
+        cache_time=cache_time or InMemoryCacheTime(schedules.clock),
+    )
 
 
 class CountingAdvanceSchedules:
@@ -61,12 +82,49 @@ def _dispatch_task(
     return dispatch
 
 
+def test_schedule_source_requires_cache_time() -> None:
+    with pytest.raises(TypeError, match="cache_time"):
+        _CacheTaskiqScheduleSource(
+            InMemoryScheduleCache(),
+            policy=TaskiqSchedulePolicy(claimant="scheduler", claim_ttl_seconds=30),
+        )
+
+
 @pytest.mark.anyio
-async def test_cron_schedule_coalesces_an_outage_to_latest_matching_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_interval_schedule_uses_the_selected_cache_time() -> None:
+    provider_clock = Clock(1_000)
+    schedules = InMemoryScheduleCache(provider_clock)
+    policy = TaskiqSchedulePolicy(claimant="scheduler", claim_ttl_seconds=30)
+    task = ScheduledTask(
+        task_name="tests.interval",
+        labels={},
+        args=[],
+        kwargs={},
+        interval=timedelta(minutes=1),
+        schedule_id="interval",
+    )
+    producer = CacheTaskiqScheduleSource(
+        schedules,
+        policy=policy,
+        cache_time=InMemoryCacheTime(provider_clock),
+    )
+
+    await producer.add_schedule(task)
+    provider_clock.value = 1_001
+    consumer = CacheTaskiqScheduleSource(
+        schedules,
+        policy=policy,
+        cache_time=InMemoryCacheTime(provider_clock),
+    )
+
+    assert (
+        _dispatch_task(await consumer.get_schedules(), task).task_name == task.task_name
+    )
+
+
+@pytest.mark.anyio
+async def test_cron_schedule_coalesces_an_outage_to_latest_matching_run() -> None:
     clock = Clock(3_600)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,
@@ -87,11 +145,8 @@ async def test_cron_schedule_coalesces_an_outage_to_latest_matching_run(
 
 
 @pytest.mark.anyio
-async def test_cron_schedule_retains_only_the_configured_recent_missed_runs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_cron_schedule_retains_only_the_configured_recent_missed_runs() -> None:
     clock = Clock(3_600)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,
@@ -116,11 +171,8 @@ async def test_cron_schedule_retains_only_the_configured_recent_missed_runs(
 
 
 @pytest.mark.anyio
-async def test_one_time_schedule_converts_naive_local_time_to_utc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_one_time_schedule_converts_naive_local_time_to_utc() -> None:
     clock = Clock(0)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,
@@ -142,11 +194,8 @@ async def test_one_time_schedule_converts_naive_local_time_to_utc(
 
 
 @pytest.mark.anyio
-async def test_deleting_claimed_schedule_cancels_it_before_broker_send(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_deleting_claimed_schedule_cancels_it_before_broker_send() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     source = CacheTaskiqScheduleSource(
         InMemoryScheduleCache(clock),
         policy=TaskiqSchedulePolicy(claimant="scheduler", claim_ttl_seconds=30),
@@ -169,11 +218,8 @@ async def test_deleting_claimed_schedule_cancels_it_before_broker_send(
 
 
 @pytest.mark.anyio
-async def test_remote_deletion_cancels_a_claimed_schedule_before_broker_send(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_remote_deletion_cancels_a_claimed_schedule_before_broker_send() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     policy = TaskiqSchedulePolicy(claimant="scheduler-a", claim_ttl_seconds=30)
     source = CacheTaskiqScheduleSource(schedules, policy=policy)
@@ -199,11 +245,8 @@ async def test_remote_deletion_cancels_a_claimed_schedule_before_broker_send(
 
 
 @pytest.mark.anyio
-async def test_interval_schedule_dispatches_then_advances_to_its_next_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_interval_schedule_dispatches_then_advances_to_its_next_run() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,
@@ -324,11 +367,8 @@ async def test_cron_schedule_accepts_a_refresh_interval_above_one_minute() -> No
 
 
 @pytest.mark.anyio
-async def test_sparse_cron_waits_for_its_next_actual_occurrence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_sparse_cron_waits_for_its_next_actual_occurrence() -> None:
     clock = Clock(0)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     counting = CountingAdvanceSchedules(schedules)
     source = CacheTaskiqScheduleSource(
@@ -374,11 +414,8 @@ def test_schedule_policy_rejects_surrounding_whitespace(
 
 
 @pytest.mark.anyio
-async def test_schedule_policy_owner_isolates_schedule_sets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_schedule_policy_owner_isolates_schedule_sets() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     first = CacheTaskiqScheduleSource(
         schedules,
@@ -416,11 +453,8 @@ async def test_schedule_policy_owner_isolates_schedule_sets(
 
 
 @pytest.mark.anyio
-async def test_invalid_schedule_envelope_is_discarded_without_aborting_poll(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_invalid_schedule_envelope_is_discarded_without_aborting_poll() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,
@@ -444,11 +478,8 @@ async def test_invalid_schedule_envelope_is_discarded_without_aborting_poll(
 
 
 @pytest.mark.anyio
-async def test_deletion_between_send_hooks_does_not_fail_settlement(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_deletion_between_send_hooks_does_not_fail_settlement() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,
@@ -475,11 +506,8 @@ async def test_deletion_between_send_hooks_does_not_fail_settlement(
 
 
 @pytest.mark.anyio
-async def test_shutdown_releases_live_claims_after_a_stale_claim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_shutdown_releases_live_claims_after_a_stale_claim() -> None:
     clock = Clock(1_000)
-    monkeypatch.setattr("wybra.tasks.taskiq_schedule.time.time", clock)
     schedules = InMemoryScheduleCache(clock)
     source = CacheTaskiqScheduleSource(
         schedules,

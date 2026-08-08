@@ -381,3 +381,4 @@ _.delete_schedule
 _.get_schedules
 _.pre_send
 _.post_send
+_.make_delay

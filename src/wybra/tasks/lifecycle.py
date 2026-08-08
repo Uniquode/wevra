@@ -25,6 +25,7 @@ class TaskLifecycleKind(StrEnum):
     SCHEDULED = "scheduled"
     STARTED = "started"
     PROGRESS = "progress"
+    ATTEMPT_FAILED = "attempt_failed"
     RETRY_SCHEDULED = "retry_scheduled"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
@@ -46,6 +47,7 @@ _KIND_STATE: Final = {
     TaskLifecycleKind.SCHEDULED: TaskState.SCHEDULED,
     TaskLifecycleKind.STARTED: TaskState.RUNNING,
     TaskLifecycleKind.PROGRESS: TaskState.RUNNING,
+    TaskLifecycleKind.ATTEMPT_FAILED: TaskState.RUNNING,
     TaskLifecycleKind.RETRY_SCHEDULED: TaskState.RETRY_SCHEDULED,
     TaskLifecycleKind.SUCCEEDED: TaskState.SUCCEEDED,
     TaskLifecycleKind.FAILED: TaskState.FAILED,
@@ -54,25 +56,36 @@ _KIND_STATE: Final = {
 _ALLOWED_TRANSITIONS: Final = {
     None: frozenset({TaskLifecycleKind.SUBMITTED}),
     TaskState.SUBMITTED: frozenset(
-        {TaskLifecycleKind.SCHEDULED, TaskLifecycleKind.STARTED}
+        {
+            TaskLifecycleKind.SCHEDULED,
+            TaskLifecycleKind.STARTED,
+            TaskLifecycleKind.FAILED,
+        }
     ),
-    TaskState.SCHEDULED: frozenset({TaskLifecycleKind.STARTED}),
+    TaskState.SCHEDULED: frozenset(
+        {TaskLifecycleKind.STARTED, TaskLifecycleKind.FAILED}
+    ),
     TaskState.RUNNING: frozenset(
         {
+            TaskLifecycleKind.STARTED,
             TaskLifecycleKind.PROGRESS,
+            TaskLifecycleKind.ATTEMPT_FAILED,
             TaskLifecycleKind.RETRY_SCHEDULED,
             TaskLifecycleKind.SUCCEEDED,
             TaskLifecycleKind.FAILED,
         }
     ),
-    TaskState.RETRY_SCHEDULED: frozenset({TaskLifecycleKind.STARTED}),
+    TaskState.RETRY_SCHEDULED: frozenset(
+        {TaskLifecycleKind.STARTED, TaskLifecycleKind.FAILED}
+    ),
     TaskState.FAILED: frozenset({TaskLifecycleKind.DEAD_LETTERED}),
     TaskState.SUCCEEDED: frozenset(),
     TaskState.DEAD_LETTERED: frozenset(),
 }
-_TERMINAL_STATES: Final = frozenset(
+TERMINAL_TASK_STATES: Final = frozenset(
     {
         TaskState.SUCCEEDED,
+        TaskState.FAILED,
         TaskState.DEAD_LETTERED,
     }
 )
@@ -92,12 +105,33 @@ class TaskLifecycleEvent:
     correlation_id: UUID
     causation_id: UUID | None = None
     attempt: int = 1
+    delivery_attempt: int | None = None
+    _delivery_identity: str | None = field(default=None, repr=False)
     worker_id: str | None = None
     progress: Mapping[str, object] | None = field(default=None, repr=False)
     error_type: str | None = None
     occurred_at: float = field(default_factory=time.time)
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.schema_version, bool)
+            or not isinstance(self.schema_version, int)
+            or self.schema_version < 1
+        ):
+            raise TaskLifecycleError("Task schema version must be a positive integer.")
+        if self.delivery_attempt is not None and (
+            isinstance(self.delivery_attempt, bool)
+            or not isinstance(self.delivery_attempt, int)
+            or self.delivery_attempt < 1
+        ):
+            raise TaskLifecycleError(
+                "Task lifecycle delivery attempt must be a positive integer."
+            )
+        if self._delivery_identity is not None and (
+            not isinstance(self._delivery_identity, str)
+            or not self._delivery_identity.strip()
+        ):
+            raise TaskLifecycleError("Task lifecycle delivery identity is invalid.")
         if self.progress is None or isinstance(self.progress, SafeJsonMetadata):
             return
         try:
@@ -120,9 +154,12 @@ class TaskLifecycleEvent:
         correlation_id: UUID | None = None,
         causation_id: UUID | None = None,
         attempt: int = 1,
+        delivery_attempt: int | None = None,
+        _delivery_identity: str | None = None,
         worker_id: str | None = None,
         progress: Mapping[str, object] | None = None,
         error_type: str | None = None,
+        occurred_at: float | None = None,
     ) -> TaskLifecycleEvent:
         resolved_task_id = task_id or uuid7()
         return cls(
@@ -134,9 +171,12 @@ class TaskLifecycleEvent:
             correlation_id=correlation_id or resolved_task_id,
             causation_id=causation_id,
             attempt=attempt,
+            delivery_attempt=delivery_attempt,
+            _delivery_identity=_delivery_identity,
             worker_id=worker_id,
             progress=progress,
             error_type=error_type,
+            occurred_at=time.time() if occurred_at is None else occurred_at,
         )
 
 
@@ -155,11 +195,51 @@ class TaskStatus:
     worker_id: str | None = None
     progress: Mapping[str, object] | None = field(default=None, repr=False)
     error_type: str | None = None
+    delivery_attempt: int | None = None
+    _delivery_identity: str | None = field(default=None, repr=False)
+    terminal_at: float | None = None
+
+    def __post_init__(self) -> None:
+        terminal_state = self.state in TERMINAL_TASK_STATES
+        if terminal_state != (self.terminal_at is not None):
+            raise TaskLifecycleError(
+                "Task status terminal timestamp must match its terminal state."
+            )
+        if self.terminal_at is not None and (
+            isinstance(self.terminal_at, bool)
+            or not isinstance(self.terminal_at, int | float)
+            or not isfinite(self.terminal_at)
+        ):
+            raise TaskLifecycleError(
+                "Task status terminal timestamp must be a finite number."
+            )
+        if self.delivery_attempt is not None and (
+            isinstance(self.delivery_attempt, bool)
+            or not isinstance(self.delivery_attempt, int)
+            or self.delivery_attempt < 1
+        ):
+            raise TaskLifecycleError(
+                "Task status delivery attempt must be a positive integer."
+            )
+        if self._delivery_identity is not None and (
+            not isinstance(self._delivery_identity, str)
+            or not self._delivery_identity.strip()
+        ):
+            raise TaskLifecycleError("Task status delivery identity is invalid.")
+        if self.progress is None or isinstance(self.progress, SafeJsonMetadata):
+            return
+        try:
+            progress = safe_json_metadata(self.progress)
+        except (TypeError, ValueError) as exc:
+            raise TaskProgressError(
+                "Task progress must be JSON-compatible and within safe limits."
+            ) from exc
+        object.__setattr__(self, "progress", progress)
 
 
 @dataclass(slots=True)
 class TaskStatusProjection:
-    retention_seconds: float = DEFAULT_TASK_STATUS_RETENTION_SECONDS
+    retention_seconds: float | None = DEFAULT_TASK_STATUS_RETENTION_SECONDS
     history_limit: int = DEFAULT_TASK_HISTORY_LIMIT
     replay_limit: int | None = None
     _clock: Callable[[], float] = field(default=time.time, repr=False)
@@ -175,7 +255,7 @@ class TaskStatusProjection:
     )
 
     def __post_init__(self) -> None:
-        if (
+        if self.retention_seconds is not None and (
             isinstance(self.retention_seconds, bool)
             or not isinstance(self.retention_seconds, (int, float))
             or not isfinite(self.retention_seconds)
@@ -229,11 +309,8 @@ class TaskStatusProjection:
             )
         if current is not None:
             _validate_identity(current, event)
-            if event.occurred_at < current.updated_at:
-                raise TaskLifecycleError(
-                    "Task lifecycle event timestamp cannot move backwards."
-                )
         _validate_attempt(current, event)
+        _validate_worker(current, event)
         submitted_at = event.occurred_at if current is None else current.submitted_at
         status = TaskStatus(
             task_id=event.task_id,
@@ -245,12 +322,19 @@ class TaskStatusProjection:
             causation_id=event.causation_id,
             attempt=event.attempt,
             submitted_at=submitted_at,
-            updated_at=event.occurred_at,
-            worker_id=event.worker_id
-            if event.worker_id is not None
-            else (current.worker_id if current is not None else None),
+            updated_at=max(event.occurred_at, current.updated_at)
+            if current is not None
+            else event.occurred_at,
+            worker_id=_next_worker_id(current, event),
             progress=_next_progress(current, event),
-            error_type=event.error_type,
+            error_type=_next_error_type(current, event),
+            delivery_attempt=event.delivery_attempt
+            if event.delivery_attempt is not None
+            else (current.delivery_attempt if current is not None else None),
+            _delivery_identity=event._delivery_identity
+            if event._delivery_identity is not None
+            else (current._delivery_identity if current is not None else None),
+            terminal_at=_next_terminal_at(current, event),
         )
         self._statuses[event.task_id] = status
         self._history.setdefault(
@@ -268,12 +352,29 @@ class TaskStatusProjection:
         self._prune_expired(self._clock())
         return tuple(self._history.get(task_id, ()))
 
+    def restore(self, status: TaskStatus) -> None:
+        """Seed the projection from a persisted status snapshot."""
+        if not isinstance(status, TaskStatus):
+            raise TypeError("Task status snapshot must be a TaskStatus.")
+        self._prune_expired(self._clock())
+        current = self._statuses.get(status.task_id)
+        if current is None or status.updated_at >= current.updated_at:
+            self._statuses[status.task_id] = status
+
     def _prune_expired(self, now: float) -> None:
+        if self.retention_seconds is None:
+            return
         expired = tuple(
             task_id
             for task_id, status in self._statuses.items()
-            if status.state in _TERMINAL_STATES
-            and now - status.updated_at > self.retention_seconds
+            if status.state in TERMINAL_TASK_STATES
+            and now
+            - (
+                status.terminal_at
+                if status.terminal_at is not None
+                else status.updated_at
+            )
+            > self.retention_seconds
         )
         for task_id in expired:
             self._statuses.pop(task_id, None)
@@ -312,6 +413,8 @@ def _event_key(event: TaskLifecycleEvent) -> _TaskEventKey:
         event.correlation_id,
         event.causation_id,
         event.attempt,
+        event.delivery_attempt,
+        event._delivery_identity,
         event.worker_id,
         progress,
         event.error_type,
@@ -327,13 +430,66 @@ def _next_progress(
         return event.progress
     if current is None:
         return None
-    if (
-        current.state is TaskState.RETRY_SCHEDULED
-        and event.kind is TaskLifecycleKind.STARTED
-        and event.attempt > current.attempt
-    ):
+    if event.kind is TaskLifecycleKind.STARTED and _advances_delivery(current, event):
         return None
     return current.progress
+
+
+def _next_worker_id(
+    current: TaskStatus | None,
+    event: TaskLifecycleEvent,
+) -> str | None:
+    if event.worker_id is not None:
+        return event.worker_id
+    if current is None:
+        return None
+    if event.kind is TaskLifecycleKind.STARTED and _advances_delivery(current, event):
+        return None
+    return current.worker_id
+
+
+def _advances_delivery(
+    current: TaskStatus,
+    event: TaskLifecycleEvent,
+) -> bool:
+    if event.attempt > current.attempt:
+        return True
+    if event.attempt != current.attempt or event.delivery_attempt is None:
+        return False
+    if (
+        current._delivery_identity is not None
+        and event._delivery_identity != current._delivery_identity
+    ):
+        return False
+    return (
+        current.delivery_attempt is None
+        or event.delivery_attempt > current.delivery_attempt
+    )
+
+
+def _next_error_type(
+    current: TaskStatus | None,
+    event: TaskLifecycleEvent,
+) -> str | None:
+    if event.error_type is not None:
+        return event.error_type
+    if event.kind in {TaskLifecycleKind.STARTED, TaskLifecycleKind.SUCCEEDED}:
+        return None
+    return current.error_type if current is not None else None
+
+
+def _next_terminal_at(
+    current: TaskStatus | None,
+    event: TaskLifecycleEvent,
+) -> float | None:
+    if current is not None and current.terminal_at is not None:
+        return current.terminal_at
+    if event.kind in {TaskLifecycleKind.FAILED, TaskLifecycleKind.SUCCEEDED}:
+        return max(
+            event.occurred_at,
+            current.updated_at if current is not None else event.occurred_at,
+        )
+    return None
 
 
 def _validate_identity(
@@ -350,6 +506,65 @@ def _validate_identity(
         raise TaskLifecycleError(
             "Task lifecycle event identity does not match the current task."
         )
+
+
+def _validate_worker(
+    current: TaskStatus | None,
+    event: TaskLifecycleEvent,
+) -> None:
+    if current is None:
+        return
+    if event.kind is TaskLifecycleKind.STARTED:
+        if event.attempt > current.attempt:
+            return
+        if current.delivery_attempt is not None:
+            if (
+                current._delivery_identity is not None
+                and event._delivery_identity != current._delivery_identity
+            ):
+                raise TaskLifecycleError(
+                    "Task lifecycle start belongs to a distinct delivery."
+                )
+            if event.delivery_attempt is None:
+                raise TaskLifecycleError(
+                    "Task lifecycle start is missing delivery provenance."
+                )
+            if event.delivery_attempt > current.delivery_attempt:
+                return
+            if event.delivery_attempt < current.delivery_attempt:
+                raise TaskLifecycleError(
+                    "Task lifecycle start belongs to an earlier delivery."
+                )
+        if _worker_matches(current, event):
+            return
+        raise TaskLifecycleError(
+            "Task lifecycle start belongs to a worker replaced by a later delivery."
+        )
+    if (
+        current.delivery_attempt is not None
+        and event.delivery_attempt != current.delivery_attempt
+    ):
+        raise TaskLifecycleError(
+            "Task lifecycle event belongs to an earlier or unknown delivery."
+        )
+    if (
+        current._delivery_identity is not None
+        and event._delivery_identity != current._delivery_identity
+    ):
+        raise TaskLifecycleError("Task lifecycle event belongs to a distinct delivery.")
+    if _worker_matches(current, event):
+        return
+    raise TaskLifecycleError(
+        "Task lifecycle event belongs to a worker replaced by a later delivery."
+    )
+
+
+def _worker_matches(current: TaskStatus, event: TaskLifecycleEvent) -> bool:
+    return (
+        current.worker_id is None
+        or event.worker_id is None
+        or current.worker_id == event.worker_id
+    )
 
 
 def _validate_attempt(
@@ -384,4 +599,5 @@ __all__ = (
     "TaskState",
     "TaskStatus",
     "TaskStatusProjection",
+    "TERMINAL_TASK_STATES",
 )

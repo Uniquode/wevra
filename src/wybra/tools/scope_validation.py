@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AbstractAsyncContextManager
-from typing import Any, Protocol
+from typing import Protocol
 
 from wybra.core.composition import AppConfig
 from wybra.core.exceptions import ConfigurationError
 from wybra.scopes import ScopeDeclarationError, validate_site_scope_catalogue
 from wybra.site import SiteCapabilityError, get_site
+from wybra.tools.lifespan import configured_asgi_lifespan
 from wybra.tools.project import ProjectToolConfigurationError, import_from_string
 from wybra.tools.validation.core import ValidationCheck, ValidationResult
 
@@ -72,24 +72,9 @@ async def _validate_configured_scope_catalogue(
         )
 
     app = import_from_string(app_target.strip())
-    lifespan_context = _lifespan_context(app)
+    lifespan_context = configured_asgi_lifespan(app)
     async with lifespan_context:
         return await validate_site_scope_catalogue(get_site(app))
-
-
-def _lifespan_context(app: Any) -> AbstractAsyncContextManager[Any]:
-    router = getattr(app, "router", None)
-    factory = getattr(router, "lifespan_context", None)
-    if not callable(factory):
-        raise ProjectToolConfigurationError(
-            "Configured ASGI application does not expose a lifespan context."
-        )
-    context = factory(app)
-    if not isinstance(context, AbstractAsyncContextManager):
-        raise ProjectToolConfigurationError(
-            "Configured ASGI application lifespan is not an async context manager."
-        )
-    return context
 
 
 __all__ = (

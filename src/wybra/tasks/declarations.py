@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from inspect import BoundArguments, Parameter, Signature, iscoroutinefunction, signature
+from math import isfinite
 from typing import Any, get_type_hints, overload
 
 from pydantic import TypeAdapter, ValidationError
 
+from wybra.tasks.config import MINIMUM_TASK_VISIBILITY_TIMEOUT_SECONDS
 from wybra.tasks.context import (
     direct_task_context,
     reset_task_context,
@@ -20,16 +22,17 @@ from wybra.tasks.models import (
     TaskPayload,
     TaskPayloadError,
 )
-from wybra.tasks.registry import TaskRegistry, default_task_registry
+from wybra.tasks.registry import register_task_declaration
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class TaskDefinition[**P, R]:
     identity: TaskIdentity
     retry: RetryPolicy | None
     _function: Callable[P, Awaitable[R]] = field(repr=False)
     _signature: Signature = field(repr=False)
     _adapters: Mapping[str, TypeAdapter[Any]] = field(repr=False)
+    visibility_timeout_seconds: float | None = None
 
     def payload(self, *args: P.args, **kwargs: P.kwargs) -> TaskPayload:
         bound = self._validated_bound_arguments(*args, **kwargs)
@@ -101,7 +104,7 @@ def task[**P, R](
     name: str | None = None,
     version: int = 1,
     retry: RetryPolicy | None = None,
-    registry: TaskRegistry = default_task_registry,
+    visibility_timeout_seconds: float | None = None,
 ) -> TaskDefinition[P, R]: ...
 
 
@@ -113,7 +116,7 @@ def task[**P, R](
     name: str | None = None,
     version: int = 1,
     retry: RetryPolicy | None = None,
-    registry: TaskRegistry = default_task_registry,
+    visibility_timeout_seconds: float | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], TaskDefinition[P, R]]: ...
 
 
@@ -124,7 +127,7 @@ def task[**P, R](
     name: str | None = None,
     version: int = 1,
     retry: RetryPolicy | None = None,
-    registry: TaskRegistry = default_task_registry,
+    visibility_timeout_seconds: float | None = None,
 ) -> TaskDefinition[P, R] | Callable[[Callable[P, Awaitable[R]]], TaskDefinition[P, R]]:
     def declare(
         task_function: Callable[P, Awaitable[R]],
@@ -140,11 +143,15 @@ def task[**P, R](
         definition = TaskDefinition(
             identity=identity,
             retry=retry,
+            visibility_timeout_seconds=_visibility_timeout(
+                visibility_timeout_seconds,
+            ),
             _function=task_function,
             _signature=task_signature,
             _adapters=_argument_adapters(task_function, task_signature),
         )
-        return registry.register(definition)
+        register_task_declaration(_declaring_module(task_function), definition)
+        return definition
 
     if function is None:
         return declare
@@ -157,6 +164,13 @@ def _derived_task_name(function: Callable[..., object]) -> str:
         raise TaskDeclarationError("Task callables must have a qualified name.")
     qualified_name = qualified_name_value.replace(".<locals>", "")
     return f"{function.__module__}.{qualified_name}"
+
+
+def _declaring_module(function: Callable[..., object]) -> str:
+    module_name = getattr(function, "__module__", None)
+    if not isinstance(module_name, str) or not module_name:
+        raise TaskDeclarationError("Task callables must belong to a Python module.")
+    return module_name
 
 
 def _validate_signature(task_signature: Signature) -> None:
@@ -195,6 +209,26 @@ def _validated_argument(
 ) -> object:
     del parameter
     return adapter.validate_python(value)
+
+
+def _visibility_timeout(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not isfinite(value)
+        or value <= 0
+    ):
+        raise TaskDeclarationError(
+            "Task visibility timeout must be a positive finite number."
+        )
+    if value < MINIMUM_TASK_VISIBILITY_TIMEOUT_SECONDS:
+        raise TaskDeclarationError(
+            "Task visibility timeout must be at least "
+            f"{MINIMUM_TASK_VISIBILITY_TIMEOUT_SECONDS} seconds."
+        )
+    return float(value)
 
 
 __all__ = ("TaskDefinition", "task")

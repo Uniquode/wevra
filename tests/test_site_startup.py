@@ -35,6 +35,7 @@ from wybra.errors.capabilities import ErrorHandlingCapability
 from wybra.errors.handlers import EmptyBodyResponseException
 from wybra.site import _local_file_uri_path, start
 from wybra.site_config import app_config_from_site
+from wybra.tasks import TaskFeatures, TasksCapability
 from wybra.testing import WybraTestClient
 
 
@@ -76,6 +77,38 @@ class ClosingCapability:
 class SyncClosingCapability:
     def close(self) -> None:
         pass
+
+
+class OrderedClosingCapability:
+    def __init__(self, name: str, closed: list[str]) -> None:
+        self.name = name
+        self.closed = closed
+
+    async def close(self) -> None:
+        self.closed.append(self.name)
+
+
+class DependentClosingCapability(OrderedClosingCapability):
+    pass
+
+
+class ClosingTasksCapability:
+    features = TaskFeatures()
+
+    def __init__(self, closed: list[str]) -> None:
+        self.closed = closed
+
+    async def submit(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("Task submission is not exercised by this test.")
+
+    async def status(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("Task status is not exercised by this test.")
+
+    async def lifecycle(self, *args: object, **kwargs: object) -> object:
+        raise AssertionError("Task lifecycle is not exercised by this test.")
+
+    async def close(self) -> None:
+        self.closed.append("tasks")
 
 
 def _write_app_config(
@@ -1035,6 +1068,40 @@ class TestSiteComposition:
         assert site.has_capability(ClosingCapability) is False
 
         await site.close()
+
+    @pytest.mark.anyio
+    async def test_site_close_preserves_registration_order_for_capabilities(
+        self,
+    ) -> None:
+        site = await start(
+            FastAPI(),
+            config_source=MappingConfigSource({"app": {"modules": ()}}),
+        )
+        closed: list[str] = []
+        dependant = DependentClosingCapability("dependant", closed)
+        provider = OrderedClosingCapability("provider", closed)
+        site.provide_capability(DependentClosingCapability, dependant)
+        site.provide_capability(OrderedClosingCapability, provider)
+
+        await site.close()
+
+        assert closed == ["dependant", "provider"]
+
+    @pytest.mark.anyio
+    async def test_site_close_closes_tasks_before_their_cache_provider(self) -> None:
+        site = await start(
+            FastAPI(),
+            config_source=MappingConfigSource({"app": {"modules": ()}}),
+        )
+        closed: list[str] = []
+        provider = OrderedClosingCapability("cache", closed)
+        tasks = ClosingTasksCapability(closed)
+        site.provide_capability(OrderedClosingCapability, provider)
+        site.provide_capability(TasksCapability, tasks)
+
+        await site.close()
+
+        assert closed == ["tasks", "cache"]
 
     @pytest.mark.anyio
     async def test_site_close_reports_invalid_hooks_after_closing_capabilities(

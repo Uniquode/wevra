@@ -12,12 +12,19 @@ from taskiq.utils import maybe_awaitable
 
 from wybra.cache import (
     CacheConflictError,
+    CacheFeatureError,
     InMemoryWorkQueue,
     WorkDelivery,
     WorkIdentity,
     WorkQueueCacheCapability,
 )
+from wybra.tasks.lifecycle import TaskLifecycleError
 from wybra.tasks.taskiq_broker import CacheTaskiqBroker, TaskiqBrokerPolicy
+from wybra.tasks.taskiq_protocol import (
+    DELIVERY_ATTEMPT_LABEL,
+    DELIVERY_RECEIPT_LABEL,
+    TASK_VISIBILITY_TIMEOUT_LABEL,
+)
 
 
 @dataclass
@@ -41,6 +48,24 @@ class FailingReserveWorkQueue:
     async def reserve(self, *args: object, **kwargs: object) -> None:
         del args, kwargs
         raise AssertionError("A stopped broker must not reserve work.")
+
+
+class FailFirstDeadLetterReadWorkQueue(InMemoryWorkQueue):
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_next_dead_letter_read = True
+
+    async def dead_letters(
+        self,
+        owner: str,
+        queue: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[WorkDelivery, ...]:
+        if self._fail_next_dead_letter_read:
+            self._fail_next_dead_letter_read = False
+            raise CacheFeatureError("Dead-letter store temporarily unavailable.")
+        return await super().dead_letters(owner, queue, limit=limit)
 
 
 @dataclass
@@ -233,6 +258,7 @@ async def _acknowledge(message: AckableMessage) -> None:
         (30, float("inf"), 3, "Wait timeout"),
         (30, True, 3, "Wait timeout"),
         (30, 1, 0, "Maximum delivery attempts"),
+        (30, 1, 4, "Maximum delivery attempts"),
         (30, 1, True, "Maximum delivery attempts"),
     ),
 )
@@ -248,6 +274,26 @@ def test_taskiq_broker_policy_rejects_invalid_delivery_controls(
             wait_timeout_seconds=wait_timeout_seconds,
             maximum_delivery_attempts=maximum_delivery_attempts,
         )
+
+
+def test_taskiq_broker_does_not_shorten_default_delivery_visibility() -> None:
+    broker = CacheTaskiqBroker(
+        InMemoryWorkQueue(),
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=30,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=3,
+        ),
+    )
+
+    assert (
+        broker.delivery_visibility_timeout(
+            {TASK_VISIBILITY_TIMEOUT_LABEL: 1},
+        )
+        == 30
+    )
 
 
 @pytest.mark.parametrize(
@@ -336,7 +382,147 @@ async def test_cache_taskiq_broker_preserves_taskiq_task_identity() -> None:
     assert restored.task_name == "tests.example"
     assert restored.args == [1]
     assert restored.kwargs == {"name": "Wybra"}
+    assert restored.labels[DELIVERY_ATTEMPT_LABEL] == 1
+    assert isinstance(restored.labels[DELIVERY_RECEIPT_LABEL], str)
     await _acknowledge(received)
+    await listener.aclose()
+
+
+@pytest.mark.anyio
+async def test_broker_keeps_unvalidated_delivery_at_default_visibility() -> None:
+    clock = FakeClock()
+    work_queue = InMemoryWorkQueue(clock)
+    broker = CacheTaskiqBroker(
+        work_queue,
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=0.1,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=3,
+        ),
+    )
+    message = broker.formatter.dumps(
+        TaskiqMessage(
+            task_id="task-123",
+            task_name="tests.removed",
+            labels={TASK_VISIBILITY_TIMEOUT_LABEL: 1},
+            args=[],
+            kwargs={},
+        )
+    )
+
+    await broker.kick(message)
+    listener = broker.listen()
+    received = _require_ackable(await anext(listener))
+    restored = broker.formatter.loads(message=received.data)
+    receipt = restored.labels[DELIVERY_RECEIPT_LABEL]
+
+    assert isinstance(receipt, str)
+    assert broker.delivery_visibility_timeout(restored.labels) == 1
+    await broker.relinquish_delivery(receipt)
+    with pytest.raises(CacheConflictError, match="stale or no longer reserved"):
+        await broker.renew_delivery(receipt, visibility_timeout=1)
+    clock.advance(0.2)
+    redelivered = await work_queue.reserve(
+        "taskiq-broker",
+        "default",
+        "worker-2",
+        visibility_timeout=0.1,
+    )
+    assert redelivered is not None
+    assert redelivered.payload == message.message
+    await work_queue.acknowledge(redelivered)
+    await listener.aclose()
+
+
+@pytest.mark.anyio
+async def test_cache_taskiq_broker_does_not_restore_delivery_after_acknowledgement_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work_queue = InMemoryWorkQueue()
+    broker = CacheTaskiqBroker(
+        work_queue,
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=1,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=3,
+        ),
+    )
+    renewal_completed = asyncio.Event()
+    release_renewal = asyncio.Event()
+    original_renew = InMemoryWorkQueue.renew
+
+    async def held_renew(
+        queue: InMemoryWorkQueue,
+        *args: object,
+        **kwargs: object,
+    ) -> WorkDelivery:
+        renewed = await original_renew(queue, *args, **kwargs)
+        renewal_completed.set()
+        await release_renewal.wait()
+        return renewed
+
+    monkeypatch.setattr(InMemoryWorkQueue, "renew", held_renew)
+    message = broker.formatter.dumps(
+        TaskiqMessage(
+            task_id="task-123",
+            task_name="tests.example",
+            labels={},
+            args=[],
+            kwargs={},
+        )
+    )
+    await broker.kick(message)
+    listener = broker.listen()
+    received = _require_ackable(await anext(listener))
+    restored = broker.formatter.loads(message=received.data)
+    receipt = restored.labels[DELIVERY_RECEIPT_LABEL]
+
+    assert isinstance(receipt, str)
+    renewal = asyncio.create_task(broker.renew_delivery(receipt, visibility_timeout=1))
+    await renewal_completed.wait()
+    await _acknowledge(received)
+    release_renewal.set()
+
+    with pytest.raises(CacheConflictError, match="stale or no longer reserved"):
+        await renewal
+
+    assert receipt not in broker._outstanding_deliveries
+    await listener.aclose()
+
+
+@pytest.mark.anyio
+async def test_cache_taskiq_broker_settles_inflight_delivery_after_shutdown() -> None:
+    broker = CacheTaskiqBroker(
+        InMemoryWorkQueue(),
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=30,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=3,
+        ),
+    )
+    message = broker.formatter.dumps(
+        TaskiqMessage(
+            task_id="task-123",
+            task_name="tests.example",
+            labels={},
+            args=[],
+            kwargs={},
+        )
+    )
+
+    await broker.kick(message)
+    listener = broker.listen()
+    received = _require_ackable(await anext(listener))
+
+    await broker.shutdown()
+    await _acknowledge(received)
+
     await listener.aclose()
 
 
@@ -728,6 +914,55 @@ async def test_cache_taskiq_broker_delivers_to_independent_consumers() -> None:
 
 
 @pytest.mark.anyio
+async def test_cache_taskiq_broker_renews_expired_delivery_until_recovered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = FakeClock()
+    monkeypatch.setattr("wybra.tasks.taskiq_broker.monotonic", clock)
+    work_queue = InMemoryWorkQueue(clock)
+    broker = CacheTaskiqBroker(
+        work_queue,
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=30,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=3,
+        ),
+    )
+    await broker.kick(
+        broker.formatter.dumps(
+            TaskiqMessage(
+                task_id="task-conditional-ownership",
+                task_name="tests.example",
+                labels={},
+                args=[],
+                kwargs={},
+            )
+        )
+    )
+    listener = broker.listen()
+    delivery = _require_ackable(await anext(listener))
+    message = broker.formatter.loads(message=delivery.data)
+    receipt = message.labels[DELIVERY_RECEIPT_LABEL]
+    assert isinstance(receipt, str)
+
+    clock.advance(30)
+    await broker.renew_delivery(receipt, visibility_timeout=30)
+    assert (
+        await work_queue.reserve(
+            "taskiq-broker",
+            "default",
+            "worker-2",
+            visibility_timeout=30,
+        )
+        is None
+    )
+    await _acknowledge(delivery)
+    await listener.aclose()
+
+
+@pytest.mark.anyio
 async def test_cache_taskiq_broker_redelivers_unacknowledged_work() -> None:
     clock = FakeClock()
     work_queue = InMemoryWorkQueue(clock)
@@ -750,11 +985,14 @@ async def test_cache_taskiq_broker_redelivers_unacknowledged_work() -> None:
     )
 
     await first_broker.kick(
-        BrokerMessage(
-            task_id="task-123",
-            task_name="tests.example",
-            message=b"taskiq-message",
-            labels={},
+        first_broker.formatter.dumps(
+            TaskiqMessage(
+                task_id="task-123",
+                task_name="tests.example",
+                labels={},
+                args=[],
+                kwargs={},
+            )
         )
     )
     first_listener = first_broker.listen()
@@ -764,7 +1002,13 @@ async def test_cache_taskiq_broker_redelivers_unacknowledged_work() -> None:
     second_listener = second_broker.listen()
     second_delivery = _require_ackable(await anext(second_listener))
 
-    assert second_delivery.data == first_delivery.data
+    first_message = first_broker.formatter.loads(message=first_delivery.data)
+    second_message = second_broker.formatter.loads(message=second_delivery.data)
+    assert first_message.task_id == second_message.task_id == "task-123"
+    assert [
+        first_message.labels[DELIVERY_ATTEMPT_LABEL],
+        second_message.labels[DELIVERY_ATTEMPT_LABEL],
+    ] == [1, 2]
     with pytest.raises(CacheConflictError, match="stale or no longer reserved"):
         await _acknowledge(first_delivery)
     await _acknowledge(second_delivery)
@@ -829,6 +1073,114 @@ async def test_cache_taskiq_broker_dead_letters_after_delivery_attempts() -> Non
         await _acknowledge(second_delivery)
     await first_listener.aclose()
     await second_listener.aclose()
+
+
+@pytest.mark.anyio
+async def test_broker_observes_retained_dead_letter_once() -> None:
+    clock = FakeClock()
+    work_queue = InMemoryWorkQueue(clock)
+    observations = 0
+
+    async def invalid_lifecycle_metadata(_message: TaskiqMessage) -> None:
+        nonlocal observations
+        observations += 1
+        raise TaskLifecycleError("dead-letter metadata is invalid")
+
+    broker = CacheTaskiqBroker(
+        work_queue,
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=30,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=1,
+        ),
+        on_delivery_exhausted=invalid_lifecycle_metadata,
+    )
+    await broker.kick(
+        broker.formatter.dumps(
+            TaskiqMessage(
+                task_id="dead-letter",
+                task_name="tests.example",
+                labels={},
+                args=[],
+                kwargs={},
+            )
+        )
+    )
+    first_listener = broker.listen()
+    assert isinstance(await anext(first_listener), AckableMessage)
+    await first_listener.aclose()
+    clock.advance(30)
+    assert (
+        await work_queue.reserve(
+            "taskiq-broker",
+            "default",
+            "worker-2",
+            visibility_timeout=30,
+        )
+        is None
+    )
+    assert await work_queue.dead_letters("taskiq-broker", "default")
+
+    await broker._observe_delivery_exhaustion()
+    await broker._observe_delivery_exhaustion()
+
+    assert observations == 1
+
+    await broker.kick(
+        broker.formatter.dumps(
+            TaskiqMessage(
+                task_id="live-work",
+                task_name="tests.example",
+                labels={},
+                args=[],
+                kwargs={},
+            )
+        )
+    )
+    listener = broker.listen()
+    delivered = await anext(listener)
+
+    assert isinstance(delivered, AckableMessage)
+    await listener.aclose()
+
+
+@pytest.mark.anyio
+async def test_broker_continues_after_transient_dead_letter_read_failure() -> None:
+    work_queue = FailFirstDeadLetterReadWorkQueue()
+
+    async def observe_dead_letter(_message: TaskiqMessage) -> None:
+        return None
+
+    broker = CacheTaskiqBroker(
+        work_queue,
+        queue="default",
+        consumer="worker-1",
+        policy=TaskiqBrokerPolicy(
+            visibility_timeout_seconds=30,
+            wait_timeout_seconds=1,
+            maximum_delivery_attempts=1,
+        ),
+        on_delivery_exhausted=observe_dead_letter,
+    )
+    await broker.kick(
+        broker.formatter.dumps(
+            TaskiqMessage(
+                task_id="live-work",
+                task_name="tests.example",
+                labels={},
+                args=[],
+                kwargs={},
+            )
+        )
+    )
+
+    listener = broker.listen()
+    delivered = await anext(listener)
+
+    assert isinstance(delivered, AckableMessage)
+    await listener.aclose()
 
 
 @pytest.mark.anyio

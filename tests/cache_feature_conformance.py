@@ -117,6 +117,12 @@ async def assert_lease_conformance(
     )
 
     renewed = await feature.renew(first, ttl=renewed_ttl)
+    assert renewed.owner == first.owner
+    assert renewed.resource == first.resource
+    assert renewed.holder == first.holder
+    assert renewed.token == first.token
+    assert renewed.fencing_token == first.fencing_token
+    assert renewed.expires_at > first.expires_at
     await feature.release(renewed)
     with pytest.raises(CacheConflictError):
         await feature.release(renewed)
@@ -135,6 +141,56 @@ async def assert_lease_conformance(
         await feature.release(second)
 
 
+async def assert_lease_fenced_mutation_conformance(
+    atomic: AtomicCacheCapability,
+    streams: StreamCacheCapability,
+    leases: LeaseCacheCapability,
+    advance: AdvanceClock,
+    *,
+    owner: str = "conformance-fence",
+    lease_ttl: float = 5,
+) -> None:
+    first = await leases.acquire(owner, "resource", "holder-1", ttl=lease_ttl)
+    assert first is not None
+    live = await atomic.create(owner, "value", b"live", ttl=30, lease=first)
+    assert live is not None
+    position = await streams.append(owner, "events", b"live", lease=first)
+    assert position.value == 1
+
+    await advance(lease_ttl)
+    second = await leases.acquire(owner, "resource", "holder-2", ttl=lease_ttl)
+    assert second is not None
+
+    with pytest.raises(CacheConflictError):
+        await atomic.create(owner, "stale-create", b"stale", ttl=30, lease=first)
+    with pytest.raises(CacheConflictError):
+        await atomic.compare_and_swap(
+            owner,
+            "value",
+            live.revision,
+            b"stale",
+            ttl=30,
+            lease=first,
+        )
+    with pytest.raises(CacheConflictError):
+        await atomic.compare_and_delete(
+            owner,
+            "value",
+            live.revision,
+            lease=first,
+        )
+    with pytest.raises(CacheConflictError):
+        await streams.append(owner, "events", b"stale", lease=first)
+
+    current = await atomic.get(owner, "value")
+    assert current is not None
+    assert current.value == b"live"
+    assert await atomic.get(owner, "stale-create") is None
+    assert [record.payload for record in await streams.read(owner, "events")] == [
+        b"live"
+    ]
+
+
 async def assert_work_queue_conformance(
     feature: WorkQueueCacheCapability,
     advance: AdvanceClock,
@@ -151,6 +207,34 @@ async def assert_work_queue_conformance(
     assert first is not None
     assert first.identity == identity
 
+    renewed = await feature.renew(first, visibility_timeout=10)
+    assert renewed.identity == first.identity
+    assert renewed.attempt == first.attempt
+    assert renewed.receipt == first.receipt
+    assert renewed.visible_until > first.visible_until
+
+    await advance(5)
+    assert (
+        await feature.reserve(
+            owner,
+            "visibility",
+            "worker-2",
+            visibility_timeout=5,
+        )
+        is None
+    )
+    await advance(5)
+    conditionally_renewed = await feature.renew(renewed, visibility_timeout=5)
+    assert conditionally_renewed.receipt == renewed.receipt
+    assert (
+        await feature.reserve(
+            owner,
+            "visibility",
+            "worker-2",
+            visibility_timeout=5,
+        )
+        is None
+    )
     await advance(5)
     second = await feature.reserve(
         owner,
@@ -161,6 +245,8 @@ async def assert_work_queue_conformance(
     assert second is not None
     assert second.identity == identity
     assert second.attempt == 2
+    with pytest.raises(CacheConflictError):
+        await feature.acknowledge(conditionally_renewed)
     await feature.reject(second, delay=5)
     assert (
         await feature.reserve(
@@ -182,6 +268,73 @@ async def assert_work_queue_conformance(
     assert third.identity == identity
     assert third.attempt == 3
     await feature.acknowledge(third)
+
+    acknowledged_identity = await feature.publish(
+        owner,
+        "conditional-acknowledgement",
+        b"acknowledged",
+    )
+    acknowledged = await feature.reserve(
+        owner,
+        "conditional-acknowledgement",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert acknowledged is not None
+    await advance(5)
+    await feature.acknowledge(acknowledged)
+    assert (
+        await feature.reserve(
+            owner,
+            "conditional-acknowledgement",
+            "worker",
+            visibility_timeout=5,
+        )
+        is None
+    )
+    assert acknowledged.identity == acknowledged_identity
+
+    retried_identity = await feature.publish(
+        owner,
+        "conditional-retry",
+        b"retried",
+    )
+    retried = await feature.reserve(
+        owner,
+        "conditional-retry",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert retried is not None
+    await advance(5)
+    await feature.reject(retried)
+    retried_again = await feature.reserve(
+        owner,
+        "conditional-retry",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert retried_again is not None
+    assert retried_again.identity == retried_identity
+    assert retried_again.attempt == 2
+    await feature.acknowledge(retried_again)
+
+    dead_identity = await feature.publish(
+        owner,
+        "conditional-dead-letter",
+        b"dead",
+    )
+    dead = await feature.reserve(
+        owner,
+        "conditional-dead-letter",
+        "worker",
+        visibility_timeout=5,
+    )
+    assert dead is not None
+    await advance(5)
+    await feature.dead_letter(dead)
+    dead_letters = await feature.dead_letters(owner, "conditional-dead-letter")
+    assert [entry.identity for entry in dead_letters] == [dead_identity]
 
     delayed_identity = await feature.publish(
         owner,
@@ -490,6 +643,7 @@ __all__ = (
     "AdvanceClock",
     "assert_atomic_conformance",
     "assert_lease_conformance",
+    "assert_lease_fenced_mutation_conformance",
     "assert_pubsub_conformance",
     "assert_schedule_conformance",
     "assert_stream_conformance",

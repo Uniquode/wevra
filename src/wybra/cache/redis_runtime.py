@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from math import ceil
@@ -43,10 +44,15 @@ from wybra.core.exceptions import ConfigurationError
 ResultT = TypeVar("ResultT")
 logger = logging.getLogger(__name__)
 MAX_REDIS_TTL_MILLISECONDS = 2**62
+_CACHE_TIME_MINIMUM_REFRESH_SECONDS = 60.0
+_CACHE_TIME_TARGET_REFRESH_SECONDS = 300.0
+_CACHE_TIME_MAXIMUM_REFRESH_SECONDS = 600.0
+_CACHE_TIME_DRIFT_TOLERANCE_SECONDS = 1.0
 
 _ADVANCED_FEATURES = frozenset(
     {"atomic", "lease", "pub-sub", "schedule", "stream", "work-queue"}
 )
+_READINESS_FEATURES = _ADVANCED_FEATURES | {"time"}
 _DURABLE_FEATURES = frozenset({"atomic", "lease", "schedule", "stream", "work-queue"})
 _ATOMIC_READINESS_SCRIPT = """
 if redis.call('exists', KEYS[1]) ~= 0 then
@@ -112,10 +118,51 @@ class RedisCacheRuntime:
     namespace: str | None = None
     _client: Any = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _closing: bool = field(default=False, init=False, repr=False)
+    _close_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _time_offset: float | None = field(default=None, init=False, repr=False)
+    _time_provider_at_calibration: float | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _time_wall_at_calibration: float | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _time_monotonic_at_calibration: float | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _time_failure_monotonic: float | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _time_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+    _wall_clock: Callable[[], float] = field(
+        default=time.time,
+        init=False,
+        repr=False,
+    )
+    _monotonic_clock: Callable[[], float] = field(
+        default=time.monotonic,
+        init=False,
+        repr=False,
+    )
 
     def client(self) -> Any:
-        if self._closed:
-            raise CacheFeatureError("The Redis cache backend is closed.")
+        self._require_open()
         if self._client is None:
             try:
                 redis_module = importlib.import_module("redis.asyncio")
@@ -145,17 +192,118 @@ class RedisCacheRuntime:
         if healthy is not True:
             raise ConfigurationError("Redis cache backend health check failed.")
 
+    async def refresh_time(self) -> float:
+        """Return locally cached time calibrated from Redis TIME when required."""
+        self._require_open()
+        if not self._time_refresh_required():
+            return self.cache_time()
+        async with self._time_lock:
+            self._require_open()
+            if not self._time_refresh_required():
+                return self.cache_time()
+            if self._time_failure_is_recent():
+                return self.cache_time()
+
+            async def read_time(client: Any) -> object:
+                return await client.time()
+
+            try:
+                provider_time = _redis_time(
+                    await self.feature_call(read_time),
+                )
+            except CacheFeatureError:
+                self._time_failure_monotonic = validate_finite(
+                    self._monotonic_clock(),
+                    label="monotonic time",
+                )
+                return self.cache_time()
+            self._require_open()
+            wall_time = validate_finite(self._wall_clock(), label="system time")
+            monotonic_time = validate_finite(
+                self._monotonic_clock(),
+                label="monotonic time",
+            )
+            self._time_offset = provider_time - wall_time
+            self._time_provider_at_calibration = provider_time
+            self._time_wall_at_calibration = wall_time
+            self._time_monotonic_at_calibration = monotonic_time
+            self._time_failure_monotonic = None
+            return provider_time
+
+    def cache_time(self) -> float:
+        """Return the latest calibrated Redis timestamp without remote I/O."""
+        self._require_open()
+        offset = self._time_offset
+        provider_time = self._time_provider_at_calibration
+        wall_at_calibration = self._time_wall_at_calibration
+        monotonic_at_calibration = self._time_monotonic_at_calibration
+        if (
+            offset is None
+            or provider_time is None
+            or wall_at_calibration is None
+            or monotonic_at_calibration is None
+        ):
+            raise CacheFeatureError("Redis cache time has not been calibrated.")
+        wall_time = validate_finite(self._wall_clock(), label="system time")
+        monotonic_time = validate_finite(
+            self._monotonic_clock(),
+            label="monotonic time",
+        )
+        elapsed = max(0.0, monotonic_time - monotonic_at_calibration)
+        if elapsed >= _CACHE_TIME_MAXIMUM_REFRESH_SECONDS:
+            raise CacheFeatureError("Redis cache time calibration has expired.")
+        wall_elapsed = wall_time - wall_at_calibration
+        if abs(wall_elapsed - elapsed) > _CACHE_TIME_DRIFT_TOLERANCE_SECONDS:
+            return provider_time + elapsed
+        return wall_time + offset
+
+    def _time_refresh_required(self) -> bool:
+        calibrated_at = self._time_monotonic_at_calibration
+        if calibrated_at is None:
+            return True
+        monotonic_time = validate_finite(
+            self._monotonic_clock(),
+            label="monotonic time",
+        )
+        age = max(0.0, monotonic_time - calibrated_at)
+        if age >= _CACHE_TIME_MAXIMUM_REFRESH_SECONDS:
+            return True
+        if age < _CACHE_TIME_MINIMUM_REFRESH_SECONDS:
+            return False
+        wall_at_calibration = self._time_wall_at_calibration
+        if wall_at_calibration is None:
+            return True
+        wall_elapsed = (
+            validate_finite(
+                self._wall_clock(),
+                label="system time",
+            )
+            - wall_at_calibration
+        )
+        if abs(wall_elapsed - age) > _CACHE_TIME_DRIFT_TOLERANCE_SECONDS:
+            return True
+        return age >= _CACHE_TIME_TARGET_REFRESH_SECONDS
+
+    def _time_failure_is_recent(self) -> bool:
+        failed_at = self._time_failure_monotonic
+        if failed_at is None:
+            return False
+        now = validate_finite(self._monotonic_clock(), label="monotonic time")
+        return max(0.0, now - failed_at) < _CACHE_TIME_MINIMUM_REFRESH_SECONDS
+
     async def validate_features(self, features: frozenset[str]) -> None:
         """Verify Redis can safely provide the selected advanced features."""
-        if not features & _ADVANCED_FEATURES:
+        if not features & _READINESS_FEATURES:
             return
-        if self.namespace is None:
+        if features & _ADVANCED_FEATURES and self.namespace is None:
             raise ConfigurationError(
                 "Advanced Redis cache features require an instance namespace."
             )
         suffix = uuid4().hex
         try:
             client = self.client()
+            if "time" in features:
+                _redis_time(await client.time())
             if features & _DURABLE_FEATURES:
                 await self._validate_advanced_configuration(client)
             if "atomic" in features:
@@ -319,12 +467,16 @@ class RedisCacheRuntime:
                 try:
                     result = await client.eval(
                         STREAM_APPEND_SCRIPT,
-                        2,
+                        3,
                         stream_key,
                         sequence_key,
+                        self.key("readiness", "cache", f"stream-fence-{suffix}"),
                         b"readiness",
                         1,
                         300_000,
+                        "",
+                        "",
+                        0,
                     )
                     _validate_stream_result(result)
                     result = await client.eval(
@@ -652,6 +804,10 @@ class RedisCacheRuntime:
                 "Redis cache backend cannot provide the configured advanced features."
             ) from None
 
+    def _require_open(self) -> None:
+        if self._closed or self._closing:
+            raise CacheFeatureError("The Redis cache backend is closed.")
+
     async def _validate_advanced_configuration(self, client: Any) -> None:
         try:
             configuration = await client.config_get("appendonly", "maxmemory-policy")
@@ -786,21 +942,27 @@ class RedisCacheRuntime:
         return milliseconds
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        client = self._client
-        if client is None:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            client = self._client
+            if client is None:
+                self._closed = True
+                return
+            try:
+                await client.aclose()
+            except asyncio.CancelledError:
+                self._closing = False
+                raise
+            except Exception as exc:
+                self._closing = False
+                _log_failure("shutdown", exc)
+                raise CacheFeatureError(
+                    "Redis cache backend shutdown failed."
+                ) from None
+            self._client = None
             self._closed = True
-            return
-        try:
-            await client.aclose()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _log_failure("shutdown", exc)
-            raise CacheFeatureError("Redis cache backend shutdown failed.") from None
-        self._client = None
-        self._closed = True
 
 
 def _configuration_value(configuration: object, key: str) -> str:
@@ -818,6 +980,28 @@ def _configuration_value(configuration: object, key: str) -> str:
             "Redis cache backend cannot inspect advanced feature configuration."
         )
     return value.lower()
+
+
+def _redis_time(value: object) -> float:
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        raise CacheFeatureError("Redis cache returned an invalid server time.")
+    seconds, microseconds = value
+    seconds = _redis_time_component(seconds)
+    microseconds = _redis_time_component(microseconds)
+    if seconds < 0 or not 0 <= microseconds < 1_000_000:
+        raise CacheFeatureError("Redis cache returned an invalid server time.")
+    return validate_finite(seconds + microseconds / 1_000_000, label="Redis time")
+
+
+def _redis_time_component(value: object) -> int:
+    try:
+        if isinstance(value, bytes):
+            value = value.decode("ascii")
+        if isinstance(value, bool) or not isinstance(value, int | str):
+            raise ValueError
+        return int(value)
+    except (TypeError, UnicodeDecodeError, ValueError) as exc:
+        raise CacheFeatureError("Redis cache returned an invalid server time.") from exc
 
 
 def _validate_readiness_result(result: object) -> None:

@@ -301,6 +301,7 @@ logic and adapters can be exercised without external infrastructure.
 | Streams | Process-local ordered replay, bounded retention, and consumer positions |
 | Pub/sub | Process-local live fan-out with no replay |
 | Schedules | Process-local revisioned records, due ordering, and fenced claims |
+| Time | Process-local time from the configured clock |
 
 Memory features are not durable, do not recover after restart, and are not safe
 for horizontal producers, workers, or schedulers. Their metadata reports these
@@ -322,13 +323,15 @@ features. Startup fails with installation guidance when `wybra[cache]` is not
 installed, or with a bounded diagnostic when Redis is unavailable.
 
 The baseline byte cache needs only a reachable Redis server when configured
-with `features = []`. Enabling `atomic`, `lease`, `schedule`, `stream`, or
-`work-queue` additionally requires Redis scripting, append-only persistence,
-and an eviction policy other than `allkeys-*`. Wybra checks those prerequisites
-at startup before advertising the features, because their revisions and fencing
-tokens must survive ordinary key expiry and process restart. Their Redis ACLs
-must also permit `PEXPIRE` for bounded readiness probes. If the Redis service
-blocks `CONFIG GET`, Wybra logs a warning and continues only when its operational
+with `features = []`. Selecting `time` validates Redis `TIME` during startup;
+the runtime then calibrates and bounds local reuse of provider time while it is
+open. Enabling `atomic`, `lease`, `schedule`, `stream`, or `work-queue`
+additionally requires Redis scripting, append-only persistence, and an eviction
+policy other than `allkeys-*`. Wybra checks those prerequisites at startup
+before advertising the features, because their revisions and fencing tokens
+must survive ordinary key expiry and process restart. Their Redis ACLs must
+also permit `PEXPIRE` for bounded readiness probes. If the Redis service blocks
+`CONFIG GET`, Wybra logs a warning and continues only when its operational
 readiness checks pass;
 the operator then owns verification of persistence and eviction policy. Redis
 Cluster is not yet supported for these advanced features; use a standalone or
@@ -356,6 +359,7 @@ operation reports a safe cache error if the provider later becomes unavailable.
 | Work queues | Shared Redis Streams consumer-group delivery with acknowledgement, visibility recovery, delayed retry, and bounded dead letters |
 | Schedules | Shared revisioned one-time and interval records with due ordering and fenced claims |
 | Streams | Shared ordered replay with a fixed 1,000-record retained history and durable consumer positions |
+| Time | Redis `TIME`, calibrated locally for shared lifecycle and scheduling decisions |
 
 Redis atomic mutations and lease changes are provider-atomic. Revisions and
 fencing sequences survive individual entry expiry, deletion, and Wybra runtime
@@ -368,6 +372,14 @@ horizontally scaled application instances. Redis metadata reports shared scope
 for every advanced feature, durability and restart recovery only for durable
 features, and horizontal-consumer support.
 
+The optional `time` feature exposes provider-authoritative Unix timestamp floats
+without exposing a Redis client. The Redis runtime calibrates from `TIME`, then
+uses a local offset between refreshes to avoid a remote request for every read.
+It refreshes no more often than once a minute, targets five minutes, forces a
+refresh by ten minutes, and rejects an expired calibration until `TIME` can be
+read again. It uses monotonic elapsed time after a local wall-clock jump until
+it can recalibrate.
+
 Provider failures are translated to bounded cache feature errors without
 including URLs, credentials, physical keys, values, scripts, or lease tokens.
 Wybra logs the failed operation and exception type for operator diagnostics.
@@ -379,7 +391,8 @@ and back it up according to the application's durability requirements.
 The Redis `work-queue` feature provides durable, at-least-once delivery across
 application instances. Each logical owner and queue receives a namespaced Redis
 Stream and consumer group. Consumers acknowledge a delivery with its opaque
-receipt; an unacknowledged delivery becomes eligible for recovery after its
+receipt and may renew a live delivery to extend its visibility deadline. An
+unacknowledged or unrenewed delivery becomes eligible for recovery after its
 visibility timeout. Rejection can defer retry durably, and terminal failures
 are retained in a bounded dead-letter stream.
 
@@ -432,8 +445,8 @@ Schedule records, due indexes, and TTL-backed claim keys are private to the
 configured Redis namespace. They survive cache registry reconstruction and
 Redis restart according to the configured Redis persistence window. Redis
 server time controls claim eligibility, claim expiry, and recurring advancement.
-The `due()` boundary remains caller-supplied, so scheduler hosts should stay
-synchronised with Redis. Claim-expiry recovery is bounded per query. `due()`
+The `due()` boundary remains caller-supplied; shared schedulers should obtain it
+from the cache `time` feature. Claim-expiry recovery is bounded per query. `due()`
 also accepts a `ScheduleCursor` continuation so consumers can page through due
 records in due-time and identity order without materialising earlier payloads.
 Every schedule feature stores at most 10,000 records and opaque schedule payload
@@ -512,6 +525,10 @@ if lease is not None:
     await leases.release(lease)
 ```
 
+Renewal extends the same lease: its holder, opaque token, and fencing token do
+not change. A new fencing token is issued only when another claimant acquires
+the resource after expiry or release.
+
 An expired lease can be acquired by another holder with a newer fencing token.
 Renewing or releasing a stale token raises `CacheConflictError`.
 
@@ -547,6 +564,16 @@ if delivery is not None:
     else:
         await queue.acknowledge(delivery)
 ```
+
+Long-running handlers can renew the same live delivery before its deadline:
+
+```python
+delivery = await queue.renew(delivery, visibility_timeout=300)
+```
+
+Renewal returns a new immutable delivery record with the same receipt and
+identity. A stale receipt cannot renew, acknowledge, reject, or dead-letter a
+later delivery.
 
 Delivery is at least once: work whose visibility expires can be delivered
 again. Consumers must make externally visible effects idempotent. The returned

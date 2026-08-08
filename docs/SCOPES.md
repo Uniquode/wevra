@@ -22,8 +22,7 @@ from wybra.scopes import scopes
 
 
 @scopes("update", "delete")
-class Article(Model):
-    ...
+class Article(Model): ...
 ```
 
 For a content type named `articles.article`, this adds
@@ -32,8 +31,7 @@ corresponding operations. It is equivalent to:
 
 ```python
 @scopes(actions=("update", "delete"))
-class Article(Model):
-    ...
+class Article(Model): ...
 ```
 
 The standard actions are `list`, `view`, `create`, `update`, `delete`, and
@@ -78,8 +76,7 @@ then applies unchanged to every model operation:
 
 ```python
 @scopes("update", requires=("catalog.access",))
-class Article(Model):
-    ...
+class Article(Model): ...
 ```
 
 Every operation requires `catalog.access`; update additionally requires

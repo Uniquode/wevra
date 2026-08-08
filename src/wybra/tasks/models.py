@@ -5,6 +5,7 @@ import math
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from sys import float_info
 from typing import Final
 from uuid import UUID
 
@@ -27,6 +28,21 @@ class TaskPayloadError(ValueError):
 
 class TaskRegistrationError(ValueError):
     """Raised when a task identity cannot be registered."""
+
+
+class TaskSubmissionError(RuntimeError):
+    """Raised when a configured task provider cannot confirm a submission."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        task_id: UUID,
+        acceptance_unknown: bool,
+    ) -> None:
+        super().__init__(message)
+        self.task_id = task_id
+        self.acceptance_unknown = acceptance_unknown
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -97,10 +113,44 @@ class RetryPolicy:
             )
         if jitter < 0:
             raise TaskDeclarationError("Task retry jitter cannot be negative.")
+        if maximum_delay is None:
+            _validate_uncapped_retry_delay(
+                max_attempts=self.max_attempts,
+                initial_delay=initial_delay,
+                backoff_multiplier=backoff_multiplier,
+                jitter=jitter,
+            )
         object.__setattr__(self, "initial_delay_seconds", initial_delay)
         object.__setattr__(self, "backoff_multiplier", backoff_multiplier)
         object.__setattr__(self, "maximum_delay_seconds", maximum_delay)
         object.__setattr__(self, "jitter_seconds", jitter)
+
+
+def _validate_uncapped_retry_delay(
+    *,
+    max_attempts: int,
+    initial_delay: float,
+    backoff_multiplier: float,
+    jitter: float,
+) -> None:
+    """Reject policies whose final scheduled retry cannot be represented."""
+    if max_attempts < 2:
+        return
+    maximum_base_delay = float_info.max - jitter
+    if initial_delay > maximum_base_delay:
+        raise TaskDeclarationError(
+            "Task retry delay and jitter must remain finite without a maximum delay."
+        )
+    if initial_delay == 0 or backoff_multiplier == 1:
+        return
+    final_exponent = max_attempts - 2
+    maximum_exponent = (
+        math.log(maximum_base_delay) - math.log(initial_delay)
+    ) / math.log(backoff_multiplier)
+    if final_exponent > maximum_exponent:
+        raise TaskDeclarationError(
+            "Task retry delay can overflow without a maximum delay."
+        )
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -189,4 +239,5 @@ __all__ = (
     "TaskPayload",
     "TaskPayloadError",
     "TaskRegistrationError",
+    "TaskSubmissionError",
 )

@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
-from typing import cast
 
 from envex import Env
 
@@ -20,7 +19,7 @@ def load_environment(
     if environ is None:
         configured_environment: MutableMapping[str, str] = os.environ
     elif isinstance(environ, MutableMapping):
-        configured_environment = cast(MutableMapping[str, str], environ)
+        configured_environment = environ
     else:
         configured_environment = dict(environ)
 

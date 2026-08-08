@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -22,6 +21,7 @@ from wybra.cache import (
     MAX_CACHE_FEATURE_LIMIT,
     CacheConflictError,
     CacheRevision,
+    CacheTimeCapability,
     ScheduleCacheCapability,
     ScheduleClaim,
     ScheduleCursor,
@@ -100,11 +100,16 @@ class CacheTaskiqScheduleSource(ScheduleSource):
     """Adapt durable cache schedules to Taskiq's schedule-source protocol."""
 
     def __init__(
-        self, schedules: ScheduleCacheCapability, *, policy: TaskiqSchedulePolicy
+        self,
+        schedules: ScheduleCacheCapability,
+        *,
+        policy: TaskiqSchedulePolicy,
+        cache_time: CacheTimeCapability,
     ) -> None:
         _validate_schedule_capacity(schedules.maximum_records)
         self._schedules = schedules
         self._policy = policy
+        self._cache_time = cache_time
         self._pending: dict[str, _PendingDispatch] = {}
         self._pending_prune_cursor = 0
         self._refreshing: dict[str, ScheduleClaim] = {}
@@ -154,11 +159,16 @@ class CacheTaskiqScheduleSource(ScheduleSource):
         )
         _validate_limit(limit, label="Catch-up limit")
         envelope = _Envelope(schedule, zone_name, limit)
+        now = await self._cache_time.refresh() if schedule.time is None else None
         record = await self._schedules.create(
             self._policy.owner,
             schedule.schedule_id,
             _encode(envelope),
-            next_due_at=_initial_due_at(schedule, zone_name),
+            next_due_at=_initial_due_at(
+                schedule,
+                zone_name,
+                now=now,
+            ),
             interval_seconds=_interval_seconds(schedule),
         )
         if record is None:
@@ -216,7 +226,7 @@ class CacheTaskiqScheduleSource(ScheduleSource):
     ) -> list[ScheduledTask]:
         if await self._prune_stale_pending():
             self._scan_cursor = None
-        now = time.time()
+        now = await self._cache_time.refresh()
         cursor = self._scan_cursor
         scanned = 0
         incompatible_count = 0
@@ -857,7 +867,12 @@ def _dispatch_task(task: ScheduledTask, claim: ScheduleClaim) -> ScheduledTask:
     )
 
 
-def _initial_due_at(schedule: ScheduledTask, timezone: str) -> float:
+def _initial_due_at(
+    schedule: ScheduledTask,
+    timezone: str,
+    *,
+    now: float | None = None,
+) -> float:
     if schedule.time is not None:
         value = schedule.time
         if value.tzinfo is None:
@@ -874,8 +889,12 @@ def _initial_due_at(schedule: ScheduledTask, timezone: str) -> float:
             value = localised
         return value.astimezone(UTC).timestamp()
     if schedule.interval is not None:
-        return time.time()
-    return _next_cron_due_at(schedule.cron or "", time.time(), timezone)
+        if now is None:
+            raise ValueError("Interval schedules require a cache time value.")
+        return now
+    if now is None:
+        raise ValueError("Cron schedules require a cache time value.")
+    return _next_cron_due_at(schedule.cron or "", now, timezone)
 
 
 def _interval_seconds(schedule: ScheduledTask) -> float | None:

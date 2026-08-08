@@ -14,6 +14,7 @@ from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.cache.redis_schedule_ordering import encode_due_order
 from wybra.cache.redis_schedule_scripts import SCHEDULE_DUE_ORDER_FUNCTION
 from wybra.cache.redis_schedules import RedisScheduleCache
+from wybra.cache.redis_time import RedisCacheTime
 from wybra.tasks.taskiq_schedule import CacheTaskiqScheduleSource, TaskiqSchedulePolicy
 
 pytestmark = pytest.mark.skipif(
@@ -130,10 +131,12 @@ async def test_redis_taskiq_sources_fence_one_time_schedule_emission() -> None:
         first_source = CacheTaskiqScheduleSource(
             schedules,
             policy=TaskiqSchedulePolicy(claimant="scheduler-a", claim_ttl_seconds=30),
+            cache_time=RedisCacheTime(runtime),
         )
         second_source = CacheTaskiqScheduleSource(
             schedules,
             policy=TaskiqSchedulePolicy(claimant="scheduler-b", claim_ttl_seconds=30),
+            cache_time=RedisCacheTime(runtime),
         )
         task = ScheduledTask(
             task_name="tests.redis_once",

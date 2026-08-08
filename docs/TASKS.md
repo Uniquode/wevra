@@ -11,13 +11,13 @@ declared task directly, or enable the optional task module and submit it through
 
 ## Execution modes
 
-Wybra's task platform covers three application use cases:
+Wybra's task platform covers five application use cases:
 
 | Use case | Current availability | Behaviour |
 | --- | --- | --- |
 | Direct task call | Available | Runs in the caller, returns the function result, and propagates the original exception. |
 | On-demand submission | Available with the immediate backend | Uses task validation, retry, lifecycle, status, correlation, and idempotency metadata, but executes inline in the submitting process. |
-| Durable background submission | Planned | Will publish through a cache-backed provider and return before worker execution. |
+| Durable background submission | Available with the Taskiq backend | Publishes through the selected cache and returns a durable handle before worker execution. |
 | One-time deferred task | Planned | Will submit one ordinary task command for a validated future time. |
 | Recurring interval or cron task | Planned | Will be discovered declaratively and published by a separately operated scheduler. |
 
@@ -26,10 +26,12 @@ and adopting the task API before worker infrastructure is available. It is not
 a background thread or process: submission waits for execution and retries to
 finish.
 
-Durable background workers, one-time deferred submission, recurring schedules,
-and the scheduler command are not yet available. Do not use `asyncio.create_task`
-or an in-process timer as a durability substitute; those operations are lost
-when the web process exits.
+The Taskiq backend supplies durable submission, lifecycle tracking, result
+storage, and a cache-aware worker receiver. Run that receiver in a separate
+process with `wybra-task-worker`; declarative deferred and recurring task APIs
+remain separate work. Do not use `asyncio.create_task` or an in-process timer
+as a durability substitute; those operations are lost when the web process
+exits.
 
 ## Enable the task capability
 
@@ -39,7 +41,7 @@ Add `wybra.tasks` to the host application's configured modules:
 [app]
 modules = [
   "wybra.tasks",
-  "example.application",
+  "example",
 ]
 ```
 
@@ -65,7 +67,7 @@ Configure `[tasks]` only when overriding those defaults:
 ```toml
 [tasks]
 enabled = true
-backend = "immediate"
+backend = "taskiq"
 default_queue = "default"
 max_attempts = 3
 initial_delay_seconds = 0.25
@@ -73,32 +75,40 @@ backoff_multiplier = 2.0
 maximum_delay_seconds = 10.0
 jitter_seconds = 0.5
 status_retention_seconds = 3600
+active_status_timeout_seconds = 86400
+worker_shutdown_grace_seconds = 30
+visibility_timeout_seconds = 30
+wait_timeout_seconds = 1
+max_delivery_attempts = 3
+result_retention_seconds = 3600
+max_result_bytes = 65536
 ```
 
-`backend = "immediate"` is the default and the only execution backend currently
-available. The module registers `TasksCapability` during site composition.
+`backend = "immediate"` is the default. The optional `taskiq` backend registers
+the durable `TasksCapability` during site composition when its selected cache
+provides every required feature.
 Without `wybra.tasks` in `[app].modules`, the capability is absent but declared
 tasks remain directly executable. The same is true when the module is present
 with `enabled = false`.
 
 ### Taskiq preflight
 
-Install the optional dependency before selecting the future Taskiq backend:
+Install the optional dependency before selecting the Taskiq backend:
 
 ```sh
 uv add 'wybra[tasks]'
 ```
 
-Taskiq configuration selects a named provider-neutral cache. It intentionally
-performs startup preflight only in the current release; it does not register a
-`TasksCapability`, broker, result backend, worker, or scheduler yet.
+Taskiq configuration selects a named provider-neutral cache. Startup constructs
+the private broker, result backend, lifecycle middleware, and cache-aware
+receiver factory, then registers a durable `TasksCapability`.
 
 ```toml
 [app]
 modules = [
   "wybra.cache",
   "wybra.tasks",
-  "example.application",
+  "example",
 ]
 
 [tasks]
@@ -109,45 +119,58 @@ cache_name = "default"
 `cache_name` defaults to `"default"`; its cache-name format is validated only
 for the Taskiq backend, while the immediate backend ignores it. The selected
 name must correspond to `[cache]` for `default`, or to a configured named cache
-such as `[cache.task_work]` when `cache_name = "task_work"`. Taskiq preflight
-runs after cache setup finalisation and checks that `wybra.cache` provides the
-selected cache. It then stops startup with an explicit message that no
-configured cache-backed Taskiq runtime is available yet. This protects
-applications from silently falling back to inline execution while durable task
-integration is incomplete.
+such as `[cache.task_work]` when `cache_name = "task_work"`. Taskiq setup runs
+after cache setup finalisation and requires the selected cache's baseline
+values plus `work-queue`, `stream`, `atomic`, `lease`, and `time` features.
+Missing prerequisites stop startup with a safe, provider-neutral diagnostic;
+Wybra never falls back to inline execution.
+
+Start one or more workers against the same selected durable cache:
+
+```sh
+wybra-task-worker
+```
+
+The command loads the configured ASGI application and enters its lifespan
+before resolving the Taskiq receiver. A worker therefore uses the same module
+composition, cache credentials, lifecycle recovery, logging, and shutdown
+behaviour as the application. It refuses to start unless enabled tasks resolve
+to the `taskiq` backend. Pass `--config path/to/app.toml` to select a specific
+application configuration.
 
 ### Cache-backed Taskiq results
 
 `CacheTaskiqResultBackend` is the reusable Taskiq adapter for retaining result
-envelopes through a selected cache's baseline byte-value capability. It is not
-activated by `[tasks]` configuration yet; a future broker runtime will create
-and register it.
+envelopes through a selected cache's baseline byte-value capability. The
+configured Taskiq runtime creates and registers it privately.
 
 The runtime supplies an immutable `TaskiqResultPolicy` with a positive result
 retention period, maximum serialised byte size, and encoder/decoder callables.
 When either codec is `None`, the policy uses Taskiq's standard JSON model codec.
-The encoder is responsible for producing a safe byte representation and runs
-before any cache write. Encoder, decoder, and cache-operation failures
-propagate to Taskiq; the adapter does not redact, wrap, or silently retain
-unsafe return values. This keeps the safe-result and redaction policy owned by
-the task runtime rather than by a particular cache provider.
+The configured runtime uses a safe encoder that retains only result readiness,
+success/failure state, and execution duration. It removes task return values,
+worker logs, exception details, and labels before the cache write. The reusable
+adapter still accepts an explicit caller-owned codec when another integration
+has its own safe-result policy.
 
 Readiness uses the baseline cache read operation, so each wait poll reads the
 stored result envelope. Configure the result byte limit and future worker poll
 interval together to control result-wait cache traffic.
 
-`get_result(..., with_logs=False)` omits the result's worker log. Request logs
-explicitly with `with_logs=True`; this controls the returned result, not the
-cache read, because Taskiq stores the log in its result envelope.
+Configured Taskiq results are retained only as safe completion metadata; they
+do not expose arbitrary return values, worker logs, exception details, or task
+labels through the task capability.
 
 ### Cache-backed Taskiq broker
 
 `CacheTaskiqBroker` is the reusable optional adapter from Taskiq's broker
 contract to a named cache's work-queue feature. It publishes the opaque bytes
 produced by Taskiq's formatter and returns them to workers with a Taskiq
-acknowledgement callback bound to the exact queue delivery. Taskiq task identity
-remains in its message envelope; cache delivery receipts and provider details
-remain internal to the adapter. Durability follows the selected cache provider:
+acknowledgement callback bound to the exact queue delivery. On delivery, the
+adapter carries the queue's monotonically increasing delivery attempt in its
+private Taskiq envelope. Taskiq task identity remains in that envelope; cache
+delivery receipts and provider details remain internal to the adapter.
+Durability follows the selected cache provider:
 the memory work queue remains process-local and volatile, while a conforming
 production provider advertises its shared durability and restart guarantees.
 
@@ -156,34 +179,128 @@ float-coercible `delay` label becomes durable queue delay in seconds. A worker
 that stops before acknowledging leaves its delivery for normal visibility-expiry
 recovery. Production workers that require at-least-once execution must not use
 Taskiq's `WHEN_RECEIVED` acknowledgement mode, which settles the delivery before
-execution. Configure the visibility timeout to cover prefetch queueing plus the
-longest expected execution and result-save interval; a shorter timeout permits
-the same task to be delivered concurrently while its first execution is still
-running.
+execution. The configured visibility timeout remains the initial reservation
+lease. A task with a longer expected execution time can declare a larger
+visibility budget; the cache-backed receiver renews that delivery while the
+task executes. A worker that cannot renew before expiry may still lose the
+delivery, so task handlers must remain idempotent.
 
-The adapter does not activate `[tasks] backend = "taskiq"` itself; site
-capability, worker registration, lifecycle, and scheduling integration remain
-later work.
+The configured Taskiq runtime activates durable submission and exposes its
+cache-aware receiver factory to `wybra-task-worker`. The receiver renews
+long-running delivery leases and acknowledges obsolete redeliveries before
+task execution. It acknowledges a completed delivery only after Taskiq has
+persisted the result and the lifecycle middleware has recorded success; a
+result-storage failure leaves the delivery available for visibility recovery.
+On shutdown, the worker stops receiving new deliveries, waits for at most
+`worker_shutdown_grace_seconds` for active callbacks, then cancels any remaining
+callbacks, permits at most one second for cancellation cleanup, and leaves any
+remaining deliveries for visibility recovery. Cancellation remains cooperative:
+an application handler that suppresses cancellation requires its process
+supervisor to terminate the worker after this bounded drain.
 
-### Cache-backed Taskiq schedules
+The receiver owns Taskiq's execution sequence instead of calling its standard
+callback, because Taskiq's callback can log argument-bearing messages at debug
+level. Wybra task definitions validate payloads before submission and require
+async handlers, so Taskiq parameter validation and executor options are
+rejected for this receiver. Taskiq timeout labels, dependency injection, and
+sync-callable execution are not supported by the configured runtime.
+
+The runtime suppresses Taskiq kicker debug records that can include task
+arguments. Operators should use Wybra lifecycle status and safe task identifiers
+for task diagnostics instead of enabling argument-bearing Taskiq debug output.
+
+### Cache-backed Taskiq lifecycle
+
+`CacheTaskiqLifecycleMiddleware` is the private optional adapter that maps
+Taskiq submission and worker hooks to Wybra's lifecycle stream and projected
+status. It records only task identity, queue, correlation, task and delivery
+attempts, a private work identity, worker, safe progress, and failure
+classification. A stable work identity prevents one duplicate retry command
+from terminalising a distinct live command for the same logical task attempt.
+The delivery attempt fences stale workers: a later delivery can replace an
+expired worker, but lifecycle facts from the earlier delivery cannot overwrite
+its status. It never copies task arguments,
+keyword arguments, Taskiq return values, worker logs, or exception messages
+into lifecycle records.
+
+The lifecycle adapter requires the selected cache's `stream`, `atomic`, `lease`,
+and `time` features. The lifecycle stream is the ordered recovery source. A
+revisioned atomic status projection provides `submitted`, running, retry, and
+terminal state by task ID. Each lifecycle event refreshes the active-status
+timeout, so a task abandoned by a stopped worker is eventually removed rather
+than occupying projection storage indefinitely, even if a provider delays
+physical key expiry. The first terminal transition instead applies the
+configured task status retention, measured from that transition rather than a
+later repair. A failed projection write
+is repaired by replaying the already-appended lifecycle record, so a worker
+restart does not need to interpret Taskiq result storage as public Wybra status.
+Lifecycle timestamps and replay retention use the selected cache's calibrated
+time, preventing host-clock skew from changing shared status lifetime.
+
+The active-status timeout is an abandonment boundary, not a worker heartbeat.
+Silent tasks that can run longer than the configured timeout must emit lifecycle
+progress or use a longer timeout. Once an active projection expires, a later
+event can be recovered only when the retained lifecycle stream still contains a
+legal `submitted` origin; an orphaned terminal event is rejected rather than
+inventing task state.
+
+The middleware appends `submitted` before broker delivery, then records
+`started`, a non-terminal `attempt_failed`, `retry_scheduled` after the retry
+hand-off succeeds, terminal `failed` then `dead_lettered`, or `succeeded` only
+after Taskiq has stored the worker result. Install it after one cache-aware wrapper
+of Taskiq's
+standard retry middleware so its reverse-order error hook records the failed
+attempt before Taskiq decides whether to re-publish it; startup rejects an
+incompatible order, multiple retry middlewares, or an unobserved standard
+retry middleware. The configured Taskiq runtime installs this middleware and
+its cache-aware retry wrapper.
+
+A retry schedule is attributed to the worker and delivery that failed. If a
+later delivery has already replaced that worker, the stale retry schedule and
+any rejected retry hand-off are ignored rather than changing the replacement's
+status.
+
+The cache-aware retry wrapper retains Taskiq's retry policy and observes its
+send failure. When the selected queue provides a definitive rejection signal
+and rejects a retry publication, the adapter records terminal `failed` and
+`dead_lettered` facts immediately.
+Transport failures remain indeterminate: the queue may have accepted the retry
+before the response was lost, so the adapter retains `attempt_failed` rather
+than incorrectly declaring it dead-lettered. A later retry execution resolves
+that state naturally; startup replay can terminalise an abandoned record after
+the active-status timeout.
+
+The lifecycle adapter currently rejects `SmartRetryMiddleware` configured with
+a Taskiq schedule source. Taskiq submits scheduled retries directly to the
+schedule source and bypasses its send hooks, so this adapter cannot confirm the
+hand-off without a dedicated lifecycle-aware schedule integration.
+
+### Cache-backed Taskiq schedule adapter
+
+`CacheTaskiqScheduleSource` is a cache adapter available for direct Taskiq
+integration. It is not activated by `[tasks]`, and `wybra-task-worker` does not run
+a scheduler. Wybra's declared deferred and recurring task APIs will own that
+integration in a later task-platform slice.
 
 `CacheTaskiqScheduleSource` is the reusable optional adapter from Taskiq's
-schedule-source interface to a selected cache's `schedule` feature. It has no
-Redis or provider-specific dependency. Construct it with a stable scheduler
-claimant and a claim TTL that covers the complete broker-enqueue and
+schedule-source interface to a selected cache's `schedule` and `time` features.
+It has no Redis or provider-specific dependency. Construct it with a stable
+scheduler claimant and a claim TTL that covers the complete broker-enqueue and
 post-enqueue settlement path:
 
 ```python
-from wybra.cache import ScheduleCacheCapability
+from wybra.cache import CacheTimeCapability, ScheduleCacheCapability
 from wybra.tasks.taskiq_schedule import (
     CacheTaskiqScheduleSource,
     TaskiqSchedulePolicy,
 )
 
-schedules = caches.require("tasks").require(
+task_cache = caches.require("tasks")
+schedules = task_cache.require(
     ScheduleCacheCapability,
     consumer="task scheduler",
 )
+cache_time = task_cache.require(CacheTimeCapability, consumer="task scheduler")
 source = CacheTaskiqScheduleSource(
     schedules,
     policy=TaskiqSchedulePolicy(
@@ -195,6 +312,7 @@ source = CacheTaskiqScheduleSource(
         scan_page_limit=100,
         scan_limit=1_000,
     ),
+    cache_time=cache_time,
 )
 ```
 
@@ -203,6 +321,10 @@ cron schedules as UTC Unix timestamps. Cron expressions use `croniter`'s
 supported five-field calendar syntax in the configured IANA `pytz` timezone.
 Taskiq `cron_offset` is deliberately rejected: use the named `timezone`
 instead so daylight-saving handling is explicit.
+Pass the selected cache's `time` feature so creation and due discovery share the
+cache's authoritative clock. For isolated process-local work, pass an
+`InMemoryCacheTime` built from the same deterministic clock as the schedule
+storage.
 
 `source_refresh_interval_seconds` declares the Taskiq source refresh cadence.
 It defaults to 60 seconds, matching Taskiq's default scheduler refresh. Fixed
@@ -270,9 +392,8 @@ persisted cron catch-up instant before dispatching it.
 See the [scheduler/cache interaction diagram](TaskScheduler.mmd) for the
 durable schedule and broker hand-off flow.
 
-This adapter is not activated by `[tasks] backend = "taskiq"` yet. Site
-activation, worker registration, lifecycle integration, and scheduler runtime
-wiring remain later work.
+The configured Taskiq runtime does not activate this source. Public declarative
+schedule registration and scheduler orchestration remain separate work.
 
 The retry settings above become site defaults for tasks that do not declare
 their own `RetryPolicy`. Terminal immediate-task status and lifecycle history
@@ -282,7 +403,14 @@ history is also bounded.
 Task declaration modules must be imported during normal application
 composition so their stable identities are registered. Keep declarations in
 application-owned modules rather than importing them dynamically from task
-messages.
+messages. Automatic discovery retains module-bound declarations; a factory-
+local declaration must be retained by application code if it is intended for
+durable submission. `@task` records the module that declares the task. When the site
+composes its configured modules, the durable runtime automatically discovers
+declarations owned by those module roots and builds an isolated registry for
+that site. No application registry object or decorator argument is required.
+Tasks declared by modules outside the configured application module roots
+remain directly executable but are unavailable to that site's durable worker.
 
 ## Declare an application task
 
@@ -360,7 +488,7 @@ from fastapi import APIRouter, Request, status
 from wybra import get_site
 from wybra.tasks import TaskSubmissionOptions, TasksCapability
 
-from example.tasks import rebuild_search
+from example.application.tasks import rebuild_search
 
 router = APIRouter()
 
@@ -392,6 +520,14 @@ Both values are trimmed and must be non-empty strings when supplied.
 The immediate backend exposes the idempotency key to the handler but does not
 deduplicate submissions. Durable providers may suppress a known duplicate
 command, but no provider can guarantee exactly-once external side effects.
+
+If durable submission raises `TaskSubmissionError`, inspect
+`error.acceptance_unknown`. When it is `True`, a provider may have accepted the
+command before its response was lost; use `error.task_id` to query lifecycle
+status before submitting again. When it is `False`, publication did not begin
+or the selected queue definitively rejected it, so the application can safely
+choose a new submission. Redis queue failures remain indeterminate unless Redis
+itself confirms that a command was not accepted.
 
 ## Select a dispatch policy
 
@@ -528,6 +664,7 @@ Lifecycle kinds cover:
 - `scheduled`;
 - `started`;
 - `progress`;
+- `attempt_failed`;
 - `retry_scheduled`;
 - `succeeded`;
 - `failed`; and
@@ -541,10 +678,11 @@ Status and lifecycle observations exclude task arguments and exception
 messages. Failure status records the safe exception type, such as
 `ConnectionError`, in `error_type`.
 
-Each accepted transition also emits a fixed-message structured log containing
-safe task identity, correlation, causation, attempt, queue, worker, transition,
-and error-type fields. Arguments, exception messages, and progress values are
-not interpolated into routine log messages.
+Immediate-task transitions emit a fixed-message structured log containing safe
+task identity, correlation, causation, attempt, queue, worker, transition, and
+error-type fields. The durable Taskiq backend keeps its lifecycle history and
+status in the selected cache; both backends exclude arguments, exception
+messages, and progress values from routine diagnostics.
 
 Immediate status is process-local and retained in memory. It is not shared
 between web instances and disappears when the process exits.
@@ -702,13 +840,13 @@ does not create a timer or lifecycle record.
 
 ## Current limitations
 
-- Only the immediate backend executes tasks; Taskiq configuration currently
-  preflights then stops before registering a capability.
-- Submission is inline rather than worker-backed.
-- Immediate status and lifecycle are process-local.
+- The immediate backend executes submissions inline; the Taskiq backend
+  publishes durable work for `wybra-task-worker` processes.
+- Taskiq result storage is an adapter concern; `TaskHandle` exposes lifecycle
+  status rather than arbitrary task return values.
 - Deferred and recurring schedules are not available.
-- Worker and scheduler commands are not available.
-- Persisted task return values and cancellation are not yet available through
-  the configured task capability.
+- The worker command is available; a scheduler command remains separate work.
+- Persisted task return values and cancellation are not available through the
+  configured task capability.
 - A complete transactional outbox is deferred; future after-commit publication
   will still document the remaining database-commit-to-broker gap.

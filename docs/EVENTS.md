@@ -71,8 +71,7 @@ matches `sql.statement` and `sql.transaction`, but not `sqltransaction`.
 from wybra.events import EventsCapability, event_scope
 
 
-async def audit_sql(event) -> None:
-    ...
+async def audit_sql(event) -> None: ...
 
 
 async def setup(events: EventsCapability) -> None:

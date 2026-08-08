@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from wybra.cache.feature_models import (
     DEFAULT_STREAM_MAX_CONSUMERS,
@@ -11,6 +13,7 @@ from wybra.cache.feature_models import (
     CacheConflictError,
     CacheFeatureError,
     CachePositionExpiredError,
+    LeaseToken,
     StreamPosition,
     StreamRecord,
     validate_limit,
@@ -19,6 +22,9 @@ from wybra.cache.feature_models import (
     validate_positive_integer,
     validate_resource,
 )
+
+if TYPE_CHECKING:
+    from wybra.cache.memory_leases import InMemoryLeaseCache
 
 type StreamKey = tuple[str, str]
 type SubscriptionCloser = Callable[[], Awaitable[None]]
@@ -30,6 +36,7 @@ class InMemoryStreamCache:
     max_records: int = DEFAULT_STREAM_RETENTION_COUNT
     max_streams: int = 1_000
     max_consumers: int = DEFAULT_STREAM_MAX_CONSUMERS
+    leases: InMemoryLeaseCache | None = field(default=None, repr=False)
     _records: dict[StreamKey, deque[StreamRecord]] = field(
         default_factory=dict,
         init=False,
@@ -54,10 +61,12 @@ class InMemoryStreamCache:
         owner: str,
         stream: str,
         payload: bytes,
+        *,
+        lease: LeaseToken | None = None,
     ) -> StreamPosition:
         stream_key = _stream_key(owner, stream)
         payload = validate_payload(payload)
-        async with self._lock:
+        async with self._fence(lease):
             if (
                 stream_key not in self._records
                 and len(self._records) >= self.max_streams
@@ -153,6 +162,13 @@ class InMemoryStreamCache:
             if consumer_stream_key == stream_key
         )
 
+    def bind_lease_fence(self, leases: InMemoryLeaseCache) -> None:
+        if self.leases is not None and self.leases is not leases:
+            raise CacheFeatureError(
+                "Stream cache lease fencing is already bound to another lease cache."
+            )
+        self.leases = leases
+
     def _read(
         self,
         stream_key: StreamKey,
@@ -172,6 +188,21 @@ class InMemoryStreamCache:
         return tuple(
             record for record in records if record.position.value > after_value
         )[:limit]
+
+    @asynccontextmanager
+    async def _fence(self, lease: LeaseToken | None):
+        if lease is None:
+            async with self._lock:
+                yield
+            return
+        if self.leases is None:
+            raise CacheFeatureError(
+                "Stream cache does not support lease-fenced appends."
+            )
+        async with self.leases.hold_fence(lease) as validate:
+            async with self._lock:
+                validate(lease)
+                yield
 
 
 @dataclass(slots=True, eq=False)

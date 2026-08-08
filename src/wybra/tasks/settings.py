@@ -8,11 +8,21 @@ from wybra.cache import to_cache_name
 from wybra.config import BaseSettings, ConfigDef, to_bool
 from wybra.core.exceptions import ConfigurationError
 from wybra.tasks.config import (
+    DEFAULT_TASK_ACTIVE_STATUS_TIMEOUT_SECONDS,
     DEFAULT_TASK_BACKEND,
     DEFAULT_TASK_CACHE_NAME,
+    DEFAULT_TASK_DELIVERY_ATTEMPTS,
     DEFAULT_TASK_QUEUE,
+    DEFAULT_TASK_RESULT_BYTES,
+    DEFAULT_TASK_RESULT_RETENTION_SECONDS,
     DEFAULT_TASK_STATUS_RETENTION_SECONDS,
+    DEFAULT_TASK_VISIBILITY_TIMEOUT_SECONDS,
+    DEFAULT_TASK_WAIT_TIMEOUT_SECONDS,
     DEFAULT_TASK_WORKER_CONCURRENCY,
+    DEFAULT_TASK_WORKER_SHUTDOWN_GRACE_SECONDS,
+    MAX_TASK_DELIVERY_ATTEMPTS,
+    MAX_TASK_RESULT_BYTES,
+    MINIMUM_TASK_VISIBILITY_TIMEOUT_SECONDS,
     TASKS_CONFIG_SECTION,
     module_config,
     to_task_backend,
@@ -35,9 +45,15 @@ class TasksSettings(BaseSettings):
     maximum_delay_seconds: float | None = None
     jitter_seconds: float = 0.0
     status_retention_seconds: float = DEFAULT_TASK_STATUS_RETENTION_SECONDS
+    active_status_timeout_seconds: float = DEFAULT_TASK_ACTIVE_STATUS_TIMEOUT_SECONDS
     worker_id: str | None = None
     worker_concurrency: int = DEFAULT_TASK_WORKER_CONCURRENCY
-    scheduler_owner: str | None = None
+    worker_shutdown_grace_seconds: float = DEFAULT_TASK_WORKER_SHUTDOWN_GRACE_SECONDS
+    visibility_timeout_seconds: float = DEFAULT_TASK_VISIBILITY_TIMEOUT_SECONDS
+    wait_timeout_seconds: float = DEFAULT_TASK_WAIT_TIMEOUT_SECONDS
+    max_delivery_attempts: int = DEFAULT_TASK_DELIVERY_ATTEMPTS
+    result_retention_seconds: float = DEFAULT_TASK_RESULT_RETENTION_SECONDS
+    max_result_bytes: int = DEFAULT_TASK_RESULT_BYTES
 
     def __post_init__(self) -> None:
         try:
@@ -77,11 +93,41 @@ class TasksSettings(BaseSettings):
                 or self.worker_concurrency < 1
             ):
                 raise ValueError("worker_concurrency must be a positive integer.")
+            for field_name, value in (
+                ("visibility_timeout_seconds", self.visibility_timeout_seconds),
+                ("wait_timeout_seconds", self.wait_timeout_seconds),
+                ("worker_shutdown_grace_seconds", self.worker_shutdown_grace_seconds),
+                ("result_retention_seconds", self.result_retention_seconds),
+                ("active_status_timeout_seconds", self.active_status_timeout_seconds),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int | float):
+                    raise ValueError(f"{field_name} must be a positive finite number.")
+                if value <= 0 or not isfinite(value):
+                    raise ValueError(f"{field_name} must be a positive finite number.")
+            if (
+                self.visibility_timeout_seconds
+                < MINIMUM_TASK_VISIBILITY_TIMEOUT_SECONDS
+            ):
+                raise ValueError(
+                    "visibility_timeout_seconds must be at least "
+                    f"{MINIMUM_TASK_VISIBILITY_TIMEOUT_SECONDS} seconds."
+                )
+            for field_name, value in (
+                ("max_delivery_attempts", self.max_delivery_attempts),
+                ("max_result_bytes", self.max_result_bytes),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValueError(f"{field_name} must be a positive integer.")
+            if self.max_delivery_attempts > MAX_TASK_DELIVERY_ATTEMPTS:
+                raise ValueError(
+                    "max_delivery_attempts must not exceed "
+                    f"{MAX_TASK_DELIVERY_ATTEMPTS}."
+                )
+            if self.max_result_bytes > MAX_TASK_RESULT_BYTES:
+                raise ValueError(
+                    f"max_result_bytes must not exceed {MAX_TASK_RESULT_BYTES}."
+                )
             worker_id = _optional_string(self.worker_id, "worker_id")
-            scheduler_owner = _optional_string(
-                self.scheduler_owner,
-                "scheduler_owner",
-            )
         except ConfigurationError:
             raise
         except (TypeError, ValueError) as exc:
@@ -110,13 +156,39 @@ class TasksSettings(BaseSettings):
         object.__setattr__(self, "status_retention_seconds", retention)
         object.__setattr__(
             self,
-            "worker_id",
-            worker_id,
+            "active_status_timeout_seconds",
+            float(self.active_status_timeout_seconds),
         )
         object.__setattr__(
             self,
-            "scheduler_owner",
-            scheduler_owner,
+            "visibility_timeout_seconds",
+            float(self.visibility_timeout_seconds),
+        )
+        object.__setattr__(
+            self,
+            "wait_timeout_seconds",
+            float(self.wait_timeout_seconds),
+        )
+        object.__setattr__(
+            self,
+            "worker_shutdown_grace_seconds",
+            float(self.worker_shutdown_grace_seconds),
+        )
+        object.__setattr__(
+            self,
+            "max_delivery_attempts",
+            self.max_delivery_attempts,
+        )
+        object.__setattr__(
+            self,
+            "result_retention_seconds",
+            float(self.result_retention_seconds),
+        )
+        object.__setattr__(self, "max_result_bytes", self.max_result_bytes)
+        object.__setattr__(
+            self,
+            "worker_id",
+            worker_id,
         )
 
     @property
