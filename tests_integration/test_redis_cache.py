@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import AsyncExitStack
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ import pytest
 import redis.asyncio as redis
 from fastapi import FastAPI
 from starlette.requests import Request
+from taskiq import AckableMessage
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import ExecWaitStrategy
 from tests.cache_feature_conformance import (
@@ -46,7 +48,15 @@ from wybra.cache.redis_streams import RedisStreamCache
 from wybra.config import MappingConfigSource
 from wybra.messages import MessagesCapability
 from wybra.sessions import NamedCacheSessionStorage, SessionRecord
-from wybra.site import start
+from wybra.site import SiteCapabilityError, start
+from wybra.tasks import RetryPolicy, current_task_context, task
+from wybra.tasks.lifecycle import TaskLifecycleKind, TaskState
+from wybra.tasks.settings import TasksSettings
+from wybra.tasks.taskiq_protocol import (
+    DELIVERY_ATTEMPT_LABEL,
+    DELIVERY_IDENTITY_LABEL,
+)
+from wybra.tasks.taskiq_runtime import build_taskiq_capability
 
 DEFAULT_REDIS_IMAGE = "redis:8.2-alpine"
 REDIS_IMAGE_ENV = "WYBRA_TESTCONTAINERS_REDIS_IMAGE"
@@ -219,6 +229,409 @@ async def test_redis_advanced_features_pass_shared_conformance(
         )
     finally:
         await caches.close()
+
+
+async def _build_redis_taskiq_runtime(
+    cleanup: AsyncExitStack,
+    redis_url: str,
+    namespace: str,
+    settings: TasksSettings,
+) -> tuple[Any, Any]:
+    caches = await build_caches(redis_settings(redis_url, namespace))
+    cleanup.push_async_callback(caches.close)
+    cache = caches.require("default")
+    capability = build_taskiq_capability(cache, settings, None)
+    cleanup.push_async_callback(capability.close)
+    return capability, cache
+
+
+async def _next_taskiq_delivery(
+    listener: AsyncIterator[bytes | AckableMessage],
+    *,
+    description: str,
+) -> AckableMessage:
+    try:
+        async with asyncio.timeout(5):
+            delivery = await anext(listener)
+    except TimeoutError as exc:
+        raise AssertionError(f"Timed out waiting for {description}.") from exc
+    assert isinstance(delivery, AckableMessage)
+    return delivery
+
+
+@pytest.mark.anyio
+async def test_redis_taskiq_runtimes_share_execution_status_and_result(
+    redis_url: str,
+) -> None:
+    namespace = f"taskiq_{uuid4().hex}"
+
+    @task(name="tests.redis_taskiq_runtime")
+    async def operation(value: str) -> str:
+        return value.upper()
+
+    async with AsyncExitStack() as cleanup:
+        submitter, submitter_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="submitter"),
+        )
+        worker, _worker_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="worker"),
+        )
+        observer, observer_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="observer"),
+        )
+        submitter.register(operation)
+        worker.register(operation)
+        listener = worker.broker.listen()
+        cleanup.push_async_callback(listener.aclose)
+
+        handle = await submitter.submit(operation, operation.payload("complete"))
+        received = await _next_taskiq_delivery(
+            listener,
+            description="the submitted Taskiq task",
+        )
+        await worker.receiver().callback(received)
+
+        status = await observer.status(handle.task_id)
+        lifecycle = await observer.lifecycle(handle.task_id)
+        result = await observer.broker.result_backend.get_result(str(handle.task_id))
+
+        assert status is not None
+        assert status.state is TaskState.SUCCEEDED
+        assert [event.kind for event in lifecycle] == [
+            TaskLifecycleKind.SUBMITTED,
+            TaskLifecycleKind.STARTED,
+            TaskLifecycleKind.SUCCEEDED,
+        ]
+        assert result.is_err is False
+        assert result.return_value is None
+
+        projection = await submitter_cache.require(AtomicCacheCapability).get(
+            "task-lifecycle",
+            f"status:{handle.task_id}",
+        )
+        assert projection is not None
+        assert await submitter_cache.require(AtomicCacheCapability).compare_and_delete(
+            "task-lifecycle",
+            f"status:{handle.task_id}",
+            projection.revision,
+        )
+        assert (
+            await observer_cache.require(AtomicCacheCapability).get(
+                "task-lifecycle",
+                f"status:{handle.task_id}",
+            )
+            is None
+        )
+
+        recovered, recovered_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="recovered"),
+        )
+        await recovered.broker.startup()
+
+        assert (
+            await recovered_cache.require(AtomicCacheCapability).get(
+                "task-lifecycle",
+                f"status:{handle.task_id}",
+            )
+            is not None
+        )
+        recovered_status = await recovered.status(handle.task_id)
+        assert recovered_status is not None
+        assert recovered_status.state is TaskState.SUCCEEDED
+
+
+@pytest.mark.anyio
+async def test_redis_taskiq_retry_moves_between_worker_runtimes(
+    redis_url: str,
+) -> None:
+    namespace = f"taskiq_retry_{uuid4().hex}"
+
+    @task(
+        name="tests.redis_taskiq_retry",
+        retry=RetryPolicy(max_attempts=2),
+    )
+    async def operation() -> None:
+        context = current_task_context()
+        assert context is not None
+        if context.attempt == 1:
+            raise RuntimeError("retry")
+
+    async with AsyncExitStack() as cleanup:
+        submitter, _submitter_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="submitter"),
+        )
+        first_worker, _first_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="worker-one"),
+        )
+        second_worker, _second_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="worker-two"),
+        )
+        for capability in (submitter, first_worker, second_worker):
+            capability.register(operation)
+        first_listener = first_worker.broker.listen()
+        cleanup.push_async_callback(first_listener.aclose)
+        second_listener = second_worker.broker.listen()
+        cleanup.push_async_callback(second_listener.aclose)
+
+        handle = await submitter.submit(operation, operation.payload())
+        await first_worker.receiver().callback(
+            await _next_taskiq_delivery(
+                first_listener,
+                description="the first task attempt",
+            )
+        )
+        await second_worker.receiver().callback(
+            await _next_taskiq_delivery(
+                second_listener,
+                description="the retried task attempt",
+            )
+        )
+
+        status = await submitter.status(handle.task_id)
+        lifecycle = await submitter.lifecycle(handle.task_id)
+
+        assert status is not None
+        assert status.state is TaskState.SUCCEEDED
+        assert status.attempt == 2
+        assert [event.kind for event in lifecycle] == [
+            TaskLifecycleKind.SUBMITTED,
+            TaskLifecycleKind.STARTED,
+            TaskLifecycleKind.ATTEMPT_FAILED,
+            TaskLifecycleKind.RETRY_SCHEDULED,
+            TaskLifecycleKind.STARTED,
+            TaskLifecycleKind.SUCCEEDED,
+        ]
+        assert [
+            event.worker_id
+            for event in lifecycle
+            if event.kind is TaskLifecycleKind.STARTED
+        ] == ["worker-one", "worker-two"]
+
+
+@pytest.mark.anyio
+async def test_redis_taskiq_recovers_a_delivery_after_worker_loss(
+    redis_url: str,
+) -> None:
+    namespace = f"taskiq_recovery_{uuid4().hex}"
+    execution_started = asyncio.Event()
+    release_execution = asyncio.Event()
+
+    @task(name="tests.redis_taskiq_recovery")
+    async def operation() -> None:
+        execution_started.set()
+        await release_execution.wait()
+
+    async with AsyncExitStack() as cleanup:
+        submitter, _submitter_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="submitter"),
+        )
+        first_worker, _first_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(
+                backend="taskiq",
+                worker_id="worker-one",
+                visibility_timeout_seconds=0.1,
+            ),
+        )
+        second_worker, _second_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(
+                backend="taskiq",
+                worker_id="worker-two",
+                visibility_timeout_seconds=0.1,
+            ),
+        )
+        for capability in (submitter, first_worker, second_worker):
+            capability.register(operation)
+        first_listener = first_worker.broker.listen()
+        cleanup.push_async_callback(first_listener.aclose)
+        second_listener = second_worker.broker.listen()
+        cleanup.push_async_callback(second_listener.aclose)
+
+        handle = await submitter.submit(operation, operation.payload())
+        first_delivery = await _next_taskiq_delivery(
+            first_listener,
+            description="the first worker delivery",
+        )
+        await first_listener.aclose()
+        second_delivery = await _next_taskiq_delivery(
+            second_listener,
+            description="the recovered worker delivery",
+        )
+
+        first_message = first_worker.broker.formatter.loads(message=first_delivery.data)
+        second_message = second_worker.broker.formatter.loads(
+            message=second_delivery.data
+        )
+        assert first_message.task_id == second_message.task_id == str(handle.task_id)
+        assert [
+            first_message.labels[DELIVERY_ATTEMPT_LABEL],
+            second_message.labels[DELIVERY_ATTEMPT_LABEL],
+        ] == [1, 2]
+        assert (
+            first_message.labels[DELIVERY_IDENTITY_LABEL]
+            == second_message.labels[DELIVERY_IDENTITY_LABEL]
+        )
+        with pytest.raises(CacheConflictError):
+            await first_delivery.ack()
+
+        execution = asyncio.create_task(
+            second_worker.receiver().callback(second_delivery)
+        )
+        try:
+            async with asyncio.timeout(5):
+                await execution_started.wait()
+        except TimeoutError as exc:
+            release_execution.set()
+            await execution
+            raise AssertionError(
+                "Timed out waiting for recovered task execution."
+            ) from exc
+        finally:
+            release_execution.set()
+        await execution
+
+        status = await submitter.status(handle.task_id)
+
+        assert status is not None
+        assert status.state is TaskState.SUCCEEDED
+        assert status.attempt == 1
+
+
+@pytest.mark.anyio
+async def test_redis_taskiq_runtimes_do_not_execute_one_delivery_twice(
+    redis_url: str,
+) -> None:
+    namespace = f"taskiq_race_{uuid4().hex}"
+
+    @task(name="tests.redis_taskiq_race")
+    async def operation() -> None:
+        return None
+
+    async with AsyncExitStack() as cleanup:
+        submitter, _submitter_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="submitter"),
+        )
+        first_worker, _first_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="worker-one"),
+        )
+        second_worker, _second_cache = await _build_redis_taskiq_runtime(
+            cleanup,
+            redis_url,
+            namespace,
+            TasksSettings(backend="taskiq", worker_id="worker-two"),
+        )
+        for capability in (submitter, first_worker, second_worker):
+            capability.register(operation)
+        first_listener = first_worker.broker.listen()
+        cleanup.push_async_callback(first_listener.aclose)
+        second_listener = second_worker.broker.listen()
+        cleanup.push_async_callback(second_listener.aclose)
+
+        handle = await submitter.submit(operation, operation.payload())
+        reservations = {
+            asyncio.create_task(
+                _next_taskiq_delivery(
+                    first_listener,
+                    description="the first competing worker delivery",
+                )
+            ): first_worker,
+            asyncio.create_task(
+                _next_taskiq_delivery(
+                    second_listener,
+                    description="the second competing worker delivery",
+                )
+            ): second_worker,
+        }
+        done, pending = await asyncio.wait(
+            reservations,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert len(done) == 1
+        for reservation in pending:
+            reservation.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+        reservation = done.pop()
+        worker = reservations[reservation]
+        await worker.receiver().callback(reservation.result())
+
+        lifecycle = await submitter.lifecycle(handle.task_id)
+        assert [event.kind for event in lifecycle] == [
+            TaskLifecycleKind.SUBMITTED,
+            TaskLifecycleKind.STARTED,
+            TaskLifecycleKind.SUCCEEDED,
+        ]
+        assert lifecycle[1].worker_id in {"worker-one", "worker-two"}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("features", "missing_feature"),
+    (
+        (("lease", "stream", "time", "work-queue"), "AtomicCacheCapability"),
+        (("atomic", "stream", "time", "work-queue"), "LeaseCacheCapability"),
+        (("atomic", "lease", "time", "work-queue"), "StreamCacheCapability"),
+        (("atomic", "lease", "stream", "work-queue"), "CacheTimeCapability"),
+        (("atomic", "lease", "stream", "time"), "WorkQueueCacheCapability"),
+    ),
+    ids=("atomic", "lease", "stream", "time", "work-queue"),
+)
+async def test_redis_taskiq_startup_requires_all_runtime_cache_features(
+    redis_url: str,
+    features: tuple[str, ...],
+    missing_feature: str,
+) -> None:
+    with pytest.raises(SiteCapabilityError, match=missing_feature):
+        await start(
+            FastAPI(),
+            config_source=MappingConfigSource(
+                {
+                    "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                    "cache": {
+                        "backend": "redis",
+                        "features": features,
+                        "namespace": f"taskiq_features_{uuid4().hex}",
+                        "url": redis_url,
+                    },
+                    "tasks": {"backend": "taskiq"},
+                }
+            ),
+        )
 
 
 @pytest.mark.anyio
