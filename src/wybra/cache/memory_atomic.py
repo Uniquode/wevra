@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from wybra.cache.feature_models import (
     AtomicCacheValue,
@@ -11,11 +13,15 @@ from wybra.cache.feature_models import (
     CacheFeatureError,
     CacheRevision,
     CounterCacheValue,
+    LeaseToken,
     validate_payload,
     validate_positive_finite,
     validate_positive_integer,
     validate_resource,
 )
+
+if TYPE_CHECKING:
+    from wybra.cache.memory_leases import InMemoryLeaseCache
 
 type Clock = Callable[[], float]
 type StorageKey = tuple[str, str]
@@ -30,8 +36,9 @@ class _AtomicEntry:
 
 @dataclass(slots=True)
 class InMemoryAtomicCache:
-    clock: Clock = field(default=time.monotonic, repr=False)
+    clock: Clock = field(default=time.time, repr=False)
     max_entries: int = 10_000
+    leases: InMemoryLeaseCache | None = field(default=None, repr=False)
     _entries: dict[StorageKey, _AtomicEntry] = field(default_factory=dict, init=False)
     _next_revision: int = field(default=0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
@@ -56,11 +63,12 @@ class InMemoryAtomicCache:
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None:
         storage_key = _storage_key(owner, key)
         value = validate_payload(value)
         ttl = validate_positive_finite(ttl, label="atomic value TTL")
-        async with self._lock:
+        async with self._fence(lease):
             if self._live_entry(storage_key) is not None:
                 return None
             self._ensure_capacity(storage_key)
@@ -80,11 +88,12 @@ class InMemoryAtomicCache:
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None:
         storage_key = _storage_key(owner, key)
         value = validate_payload(value)
         ttl = validate_positive_finite(ttl, label="atomic value TTL")
-        async with self._lock:
+        async with self._fence(lease):
             entry = self._live_entry(storage_key)
             if entry is None or entry.revision != expected:
                 return None
@@ -103,9 +112,11 @@ class InMemoryAtomicCache:
         owner: str,
         key: str,
         expected: CacheRevision,
+        *,
+        lease: LeaseToken | None = None,
     ) -> bool:
         storage_key = _storage_key(owner, key)
-        async with self._lock:
+        async with self._fence(lease):
             entry = self._live_entry(storage_key)
             if entry is None or entry.revision != expected:
                 return False
@@ -169,6 +180,28 @@ class InMemoryAtomicCache:
     def _revision(self) -> CacheRevision:
         self._next_revision += 1
         return CacheRevision(self._next_revision)
+
+    def bind_lease_fence(self, leases: InMemoryLeaseCache) -> None:
+        if self.leases is not None and self.leases is not leases:
+            raise CacheFeatureError(
+                "Atomic cache lease fencing is already bound to another lease cache."
+            )
+        self.leases = leases
+
+    @asynccontextmanager
+    async def _fence(self, lease: LeaseToken | None):
+        if lease is None:
+            async with self._lock:
+                yield
+            return
+        if self.leases is None:
+            raise CacheFeatureError(
+                "Atomic cache does not support lease-fenced writes."
+            )
+        async with self.leases.hold_fence(lease) as validate:
+            async with self._lock:
+                validate(lease)
+                yield
 
 
 def _storage_key(owner: str, key: str) -> StorageKey:

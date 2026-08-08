@@ -9,12 +9,22 @@ from wybra.cache.feature_models import (
     CacheFeatureError,
     CacheRevision,
     CounterCacheValue,
+    LeaseToken,
+    validate_lease_token,
     validate_payload,
     validate_resource,
 )
 from wybra.cache.redis_runtime import RedisCacheRuntime
 
 CREATE_SCRIPT = """
+if ARGV[3] ~= '' then
+    if redis.call('hget', KEYS[3], 'holder') ~= ARGV[3]
+        or redis.call('hget', KEYS[3], 'token') ~= ARGV[4]
+        or redis.call('hget', KEYS[3], 'fencing_token') ~= ARGV[5]
+    then
+        return {-2}
+    end
+end
 if redis.call('exists', KEYS[1]) == 1 then
     return {0}
 end
@@ -35,6 +45,14 @@ return {1, revision}
 """
 
 COMPARE_AND_SWAP_SCRIPT = """
+if ARGV[4] ~= '' then
+    if redis.call('hget', KEYS[3], 'holder') ~= ARGV[4]
+        or redis.call('hget', KEYS[3], 'token') ~= ARGV[5]
+        or redis.call('hget', KEYS[3], 'fencing_token') ~= ARGV[6]
+    then
+        return {-2}
+    end
+end
 local current_revision = redis.call('hget', KEYS[1], 'revision')
 if not current_revision then
     return {0}
@@ -60,6 +78,14 @@ return {1, revision}
 """
 
 COMPARE_AND_DELETE_SCRIPT = """
+if ARGV[2] ~= '' then
+    if redis.call('hget', KEYS[2], 'holder') ~= ARGV[2]
+        or redis.call('hget', KEYS[2], 'token') ~= ARGV[3]
+        or redis.call('hget', KEYS[2], 'fencing_token') ~= ARGV[4]
+    then
+        return {-2}
+    end
+end
 local current_revision = redis.call('hget', KEYS[1], 'revision')
 if not current_revision then
     return {0}
@@ -129,24 +155,30 @@ class RedisAtomicCache:
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None:
         entry_key = self._entry_key(owner, key)
         value = validate_payload(value)
         ttl_ms = self.runtime.ttl_milliseconds(ttl, label="atomic value TTL")
+        lease_key, lease_arguments = self._lease_arguments(lease)
 
         async def create_value(client: Any) -> Any:
             return await client.eval(
                 CREATE_SCRIPT,
-                2,
+                3,
                 entry_key,
                 self.runtime.sequence_key("atomic-revision"),
+                lease_key,
                 value,
                 ttl_ms,
+                *lease_arguments,
             )
 
         result = _script_result(await self.runtime.feature_call(create_value))
         if result[0] == 0:
             return None
+        if result[0] == -2:
+            raise CacheConflictError("Lease is stale or no longer held.")
         _require_success(result, length=2)
         return AtomicCacheValue(value, CacheRevision(_integer(result[1])))
 
@@ -158,26 +190,32 @@ class RedisAtomicCache:
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None:
         entry_key = self._entry_key(owner, key)
         expected = _revision(expected)
         value = validate_payload(value)
         ttl_ms = self.runtime.ttl_milliseconds(ttl, label="atomic value TTL")
+        lease_key, lease_arguments = self._lease_arguments(lease)
 
         async def swap(client: Any) -> Any:
             return await client.eval(
                 COMPARE_AND_SWAP_SCRIPT,
-                2,
+                3,
                 entry_key,
                 self.runtime.sequence_key("atomic-revision"),
+                lease_key,
                 expected.value,
                 value,
                 ttl_ms,
+                *lease_arguments,
             )
 
         result = _script_result(await self.runtime.feature_call(swap))
         if result[0] == 0:
             return None
+        if result[0] == -2:
+            raise CacheConflictError("Lease is stale or no longer held.")
         if result[0] == -1:
             raise CacheConflictError("The requested atomic key contains a counter.")
         _require_success(result, length=2)
@@ -188,21 +226,28 @@ class RedisAtomicCache:
         owner: str,
         key: str,
         expected: CacheRevision,
+        *,
+        lease: LeaseToken | None = None,
     ) -> bool:
         entry_key = self._entry_key(owner, key)
         expected = _revision(expected)
+        lease_key, lease_arguments = self._lease_arguments(lease)
 
         async def delete(client: Any) -> Any:
             return await client.eval(
                 COMPARE_AND_DELETE_SCRIPT,
-                1,
+                2,
                 entry_key,
+                lease_key,
                 expected.value,
+                *lease_arguments,
             )
 
         result = _script_result(await self.runtime.feature_call(delete))
         if result[0] == -1:
             raise CacheConflictError("The requested atomic key contains a counter.")
+        if result[0] == -2:
+            raise CacheConflictError("Lease is stale or no longer held.")
         if result[0] not in {0, 1}:
             raise CacheFeatureError(
                 "Redis atomic cache operation returned invalid state."
@@ -247,6 +292,22 @@ class RedisAtomicCache:
         validate_resource(owner, label="cache owner")
         validate_resource(key, label="cache key")
         return self.runtime.key("atomic", owner, key)
+
+    def _lease_arguments(
+        self,
+        lease: LeaseToken | None,
+    ) -> tuple[str, tuple[str, str, int]]:
+        if lease is None:
+            return self.runtime.key("lease-fence-unused", "fence", "unused"), (
+                "",
+                "",
+                0,
+            )
+        lease = validate_lease_token(lease)
+        return (
+            self.runtime.key("lease", lease.owner, lease.resource),
+            (lease.holder, lease.token, lease.fencing_token.value),
+        )
 
 
 def _revision(value: CacheRevision) -> CacheRevision:

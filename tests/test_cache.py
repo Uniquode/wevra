@@ -389,6 +389,7 @@ url = "redis://cache/1"
             "pub-sub",
             "schedule",
             "stream",
+            "time",
             "work-queue",
         )
         assert diagnostics[1].features == (
@@ -397,6 +398,7 @@ url = "redis://cache/1"
             "pub-sub",
             "schedule",
             "stream",
+            "time",
             "work-queue",
         )
         assert diagnostics[0].health == "configured"
@@ -1086,6 +1088,40 @@ class TestRedisCache:
 
         with pytest.raises(ValueError, match="namespace must not contain ':'"):
             runtime.key("atomic", "owner", "key")
+
+    @pytest.mark.anyio
+    async def test_redis_runtime_close_waits_for_concurrent_callers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+        client = SimpleNamespace(close_count=0)
+
+        async def close() -> None:
+            client.close_count += 1
+            close_started.set()
+            await allow_close.wait()
+
+        client.aclose = close
+        monkeypatch.setattr(
+            "wybra.cache.redis_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(
+                Redis=SimpleNamespace(from_url=lambda *_args, **_kwargs: client)
+            ),
+        )
+        runtime = RedisCacheRuntime("redis://cache")
+        runtime.client()
+
+        first = asyncio.create_task(runtime.close())
+        await close_started.wait()
+        second = asyncio.create_task(runtime.close())
+        await asyncio.sleep(0)
+        assert second.done() is False
+        allow_close.set()
+        await asyncio.gather(first, second)
+
+        assert client.close_count == 1
 
 
 class TestCacheModule:

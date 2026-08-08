@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 
 from wybra.cache.feature_contracts import (
     AtomicCacheCapability,
+    CacheTimeCapability,
     LeaseCacheCapability,
     PubSubCacheCapability,
     ScheduleCacheCapability,
@@ -21,6 +23,7 @@ from wybra.cache.memory_leases import InMemoryLeaseCache
 from wybra.cache.memory_queues import InMemoryWorkQueue
 from wybra.cache.memory_schedules import InMemoryScheduleCache
 from wybra.cache.memory_streams import InMemoryPubSubCache, InMemoryStreamCache
+from wybra.cache.memory_time import InMemoryCacheTime
 
 
 def _process_local(
@@ -53,6 +56,10 @@ MEMORY_ATOMIC_FEATURE = CacheFeatureMetadata(
 MEMORY_LEASE_FEATURE = CacheFeatureMetadata(
     "lease",
     _process_local(ordering_scope="resource"),
+)
+MEMORY_TIME_FEATURE = CacheFeatureMetadata(
+    "time",
+    _process_local(ordering_scope="clock"),
 )
 MEMORY_WORK_QUEUE_FEATURE = CacheFeatureMetadata(
     "work-queue",
@@ -87,6 +94,7 @@ MEMORY_CACHE_FEATURES = frozenset(
     for feature in (
         MEMORY_ATOMIC_FEATURE,
         MEMORY_LEASE_FEATURE,
+        MEMORY_TIME_FEATURE,
         MEMORY_WORK_QUEUE_FEATURE,
         MEMORY_STREAM_FEATURE,
         MEMORY_PUBSUB_FEATURE,
@@ -99,6 +107,7 @@ MEMORY_CACHE_FEATURES = frozenset(
 class InMemoryCacheFeatures:
     atomic: InMemoryAtomicCache = field(default_factory=InMemoryAtomicCache)
     leases: InMemoryLeaseCache = field(default_factory=InMemoryLeaseCache)
+    time: InMemoryCacheTime = field(default_factory=InMemoryCacheTime)
     work_queue: InMemoryWorkQueue = field(default_factory=InMemoryWorkQueue)
     streams: InMemoryStreamCache = field(default_factory=InMemoryStreamCache)
     pubsub: InMemoryPubSubCache = field(default_factory=InMemoryPubSubCache)
@@ -106,6 +115,19 @@ class InMemoryCacheFeatures:
     _closed: bool = field(default=False, init=False, repr=False)
     _work_queue_closed: bool = field(default=False, init=False, repr=False)
     _pubsub_closed: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        cache_clock = self.time.now
+        if self.atomic.clock is time.time:
+            self.atomic.clock = cache_clock
+        if self.leases.clock is time.time:
+            self.leases.clock = cache_clock
+        if getattr(self.work_queue, "clock", None) is time.time:
+            self.work_queue.clock = cache_clock
+        if self.schedules.clock is time.time:
+            self.schedules.clock = cache_clock
+        self.atomic.bind_lease_fence(self.leases)
+        self.streams.bind_lease_fence(self.leases)
 
     def registrations(self) -> tuple[CacheFeatureRegistration, ...]:
         return (
@@ -118,6 +140,11 @@ class InMemoryCacheFeatures:
                 LeaseCacheCapability,
                 self.leases,
                 MEMORY_LEASE_FEATURE,
+            ),
+            CacheFeatureRegistration(
+                CacheTimeCapability,
+                self.time,
+                MEMORY_TIME_FEATURE,
             ),
             CacheFeatureRegistration(
                 WorkQueueCacheCapability,
@@ -189,5 +216,6 @@ __all__ = (
     "MEMORY_PUBSUB_FEATURE",
     "MEMORY_SCHEDULE_FEATURE",
     "MEMORY_STREAM_FEATURE",
+    "MEMORY_TIME_FEATURE",
     "MEMORY_WORK_QUEUE_FEATURE",
 )

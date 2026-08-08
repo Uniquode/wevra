@@ -20,6 +20,20 @@ def _decode_default_result(payload: bytes) -> TaskiqResult[Any]:
     return TaskiqResult.model_validate_json(payload)
 
 
+def safe_taskiq_result_encoder(result: TaskiqResult[Any]) -> bytes:
+    """Serialise only Taskiq result readiness metadata for the configured runtime."""
+
+    safe_result = result.model_copy(
+        update={
+            "error": None,
+            "labels": {},
+            "log": None,
+            "return_value": None,
+        }
+    )
+    return safe_result.model_dump_json().encode()
+
+
 @dataclass(frozen=True, slots=True)
 class TaskiqResultPolicy:
     """Caller-owned retention and safe serialisation policy for Taskiq results."""
@@ -104,4 +118,8 @@ class CacheTaskiqResultBackend(AsyncResultBackend[Any]):
         return result.model_copy(update={"log": None})
 
 
-__all__ = ("CacheTaskiqResultBackend", "TaskiqResultPolicy")
+__all__ = (
+    "CacheTaskiqResultBackend",
+    "TaskiqResultPolicy",
+    "safe_taskiq_result_encoder",
+)

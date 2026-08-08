@@ -10,7 +10,6 @@ from wybra.tasks import (
     TaskDeclarationError,
     TaskPayload,
     TaskPayloadError,
-    TaskRegistry,
     current_task_context,
     task,
 )
@@ -28,28 +27,22 @@ def test_task_package_exposes_public_declaration_contracts() -> None:
         "TaskPayloadError",
         "TaskProgressError",
         "TaskRegistrationError",
-        "TaskRegistry",
         "current_task_context",
         "task",
     } <= set(wybra.tasks.__all__)
 
 
 def test_task_declaration_uses_explicit_identity() -> None:
-    registry = TaskRegistry()
-
-    @task(name="messages.send", version=2, registry=registry)
+    @task(name="messages.send", version=2)
     async def send_message(recipient: str) -> str:
         return recipient
 
     assert send_message.identity.name == "messages.send"
     assert send_message.identity.version == 2
-    assert registry.require(send_message.identity) is send_message
 
 
 def test_task_declaration_derives_identity_from_function() -> None:
-    registry = TaskRegistry()
-
-    @task(registry=registry)
+    @task()
     async def rebuild_index() -> None:
         return None
 
@@ -58,42 +51,34 @@ def test_task_declaration_derives_identity_from_function() -> None:
 
 
 def test_task_declaration_rejects_synchronous_function() -> None:
-    registry = TaskRegistry()
-
     with pytest.raises(TaskDeclarationError, match="async function"):
 
-        @task(registry=registry)
+        @task()
         def synchronous_task() -> None:
             return None
 
 
 def test_task_declaration_rejects_variadic_positional_parameters() -> None:
-    registry = TaskRegistry()
-
     with pytest.raises(TaskDeclarationError, match="variadic"):
 
-        @task(registry=registry)
+        @task()
         async def variadic_positional(*values: int) -> None:
             del values
 
 
 def test_task_declaration_rejects_variadic_keyword_parameters() -> None:
-    registry = TaskRegistry()
-
     with pytest.raises(TaskDeclarationError, match="variadic"):
 
-        @task(registry=registry)
+        @task()
         async def variadic_keyword(**values: int) -> None:
             del values
 
 
 @pytest.mark.parametrize("version", (0, -1, True))
 def test_task_declaration_rejects_invalid_schema_version(version: int) -> None:
-    registry = TaskRegistry()
-
     with pytest.raises(TaskDeclarationError, match="positive integer"):
 
-        @task(version=version, registry=registry)
+        @task(version=version)
         async def invalid_version() -> None:
             return None
 
@@ -103,29 +88,8 @@ def test_task_identity_rejects_non_string_name() -> None:
         wybra.tasks.TaskIdentity(name=123)  # type: ignore[arg-type]
 
 
-def test_task_registry_rejects_duplicate_identity() -> None:
-    registry = TaskRegistry()
-
-    @task(name="messages.send", registry=registry)
-    async def first() -> None:
-        return None
-
-    with pytest.raises(
-        wybra.tasks.TaskRegistrationError,
-        match="already registered",
-    ):
-
-        @task(name="messages.send", registry=registry)
-        async def second() -> None:
-            return None
-
-    assert registry.require(first.identity) is first
-
-
 def test_task_payload_validates_and_serialises_arguments() -> None:
-    registry = TaskRegistry()
-
-    @task(registry=registry)
+    @task()
     async def resize(width: int, *, format_name: str = "webp") -> None:
         return None
 
@@ -141,9 +105,7 @@ class UnsupportedPayload:
 
 
 def test_task_payload_rejects_non_serialisable_arguments() -> None:
-    registry = TaskRegistry()
-
-    @task(registry=registry)
+    @task()
     async def unsupported(value: object) -> None:
         return None
 
@@ -187,9 +149,7 @@ def test_retry_policy_rejects_non_finite_values(
 
 @pytest.mark.anyio
 async def test_task_runs_directly_without_site_or_capability() -> None:
-    registry = TaskRegistry()
-
-    @task(registry=registry)
+    @task()
     async def total(left: int, right: int) -> int:
         return left + right
 
@@ -198,10 +158,9 @@ async def test_task_runs_directly_without_site_or_capability() -> None:
 
 @pytest.mark.anyio
 async def test_direct_task_preserves_original_exception() -> None:
-    registry = TaskRegistry()
     failure = RuntimeError("failed")
 
-    @task(registry=registry)
+    @task()
     async def fail() -> None:
         raise failure
 
@@ -213,9 +172,7 @@ async def test_direct_task_preserves_original_exception() -> None:
 
 @pytest.mark.anyio
 async def test_direct_task_exposes_execution_context() -> None:
-    registry = TaskRegistry()
-
-    @task(name="context.inspect", version=3, registry=registry)
+    @task(name="context.inspect", version=3)
     async def inspect_context() -> tuple[str, int, int]:
         context = current_task_context()
         assert context is not None
@@ -227,15 +184,13 @@ async def test_direct_task_exposes_execution_context() -> None:
 
 @pytest.mark.anyio
 async def test_nested_direct_task_inherits_correlation_and_records_causation() -> None:
-    registry = TaskRegistry()
-
-    @task(name="context.child", registry=registry)
+    @task(name="context.child")
     async def child() -> tuple[object, object]:
         context = current_task_context()
         assert context is not None
         return context.correlation_id, context.causation_id
 
-    @task(name="context.parent", registry=registry)
+    @task(name="context.parent")
     async def parent() -> tuple[object, object, object]:
         parent_context = current_task_context()
         assert parent_context is not None

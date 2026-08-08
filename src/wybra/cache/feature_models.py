@@ -25,6 +25,10 @@ class CacheConflictError(CacheFeatureError):
     """Raised when a revision, delivery, lease, or claim is stale."""
 
 
+class CacheWorkQueueRejectedError(CacheFeatureError):
+    """Raised when a work queue definitively rejects a publication."""
+
+
 class CachePositionExpiredError(CacheFeatureError):
     """Raised when a requested stream position is no longer retained."""
 
@@ -115,6 +119,12 @@ class LeaseToken:
         validate_resource(self.holder, label="lease holder")
         validate_finite(self.expires_at, label="lease expiry")
         validate_resource(self.token, label="lease token")
+
+
+def validate_lease_token(lease: LeaseToken) -> LeaseToken:
+    if not isinstance(lease, LeaseToken):
+        raise TypeError("Lease must be a LeaseToken.")
+    return lease
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +307,7 @@ __all__ = (
     "CacheFeatureUnavailableError",
     "CachePositionExpiredError",
     "CacheRevision",
+    "CacheWorkQueueRejectedError",
     "CounterCacheValue",
     "DEFAULT_SCHEDULE_MAX_RECORDS",
     "DEFAULT_STREAM_MAX_CONSUMERS",
@@ -316,6 +327,7 @@ __all__ = (
     "validate_feature_name",
     "validate_finite",
     "validate_limit",
+    "validate_lease_token",
     "validate_non_negative_finite",
     "validate_payload",
     "validate_positive_finite",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import Any, cast
 from uuid import uuid4
@@ -205,6 +205,12 @@ _ACKNOWLEDGE_SCRIPT = """
 if redis.call('hget', KEYS[5], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
     return 0
 end
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local deadline = redis.call('zscore', KEYS[6], ARGV[2])
+if deadline == false or tonumber(deadline) <= milliseconds then
+    return 0
+end
 redis.call('xack', KEYS[1], ARGV[1], ARGV[2])
 redis.call('xdel', KEYS[1], ARGV[2])
 redis.call('hdel', KEYS[2], ARGV[4])
@@ -214,8 +220,31 @@ redis.call('hdel', KEYS[5], ARGV[2])
 redis.call('zrem', KEYS[6], ARGV[2])
 return 1
 """
+_RENEW_SCRIPT = """
+if redis.call('hget', KEYS[1], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
+    return {}
+end
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local previous_deadline = redis.call('zscore', KEYS[2], ARGV[2])
+if previous_deadline == false or tonumber(previous_deadline) <= milliseconds then
+    return {}
+end
+local deadline = milliseconds
+    + tonumber(ARGV[6])
+redis.call('zadd', KEYS[2], deadline, ARGV[2])
+redis.call('hset', KEYS[3], ARGV[5], ARGV[6])
+redis.call('pexpire', KEYS[3], math.max(tonumber(ARGV[6]), 604800000))
+return {deadline}
+"""
 _REJECT_SCRIPT = """
 if redis.call('hget', KEYS[7], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
+    return 0
+end
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local deadline = redis.call('zscore', KEYS[8], ARGV[2])
+if deadline == false or tonumber(deadline) <= milliseconds then
     return 0
 end
 local attempt = tonumber(redis.call('hget', KEYS[5], ARGV[4]))
@@ -239,16 +268,19 @@ if tonumber(ARGV[5]) == 0 then
     redis.call('xadd', KEYS[1], '*', 'i', ARGV[4])
     return 1
 end
-local now = redis.call('time')
-local due = tonumber(now[1]) * 1000
-    + math.floor(tonumber(now[2]) / 1000)
-    + tonumber(ARGV[5])
+local due = milliseconds + tonumber(ARGV[5])
 redis.call('zadd', KEYS[2], due, ARGV[4])
 redis.call('xadd', KEYS[9], 'MAXLEN', '~', ARGV[7], '*', 'i', ARGV[4])
 return 1
 """
 _DEAD_LETTER_SCRIPT = """
 if redis.call('hget', KEYS[6], ARGV[2]) ~= ARGV[3] .. '|' .. ARGV[4] then
+    return 0
+end
+local now = redis.call('time')
+local milliseconds = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+local deadline = redis.call('zscore', KEYS[7], ARGV[2])
+if deadline == false or tonumber(deadline) <= milliseconds then
     return 0
 end
 local payload = redis.call('hget', KEYS[2], ARGV[4])
@@ -483,6 +515,60 @@ class RedisWorkQueue:
 
     async def acknowledge(self, delivery: WorkDelivery) -> None:
         await self._settle(delivery, action="acknowledge", delay_milliseconds=0)
+
+    async def renew(
+        self,
+        delivery: WorkDelivery,
+        *,
+        visibility_timeout: float,
+    ) -> WorkDelivery:
+        visibility_timeout = validate_positive_finite(
+            visibility_timeout,
+            label="visibility timeout",
+        )
+        visibility_milliseconds = self.runtime.duration_milliseconds(
+            visibility_timeout,
+            label="visibility timeout",
+        )
+        await self._prune_deliveries()
+        state = self._state_for_delivery(delivery)
+
+        async def renew(client: Any) -> object:
+            return await client.eval(
+                _RENEW_SCRIPT,
+                3,
+                state.keys.receipts,
+                state.keys.visible,
+                state.keys.consumers,
+                _GROUP,
+                state.entry_id,
+                delivery.receipt,
+                delivery.identity.value,
+                state.consumer,
+                visibility_milliseconds,
+            )
+
+        renewed = cast(tuple[Any, ...], await self.runtime.feature_call(renew))
+        if len(renewed) != 1:
+            self._deliveries.pop(delivery.receipt, None)
+            await self._remove_consumer_if_idle(state.keys, state.consumer)
+            self._consumers.discard((state.keys, state.consumer))
+            raise CacheConflictError(
+                f"Delivery {delivery.identity.value!r} is stale or no longer reserved."
+            )
+        visible_until = _integer(renewed[0]) / 1_000
+        self._deliveries[delivery.receipt] = replace(
+            state,
+            expires_at=monotonic() + visibility_timeout,
+        )
+        return WorkDelivery(
+            queue=delivery.queue,
+            identity=delivery.identity,
+            payload=delivery.payload,
+            attempt=delivery.attempt,
+            visible_until=visible_until,
+            receipt=delivery.receipt,
+        )
 
     async def reject(self, delivery: WorkDelivery, *, delay: float = 0) -> None:
         delay = validate_non_negative_finite(delay, label="retry delay")

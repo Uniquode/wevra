@@ -10,8 +10,10 @@ from wybra.cache.feature_models import (
     CacheConflictError,
     CacheFeatureError,
     CachePositionExpiredError,
+    LeaseToken,
     StreamPosition,
     StreamRecord,
+    validate_lease_token,
     validate_limit,
     validate_payload,
     validate_positive_integer,
@@ -54,24 +56,30 @@ class RedisStreamCache:
         owner: str,
         stream: str,
         payload: bytes,
+        *,
+        lease: LeaseToken | None = None,
     ) -> StreamPosition:
         keys = self._keys(owner, stream)
         payload = validate_payload(payload)
+        lease_key, lease_arguments = self._lease_arguments(lease)
 
         async def append_record(client: Any) -> object:
             return await client.eval(
                 STREAM_APPEND_SCRIPT,
-                2,
+                3,
                 keys.stream,
                 keys.sequence,
+                lease_key,
                 payload,
                 self.retention_count,
+                "",
+                *lease_arguments,
             )
 
-        return _provider_position(
-            await self.runtime.feature_call(append_record),
-            label="append result",
-        )
+        result = _integer(await self.runtime.feature_call(append_record))
+        if result == 0:
+            raise CacheConflictError("Lease is stale or no longer held.")
+        return _provider_position(result, label="append result")
 
     async def read(
         self,
@@ -194,6 +202,22 @@ class RedisStreamCache:
             sequence=self.runtime.key("stream-sequence", owner, stream),
             consumers=self.runtime.key("stream-consumer", owner, stream),
             stream_name=stream,
+        )
+
+    def _lease_arguments(
+        self,
+        lease: LeaseToken | None,
+    ) -> tuple[str, tuple[str, str, int]]:
+        if lease is None:
+            return self.runtime.key("lease-fence-unused", "fence", "unused"), (
+                "",
+                "",
+                0,
+            )
+        lease = validate_lease_token(lease)
+        return (
+            self.runtime.key("lease", lease.owner, lease.resource),
+            (lease.holder, lease.token, lease.fencing_token.value),
         )
 
 

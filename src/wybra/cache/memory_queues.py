@@ -11,6 +11,7 @@ from uuid import uuid4
 from wybra.cache.feature_models import (
     CacheConflictError,
     CacheFeatureError,
+    CacheWorkQueueRejectedError,
     WorkDelivery,
     WorkIdentity,
     validate_limit,
@@ -106,7 +107,7 @@ class InMemoryWorkQueue:
             self._recover()
             self._ensure_queue_capacity(queue_key)
             if self._active_count(queue_key) >= self.max_items_per_queue:
-                raise CacheFeatureError(
+                raise CacheWorkQueueRejectedError(
                     f"Queue {queue!r} has reached its configured item capacity."
                 )
             self._enqueue(queue_key, item, delay=delay)
@@ -179,6 +180,22 @@ class InMemoryWorkQueue:
             reservation = self._required_reservation(delivery)
             self._inflight.pop(reservation.receipt, None)
             self._prune_queue(reservation.queue_key)
+
+    async def renew(
+        self,
+        delivery: WorkDelivery,
+        *,
+        visibility_timeout: float,
+    ) -> WorkDelivery:
+        visibility_timeout = validate_positive_finite(
+            visibility_timeout,
+            label="visibility timeout",
+        )
+        async with self._condition:
+            self._recover()
+            reservation = self._required_reservation(delivery)
+            reservation.visible_until = self.clock() + visibility_timeout
+            return reservation.delivery()
 
     async def reject(self, delivery: WorkDelivery, *, delay: float = 0) -> None:
         delay = validate_non_negative_finite(delay, label="retry delay")
@@ -319,7 +336,7 @@ class InMemoryWorkQueue:
     def _ensure_queue_capacity(self, queue_key: QueueKey) -> None:
         known_queues = self._known_queues()
         if queue_key not in known_queues and len(known_queues) >= self.max_queues:
-            raise CacheFeatureError(
+            raise CacheWorkQueueRejectedError(
                 "The in-memory work queue has reached its configured queue capacity."
             )
 

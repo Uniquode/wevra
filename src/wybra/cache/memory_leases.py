@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -39,10 +40,21 @@ class _LeaseState:
 
 
 @dataclass(slots=True)
+class _ResourceLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+@dataclass(slots=True)
 class InMemoryLeaseCache:
     clock: Clock = field(default=time.time, repr=False)
     max_leases: int = 10_000
     _leases: dict[LeaseKey, _LeaseState] = field(default_factory=dict, init=False)
+    _resource_locks: dict[LeaseKey, _ResourceLock] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
     _next_fencing_token: int = field(default=0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
 
@@ -60,33 +72,70 @@ class InMemoryLeaseCache:
         lease_key = _lease_key(owner, resource)
         holder = validate_resource(holder, label="lease holder")
         ttl = validate_positive_finite(ttl, label="lease TTL")
-        async with self._lock:
-            current = self._live_lease(lease_key)
-            if current is not None:
-                return None
-            self._ensure_capacity()
-            self._next_fencing_token += 1
-            state = _LeaseState(
-                holder=holder,
-                fencing_token=FencingToken(self._next_fencing_token),
-                expires_at=self.clock() + ttl,
-                token=uuid4().hex,
-            )
-            self._leases[lease_key] = state
-            return state.value(owner, resource)
+        async with self._resource_lock(lease_key):
+            async with self._lock:
+                current = self._live_lease(lease_key)
+                if current is not None:
+                    return None
+                self._ensure_capacity()
+                self._next_fencing_token += 1
+                state = _LeaseState(
+                    holder=holder,
+                    fencing_token=FencingToken(self._next_fencing_token),
+                    expires_at=self.clock() + ttl,
+                    token=uuid4().hex,
+                )
+                self._leases[lease_key] = state
+                return state.value(owner, resource)
 
     async def renew(self, lease: LeaseToken, *, ttl: float) -> LeaseToken:
         ttl = validate_positive_finite(ttl, label="lease TTL")
-        async with self._lock:
-            lease_key, current = self._required_lease(lease)
-            current.expires_at = self.clock() + ttl
-            self._leases[lease_key] = current
-            return current.value(lease.owner, lease.resource)
+        lease_key = _lease_key_from_token(lease)
+        async with self._resource_lock(lease_key):
+            async with self._lock:
+                _lease_key, current = self._required_lease(lease)
+                current.expires_at = self.clock() + ttl
+                self._leases[lease_key] = current
+                return current.value(lease.owner, lease.resource)
 
     async def release(self, lease: LeaseToken) -> None:
+        lease_key = _lease_key_from_token(lease)
+        async with self._resource_lock(lease_key):
+            async with self._lock:
+                _lease_key, _current = self._required_lease(lease)
+                self._leases.pop(lease_key, None)
+
+    @asynccontextmanager
+    async def hold_fence(self, lease: LeaseToken):
+        """Hold a current lease while a fenced feature mutation is applied."""
+        lease_key = _lease_key_from_token(lease)
+        async with self._resource_lock(lease_key):
+            async with self._lock:
+                self._required_lease(lease)
+            yield self._required_lease
+
+    @asynccontextmanager
+    async def _resource_lock(self, lease_key: LeaseKey):
         async with self._lock:
-            lease_key, _current = self._required_lease(lease)
-            self._leases.pop(lease_key, None)
+            resource_lock = self._resource_locks.setdefault(lease_key, _ResourceLock())
+            resource_lock.users += 1
+        try:
+            async with resource_lock.lock:
+                yield
+        finally:
+            async with self._lock:
+                resource_lock.users -= 1
+                self._discard_idle_resource_lock(lease_key)
+
+    def _discard_idle_resource_lock(self, lease_key: LeaseKey) -> None:
+        resource_lock = self._resource_locks.get(lease_key)
+        if (
+            resource_lock is not None
+            and resource_lock.users == 0
+            and not resource_lock.lock.locked()
+            and lease_key not in self._leases
+        ):
+            self._resource_locks.pop(lease_key, None)
 
     def _required_lease(self, lease: LeaseToken) -> tuple[LeaseKey, _LeaseState]:
         lease_key = _lease_key_from_token(lease)
@@ -118,6 +167,7 @@ class InMemoryLeaseCache:
         ]
         for lease_key in expired:
             self._leases.pop(lease_key, None)
+            self._discard_idle_resource_lock(lease_key)
         if len(self._leases) >= self.max_leases:
             raise CacheFeatureError(
                 "The in-memory lease cache has reached its configured lease capacity."

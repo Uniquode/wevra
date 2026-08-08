@@ -30,8 +30,8 @@ from wybra.tasks.models import (
     TaskPayload,
     TaskPayloadError,
     TaskRegistrationError,
+    TaskSubmissionError,
 )
-from wybra.tasks.registry import TaskRegistry
 from wybra.tasks.settings import TasksSettings
 from wybra.tasks.setup import post_setup_site, setup_site
 
@@ -55,7 +55,7 @@ __all__ = (
     "TaskPayloadError",
     "TaskProgressError",
     "TaskRegistrationError",
-    "TaskRegistry",
+    "TaskSubmissionError",
     "TaskState",
     "TaskStatus",
     "TaskSubmissionOptions",

@@ -29,6 +29,7 @@ class AtomicCacheCapability(Protocol):
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None: ...
 
     async def compare_and_swap(
@@ -39,6 +40,7 @@ class AtomicCacheCapability(Protocol):
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None: ...
 
     async def compare_and_delete(
@@ -46,6 +48,8 @@ class AtomicCacheCapability(Protocol):
         owner: str,
         key: str,
         expected: CacheRevision,
+        *,
+        lease: LeaseToken | None = None,
     ) -> bool: ...
 
     async def increment(
@@ -69,9 +73,20 @@ class LeaseCacheCapability(Protocol):
         ttl: float,
     ) -> LeaseToken | None: ...
 
-    async def renew(self, lease: LeaseToken, *, ttl: float) -> LeaseToken: ...
+    async def renew(self, lease: LeaseToken, *, ttl: float) -> LeaseToken:
+        """Extend the same lease identity with a new expiry."""
+        ...
 
     async def release(self, lease: LeaseToken) -> None: ...
+
+
+@runtime_checkable
+class CacheTimeCapability(Protocol):
+    """Provide the cache provider's current Unix timestamp."""
+
+    async def refresh(self) -> float: ...
+
+    def now(self) -> float: ...
 
 
 @runtime_checkable
@@ -96,6 +111,15 @@ class WorkQueueCacheCapability(Protocol):
         wait_timeout: float = 0,
     ) -> WorkDelivery | None: ...
 
+    async def renew(
+        self,
+        delivery: WorkDelivery,
+        *,
+        visibility_timeout: float,
+    ) -> WorkDelivery:
+        """Extend a live delivery lease and return its new visibility deadline."""
+        ...
+
     async def acknowledge(self, delivery: WorkDelivery) -> None: ...
 
     async def reject(self, delivery: WorkDelivery, *, delay: float = 0) -> None: ...
@@ -118,6 +142,8 @@ class StreamCacheCapability(Protocol):
         owner: str,
         stream: str,
         payload: bytes,
+        *,
+        lease: LeaseToken | None = None,
     ) -> StreamPosition: ...
 
     async def read(
@@ -235,6 +261,7 @@ class ScheduleCacheCapability(Protocol):
 
 __all__ = (
     "AtomicCacheCapability",
+    "CacheTimeCapability",
     "LeaseCacheCapability",
     "PubSubCacheCapability",
     "PubSubSubscription",

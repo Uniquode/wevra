@@ -34,7 +34,8 @@ Repository: <https://github.com/Uniquode/wybra>
 - `wybra.cache`: optional named cache registry with a common byte-store
   baseline, typed advanced memory features, and Redis-backed baseline, atomic,
   counter, lease, fencing, durable work-queue, durable stream, live pub/sub,
-  and revisioned schedule support, including Jinja template-fragment caching.
+  revisioned schedule, and provider-calibrated time support, including Jinja
+  template-fragment caching.
 - `wybra.forms`: form settings, CSRF protection, request form parsing, form
   safety helpers, form response finalisation, and forms validation.
 - `wybra.security`: web-facing security policy, COOP/security headers, CORS
@@ -112,8 +113,7 @@ Configured modules expose one async setup hook at their package root:
 from wybra import Site
 
 
-async def setup_site(site: Site) -> None:
-    ...
+async def setup_site(site: Site) -> None: ...
 ```
 
 Startup calls configured module hooks in `app.toml` order. Modules use
@@ -186,8 +186,7 @@ from wybra.auth import login_required
 
 
 @router.get("/admin", dependencies=[Depends(login_required)])
-async def admin_page():
-    ...
+async def admin_page(): ...
 ```
 
 App-side Wybra database, auth, route, template, static, or runtime-state setup
@@ -439,6 +438,7 @@ Wybra publishes prefixed console scripts to avoid collisions with host
 application or environment-specific tooling:
 
 - `wybra-runserver`: start the configured ASGI application with Uvicorn.
+- `wybra-task-worker`: run the configured cache-backed Taskiq worker.
 - `wybra-migrate`: run native Tortoise migrations for the configured
   application.
 - `wybra-collect`: collect configured module static assets for deployment.

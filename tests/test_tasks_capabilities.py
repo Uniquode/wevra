@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from uuid import uuid7
 
 import pytest
 from fastapi import FastAPI
-from taskiq import TaskiqResult
+from taskiq import AckableMessage, TaskiqResult
 
 import wybra.tasks.capabilities as task_capabilities_module
 from wybra.cache import InMemoryCache
@@ -31,6 +32,7 @@ from wybra.site import Site, SiteCapabilityError, start
 from wybra.tasks import (
     TASK_EVENT_SCOPE,
     RetryPolicy,
+    TaskDeclarationError,
     TaskDispatchPolicy,
     TaskFeature,
     TaskFeatureUnavailableError,
@@ -40,7 +42,6 @@ from wybra.tasks import (
     TaskPayload,
     TaskPayloadError,
     TaskProgressError,
-    TaskRegistry,
     TasksCapability,
     TasksSettings,
     TaskState,
@@ -51,6 +52,7 @@ from wybra.tasks import (
 )
 from wybra.tasks.capabilities import ImmediateTasksCapability
 from wybra.tasks.lifecycle import TaskLifecycleEvent, TaskStatusProjection
+from wybra.tasks.taskiq_capabilities import CacheTaskiqTasksCapability
 from wybra.tasks.taskiq_results import CacheTaskiqResultBackend, TaskiqResultPolicy
 from wybra.tasks.taskiq_runtime import load_taskiq
 from wybra.utils.safety import MAX_SAFE_METADATA_ITEMS
@@ -86,6 +88,36 @@ def test_task_settings_default_to_immediate_backend() -> None:
     assert settings.worker_concurrency == 1
 
 
+@pytest.mark.parametrize("visibility_timeout_seconds", (0, -1, float("inf"), True))
+def test_task_declaration_rejects_invalid_visibility_timeout(
+    visibility_timeout_seconds: float,
+) -> None:
+
+    with pytest.raises(
+        ValueError,
+        match="Task visibility timeout must be a positive finite number",
+    ):
+
+        @task(
+            name="tests.invalid_visibility_timeout",
+            visibility_timeout_seconds=visibility_timeout_seconds,
+        )
+        async def invalid_visibility_timeout() -> None:
+            return None
+
+
+def test_task_declaration_rejects_visibility_timeout_below_worker_floor() -> None:
+
+    with pytest.raises(ValueError, match="at least 0.1 seconds"):
+
+        @task(
+            name="tests.minimum_visibility_timeout",
+            visibility_timeout_seconds=0.05,
+        )
+        async def minimum_visibility_timeout() -> None:
+            return None
+
+
 def test_task_settings_load_complete_operational_policy() -> None:
     settings = TasksSettings.load_settings(
         {
@@ -97,9 +129,15 @@ def test_task_settings_load_complete_operational_policy() -> None:
                 "maximum_delay_seconds": 20.0,
                 "jitter_seconds": 0.25,
                 "status_retention_seconds": 600.0,
+                "active_status_timeout_seconds": 900.0,
                 "worker_id": "worker-a",
                 "worker_concurrency": 8,
-                "scheduler_owner": "scheduler-a",
+                "worker_shutdown_grace_seconds": 15.0,
+                "visibility_timeout_seconds": 45.0,
+                "wait_timeout_seconds": 2.0,
+                "max_delivery_attempts": 3,
+                "result_retention_seconds": 1_200.0,
+                "max_result_bytes": 8_192,
             }
         }
     )
@@ -113,9 +151,15 @@ def test_task_settings_load_complete_operational_policy() -> None:
         jitter_seconds=0.25,
     )
     assert settings.status_retention_seconds == 600.0
+    assert settings.active_status_timeout_seconds == 900.0
     assert settings.worker_id == "worker-a"
     assert settings.worker_concurrency == 8
-    assert settings.scheduler_owner == "scheduler-a"
+    assert settings.worker_shutdown_grace_seconds == 15.0
+    assert settings.visibility_timeout_seconds == 45.0
+    assert settings.wait_timeout_seconds == 2.0
+    assert settings.max_delivery_attempts == 3
+    assert settings.result_retention_seconds == 1_200.0
+    assert settings.max_result_bytes == 8_192
 
 
 def test_task_settings_can_disable_module() -> None:
@@ -548,12 +592,11 @@ def test_baseline_task_paths_do_not_import_taskiq() -> None:
 
         from wybra.config import MappingConfigSource
         from wybra.site import start
-        from wybra.tasks import TaskRegistry, TasksCapability, task
-
-        registry = TaskRegistry()
+        from wybra.tasks import TasksCapability, task
 
 
-        @task(name="tests.import_boundary", registry=registry)
+
+        @task(name="tests.import_boundary", )
         async def operation():
             return "complete"
 
@@ -614,10 +657,11 @@ async def test_site_without_tasks_module_has_no_task_capability() -> None:
 
 @pytest.mark.anyio
 async def test_disabled_tasks_module_does_not_resolve_capability() -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.disabled_direct", registry=registry)
+    @task(
+        name="tests.disabled_direct",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -646,9 +690,10 @@ async def test_disabled_tasks_module_does_not_resolve_capability() -> None:
 
 @pytest.mark.anyio
 async def test_configured_tasks_module_provides_immediate_capability() -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.configured_immediate", registry=registry)
+    @task(
+        name="tests.configured_immediate",
+    )
     async def operation() -> None:
         return None
 
@@ -744,16 +789,228 @@ async def test_taskiq_backend_requires_configured_caches_capability(
 
 @pytest.mark.anyio
 async def test_taskiq_backend_preflight_runs_after_cache_finalisation() -> None:
-    with pytest.raises(SiteCapabilityError, match="no cache-backed Taskiq broker"):
-        await start(
-            FastAPI(),
-            config_source=MappingConfigSource(
-                {
-                    "app": {"modules": ("wybra.tasks", "wybra.cache")},
-                    "tasks": {"backend": "taskiq"},
-                }
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.tasks", "wybra.cache")},
+                "cache": {
+                    "features": ("atomic", "lease", "stream", "time", "work-queue"),
+                },
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        capability = site.require_capability(TasksCapability)
+        assert not capability.features.supports(TaskFeature.DEFERRED)
+        assert not capability.features.supports(TaskFeature.RECURRING)
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_taskiq_backend_discovers_only_configured_module_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    configured_module = "task_discovery_app"
+    unrelated_module = "unrelated_task_app"
+    for module_name in (configured_module, unrelated_module):
+        (tmp_path / f"{module_name}.py").write_text(
+            "from wybra.tasks import task\n\n"
+            f'@task(name="{module_name}.operation")\n'
+            "async def operation() -> None:\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.import_module(unrelated_module)
+
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {
+                    "modules": (
+                        "wybra.cache",
+                        "wybra.tasks",
+                        configured_module,
+                    )
+                },
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        capability = cast(
+            CacheTaskiqTasksCapability,
+            site.require_capability(TasksCapability),
+        )
+        assert (
+            capability.broker.find_task("wybra.task_discovery_app.operation.__v1")
+            is not None
+        )
+        assert (
+            capability.broker.find_task("wybra.unrelated_task_app.operation.__v1")
+            is None
+        )
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_taskiq_backend_discovers_tasks_imported_during_post_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    package_name = "late_task_discovery_app"
+    package = tmp_path / package_name
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "import importlib\n\n"
+        "async def post_setup_site(site):\n"
+        f'    importlib.import_module("{package_name}.tasks")\n',
+        encoding="utf-8",
+    )
+    (package / "tasks.py").write_text(
+        "from wybra.tasks import task\n\n"
+        '@task(name="late_task_discovery.operation")\n'
+        "async def operation() -> None:\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {
+                    "modules": (
+                        "wybra.cache",
+                        "wybra.tasks",
+                        package_name,
+                    )
+                },
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        capability = cast(
+            CacheTaskiqTasksCapability,
+            site.require_capability(TasksCapability),
+        )
+        assert (
+            capability.broker.find_task("wybra.late_task_discovery.operation.__v1")
+            is not None
+        )
+        operation = importlib.import_module(f"{package_name}.tasks").operation
+        handle = await capability.submit(operation, operation.payload())
+        listener = capability.broker.listen()
+        received = await anext(listener)
+        assert isinstance(received, AckableMessage)
+        await capability.receiver(validate_params=False).callback(received)
+        status = await handle.status()
+        assert status is not None
+        assert status.state is TaskState.SUCCEEDED
+        await listener.aclose()
+    finally:
+        await site.close()
+
+
+@pytest.mark.anyio
+async def test_taskiq_discovery_isolated_between_composed_sites(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    module_names = ("first_task_site", "second_task_site")
+    for module_name in module_names:
+        (tmp_path / f"{module_name}.py").write_text(
+            "from wybra.tasks import task\n\n"
+            '@task(name="shared.operation")\n'
+            "async def operation() -> None:\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    first_site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.cache", "wybra.tasks", module_names[0])},
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        first = cast(
+            CacheTaskiqTasksCapability,
+            first_site.require_capability(TasksCapability),
+        )
+        assert first.broker.find_task("wybra.shared.operation.__v1") is not None
+    finally:
+        await first_site.close()
+
+    second_site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.cache", "wybra.tasks", module_names[1])},
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        second = cast(
+            CacheTaskiqTasksCapability,
+            second_site.require_capability(TasksCapability),
+        )
+        assert second.broker.find_task("wybra.shared.operation.__v1") is not None
+    finally:
+        await second_site.close()
+
+
+@pytest.mark.anyio
+async def test_taskiq_runtime_persists_only_safe_result_metadata() -> None:
+    secret = "TOP_SECRET_TASK_RESULT"
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        capability = cast(
+            CacheTaskiqTasksCapability,
+            site.require_capability(TasksCapability),
+        )
+        backend = capability.broker.result_backend
+        await backend.set_result(
+            "task-123",
+            TaskiqResult(
+                is_err=True,
+                error=RuntimeError(secret),
+                execution_time=0.25,
+                labels={"idempotency": secret},
+                log=secret,
+                return_value={"secret": secret},
             ),
         )
+
+        result = await backend.get_result("task-123", with_logs=True)
+        assert result.is_err is True
+        assert result.execution_time == 0.25
+        assert result.error is None
+        assert result.labels == {}
+        assert result.log is None
+        assert result.return_value is None
+    finally:
+        await site.close()
 
 
 @pytest.mark.anyio
@@ -819,7 +1076,7 @@ async def test_taskiq_backend_reports_missing_optional_dependency_at_startup(
 
 
 @pytest.mark.anyio
-async def test_taskiq_preflight_never_provides_tasks_capability(
+async def test_taskiq_activation_requires_cache_and_provides_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provided_types: list[type[object]] = []
@@ -834,7 +1091,7 @@ async def test_taskiq_preflight_never_provides_tasks_capability(
         provide_capability(site, capability_type, capability)
 
     monkeypatch.setattr(Site, "provide_capability", recording_provide)
-    configurations = (
+    failing_configurations = (
         {
             "app": {"modules": ("wybra.tasks",)},
             "tasks": {"backend": "taskiq"},
@@ -843,13 +1100,9 @@ async def test_taskiq_preflight_never_provides_tasks_capability(
             "app": {"modules": ("wybra.cache", "wybra.tasks")},
             "tasks": {"backend": "taskiq", "cache_name": "task_work"},
         },
-        {
-            "app": {"modules": ("wybra.cache", "wybra.tasks")},
-            "tasks": {"backend": "taskiq"},
-        },
     )
 
-    for configuration in configurations:
+    for configuration in failing_configurations:
         with pytest.raises(SiteCapabilityError):
             await start(
                 FastAPI(),
@@ -872,6 +1125,21 @@ async def test_taskiq_preflight_never_provides_tasks_capability(
         )
 
     assert TasksCapability not in provided_types
+    monkeypatch.undo()
+
+    site = await start(
+        FastAPI(),
+        config_source=MappingConfigSource(
+            {
+                "app": {"modules": ("wybra.cache", "wybra.tasks")},
+                "tasks": {"backend": "taskiq"},
+            }
+        ),
+    )
+    try:
+        assert site.has_capability(TasksCapability)
+    finally:
+        await site.close()
 
 
 def test_immediate_provider_rejects_scheduling_features() -> None:
@@ -940,7 +1208,7 @@ def test_status_projection_rejects_changed_task_identity(
         )
 
 
-def test_status_projection_rejects_stale_events() -> None:
+def test_projection_keeps_monotonic_timestamps_for_ordered_events() -> None:
     projection = TaskStatusProjection()
     submitted = TaskLifecycleEvent.new(
         kind=TaskLifecycleKind.SUBMITTED,
@@ -950,14 +1218,16 @@ def test_status_projection_rejects_stale_events() -> None:
     )
     projection.apply(submitted)
 
-    with pytest.raises(TaskLifecycleError, match="timestamp"):
-        projection.apply(
-            replace(
-                submitted,
-                kind=TaskLifecycleKind.STARTED,
-                occurred_at=submitted.occurred_at - 1,
-            )
+    status = projection.apply(
+        replace(
+            submitted,
+            kind=TaskLifecycleKind.STARTED,
+            occurred_at=submitted.occurred_at - 1,
         )
+    )
+
+    assert status.state is TaskState.RUNNING
+    assert status.updated_at == submitted.occurred_at
 
 
 def test_status_projection_rejects_inconsistent_attempt_progression() -> None:
@@ -1258,9 +1528,10 @@ def test_status_projection_expires_terminal_status_and_history() -> None:
 
 @pytest.mark.anyio
 async def test_immediate_submission_exposes_successful_lifecycle() -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.add", registry=registry)
+    @task(
+        name="tests.add",
+    )
     async def add(left: int, right: int) -> int:
         return left + right
 
@@ -1281,7 +1552,6 @@ async def test_immediate_submission_exposes_successful_lifecycle() -> None:
 
 @pytest.mark.anyio
 async def test_immediate_submission_mirrors_safe_lifecycle_events() -> None:
-    registry = TaskRegistry()
 
     class RecordingEvents:
         def __init__(self) -> None:
@@ -1300,7 +1570,9 @@ async def test_immediate_submission_mirrors_safe_lifecycle_events() -> None:
             assert isinstance(event, TaskLifecycleObservationEvent)
             self.events.append(event)
 
-    @task(name="tests.observed", registry=registry)
+    @task(
+        name="tests.observed",
+    )
     async def operation() -> str:
         return "not mirrored"
 
@@ -1325,7 +1597,6 @@ async def test_immediate_submission_mirrors_safe_lifecycle_events() -> None:
 
 @pytest.mark.anyio
 async def test_immediate_submission_mirrors_retry_sequence() -> None:
-    registry = TaskRegistry()
     attempts = 0
 
     class RecordingEvents:
@@ -1345,7 +1616,9 @@ async def test_immediate_submission_mirrors_retry_sequence() -> None:
             assert isinstance(event, TaskLifecycleObservationEvent)
             self.events.append(event)
 
-    @task(name="tests.observed_retry", registry=registry)
+    @task(
+        name="tests.observed_retry",
+    )
     async def operation() -> None:
         nonlocal attempts
         attempts += 1
@@ -1371,10 +1644,11 @@ async def test_immediate_submission_mirrors_retry_sequence() -> None:
 
 @pytest.mark.anyio
 async def test_composed_site_mirrors_task_lifecycle_through_core_events() -> None:
-    registry = TaskRegistry()
     observed: list[TaskLifecycleObservationEvent] = []
 
-    @task(name="tests.composed_events", registry=registry)
+    @task(
+        name="tests.composed_events",
+    )
     async def operation() -> None:
         return None
 
@@ -1408,9 +1682,10 @@ async def test_composed_site_mirrors_task_lifecycle_through_core_events() -> Non
 
 @pytest.mark.anyio
 async def test_disabled_core_events_skip_task_observation_construction() -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.disabled_event_construction", registry=registry)
+    @task(
+        name="tests.disabled_event_construction",
+    )
     async def operation() -> None:
         return None
 
@@ -1505,7 +1780,6 @@ async def test_task_observation_diagnostics_include_execution_identity() -> None
 
 @pytest.mark.anyio
 async def test_immediate_task_reports_secret_safe_progress() -> None:
-    registry = TaskRegistry()
     observed: list[TaskLifecycleObservationEvent] = []
 
     class RecordingEvents:
@@ -1522,7 +1796,9 @@ async def test_immediate_task_reports_secret_safe_progress() -> None:
             assert isinstance(event, TaskLifecycleObservationEvent)
             observed.append(event)
 
-    @task(name="tests.progress", registry=registry)
+    @task(
+        name="tests.progress",
+    )
     async def operation() -> None:
         context = current_task_context()
         assert context is not None
@@ -1561,9 +1837,10 @@ async def test_immediate_task_reports_secret_safe_progress() -> None:
 
 @pytest.mark.anyio
 async def test_direct_task_progress_reporting_is_a_no_op() -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.direct_progress", registry=registry)
+    @task(
+        name="tests.direct_progress",
+    )
     async def operation() -> str:
         context = current_task_context()
         assert context is not None
@@ -1575,9 +1852,10 @@ async def test_direct_task_progress_reporting_is_a_no_op() -> None:
 
 @pytest.mark.anyio
 async def test_direct_task_progress_still_validates_metadata() -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.direct_invalid_progress", registry=registry)
+    @task(
+        name="tests.direct_invalid_progress",
+    )
     async def operation() -> None:
         context = current_task_context()
         assert context is not None
@@ -1589,10 +1867,11 @@ async def test_direct_task_progress_still_validates_metadata() -> None:
 
 @pytest.mark.anyio
 async def test_invalid_submitted_progress_becomes_a_safe_task_failure() -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.invalid_progress", registry=registry)
+    @task(
+        name="tests.invalid_progress",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -1620,10 +1899,11 @@ async def test_invalid_submitted_progress_becomes_a_safe_task_failure() -> None:
 
 @pytest.mark.anyio
 async def test_late_progress_report_is_rejected_without_changing_status() -> None:
-    registry = TaskRegistry()
     retained_context = None
 
-    @task(name="tests.late_progress", registry=registry)
+    @task(
+        name="tests.late_progress",
+    )
     async def operation() -> None:
         nonlocal retained_context
         retained_context = current_task_context()
@@ -1644,7 +1924,6 @@ async def test_late_progress_report_is_rejected_without_changing_status() -> Non
 async def test_lifecycle_event_publication_failure_does_not_change_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry = TaskRegistry()
     calls = 0
 
     class FailingEvents:
@@ -1661,7 +1940,9 @@ async def test_lifecycle_event_publication_failure_does_not_change_execution(
             del event
             raise RuntimeError("publisher unavailable")
 
-    @task(name="tests.publication_failure", registry=registry)
+    @task(
+        name="tests.publication_failure",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -1690,10 +1971,11 @@ async def test_lifecycle_event_publication_failure_does_not_change_execution(
 async def test_lifecycle_logging_failure_does_not_change_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.logging_failure", registry=registry)
+    @task(
+        name="tests.logging_failure",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -1724,7 +2006,6 @@ async def test_lifecycle_logging_failure_does_not_change_execution(
 
 @pytest.mark.anyio
 async def test_sink_cancelled_error_does_not_cancel_task_execution() -> None:
-    registry = TaskRegistry()
     calls = 0
 
     class CancellingEvents:
@@ -1741,7 +2022,9 @@ async def test_sink_cancelled_error_does_not_cancel_task_execution() -> None:
             del event
             raise asyncio.CancelledError
 
-    @task(name="tests.sink_cancellation", registry=registry)
+    @task(
+        name="tests.sink_cancellation",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -1766,10 +2049,11 @@ async def test_immediate_submission_uses_effective_worker_identity(
     configured_worker_id: str | None,
     expected_worker_id: str,
 ) -> None:
-    registry = TaskRegistry()
     observed_worker_id: str | None = None
 
-    @task(name="tests.worker_identity", registry=registry)
+    @task(
+        name="tests.worker_identity",
+    )
     async def inspect_worker() -> None:
         nonlocal observed_worker_id
         context = current_task_context()
@@ -1791,10 +2075,11 @@ async def test_immediate_submission_uses_effective_worker_identity(
 
 @pytest.mark.anyio
 async def test_immediate_submission_retries_and_records_terminal_failure() -> None:
-    registry = TaskRegistry()
     attempts = 0
 
-    @task(name="tests.fail", registry=registry)
+    @task(
+        name="tests.fail",
+    )
     async def fail() -> None:
         nonlocal attempts
         attempts += 1
@@ -1814,10 +2099,11 @@ async def test_immediate_submission_retries_and_records_terminal_failure() -> No
 
 @pytest.mark.anyio
 async def test_handler_lifecycle_error_uses_configured_retries() -> None:
-    registry = TaskRegistry()
     attempts = 0
 
-    @task(name="tests.lifecycle_error", registry=registry)
+    @task(
+        name="tests.lifecycle_error",
+    )
     async def fail() -> None:
         nonlocal attempts
         attempts += 1
@@ -1838,9 +2124,10 @@ async def test_handler_lifecycle_error_uses_configured_retries() -> None:
 async def test_task_lifecycle_logs_use_secret_safe_structured_fields(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.safe_logs", registry=registry)
+    @task(
+        name="tests.safe_logs",
+    )
     async def fail(password: str) -> None:
         raise RuntimeError(f"credential leaked: {password}")
 
@@ -1866,13 +2153,11 @@ async def test_task_lifecycle_logs_use_secret_safe_structured_fields(
 
 @pytest.mark.anyio
 async def test_immediate_submission_honours_explicit_single_attempt_policy() -> None:
-    registry = TaskRegistry()
     attempts = 0
 
     @task(
         name="tests.single_attempt",
         retry=RetryPolicy(max_attempts=1),
-        registry=registry,
     )
     async def fail() -> None:
         nonlocal attempts
@@ -1888,13 +2173,14 @@ async def test_immediate_submission_honours_explicit_single_attempt_policy() -> 
 
 @pytest.mark.anyio
 async def test_immediate_submission_applies_configured_retry_jitter() -> None:
-    registry = TaskRegistry()
     delays: list[float] = []
 
     async def record_delay(delay: float) -> None:
         delays.append(delay)
 
-    @task(name="tests.jitter", registry=registry)
+    @task(
+        name="tests.jitter",
+    )
     async def fail() -> None:
         raise RuntimeError
 
@@ -1915,7 +2201,6 @@ async def test_immediate_submission_applies_configured_retry_jitter() -> None:
 
 @pytest.mark.anyio
 async def test_immediate_submission_caps_retry_before_backoff_overflows() -> None:
-    registry = TaskRegistry()
     delays: list[float] = []
 
     async def record_delay(delay: float) -> None:
@@ -1929,7 +2214,6 @@ async def test_immediate_submission_caps_retry_before_backoff_overflows() -> Non
             backoff_multiplier=1e308,
             maximum_delay_seconds=10.0,
         ),
-        registry=registry,
     )
     async def fail() -> None:
         raise RuntimeError
@@ -1945,12 +2229,22 @@ async def test_immediate_submission_caps_retry_before_backoff_overflows() -> Non
     assert (await handle.status()).state is TaskState.DEAD_LETTERED  # type: ignore[union-attr]
 
 
+def test_retry_policy_rejects_an_uncapped_overflowing_backoff() -> None:
+    with pytest.raises(TaskDeclarationError, match="can overflow"):
+        RetryPolicy(
+            max_attempts=4,
+            initial_delay_seconds=1.0,
+            backoff_multiplier=1e308,
+        )
+
+
 @pytest.mark.anyio
 async def test_immediate_submission_validates_hand_constructed_payload() -> None:
-    registry = TaskRegistry()
     received: list[int] = []
 
-    @task(name="tests.validated_submit", registry=registry)
+    @task(
+        name="tests.validated_submit",
+    )
     async def operation(value: int) -> None:
         received.append(value)
 
@@ -1964,10 +2258,11 @@ async def test_immediate_submission_validates_hand_constructed_payload() -> None
 
 @pytest.mark.anyio
 async def test_immediate_submission_rejects_invalid_payload_before_lifecycle() -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.invalid_submit", registry=registry)
+    @task(
+        name="tests.invalid_submit",
+    )
     async def operation(value: int) -> None:
         nonlocal calls
         calls += 1
@@ -1982,10 +2277,11 @@ async def test_immediate_submission_rejects_invalid_payload_before_lifecycle() -
 
 @pytest.mark.anyio
 async def test_immediate_submission_propagates_idempotency_context() -> None:
-    registry = TaskRegistry()
     observed_key: str | None = None
 
-    @task(name="tests.idempotency", registry=registry)
+    @task(
+        name="tests.idempotency",
+    )
     async def operation() -> None:
         nonlocal observed_key
         context = current_task_context()
@@ -2034,10 +2330,11 @@ def test_submission_options_normalise_metadata() -> None:
 
 @pytest.mark.anyio
 async def test_dispatch_forwards_submission_options() -> None:
-    registry = TaskRegistry()
     observed_key: str | None = None
 
-    @task(name="tests.dispatch_options", registry=registry)
+    @task(
+        name="tests.dispatch_options",
+    )
     async def operation() -> None:
         nonlocal observed_key
         context = current_task_context()
@@ -2075,9 +2372,10 @@ async def test_dispatch_forwards_submission_options() -> None:
 async def test_direct_dispatch_rejects_submission_options(
     policy: TaskDispatchPolicy,
 ) -> None:
-    registry = TaskRegistry()
 
-    @task(name="tests.direct_options", registry=registry)
+    @task(
+        name="tests.direct_options",
+    )
     async def operation() -> None:
         raise AssertionError("Task must not execute.")
 
@@ -2098,10 +2396,11 @@ async def test_direct_dispatch_rejects_submission_options(
 
 @pytest.mark.anyio
 async def test_prefer_background_runs_directly_when_capability_is_absent() -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.direct_fallback", registry=registry)
+    @task(
+        name="tests.direct_fallback",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -2124,10 +2423,11 @@ async def test_prefer_background_runs_directly_when_capability_is_absent() -> No
 
 @pytest.mark.anyio
 async def test_background_requires_capability_without_invoking_task() -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.background_required", registry=registry)
+    @task(
+        name="tests.background_required",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1
@@ -2150,10 +2450,11 @@ async def test_background_requires_capability_without_invoking_task() -> None:
 
 @pytest.mark.anyio
 async def test_prefer_background_does_not_fallback_after_submission_failure() -> None:
-    registry = TaskRegistry()
     calls = 0
 
-    @task(name="tests.no_fallback", registry=registry)
+    @task(
+        name="tests.no_fallback",
+    )
     async def operation() -> None:
         nonlocal calls
         calls += 1

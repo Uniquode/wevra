@@ -8,6 +8,7 @@ import pytest
 from cache_feature_conformance import (
     assert_atomic_conformance,
     assert_lease_conformance,
+    assert_lease_fenced_mutation_conformance,
     assert_pubsub_conformance,
     assert_schedule_conformance,
     assert_stream_conformance,
@@ -29,16 +30,20 @@ from wybra.cache import (
     CacheRevision,
     CacheSettings,
     CachesSettings,
+    CacheTimeCapability,
+    CacheWorkQueueRejectedError,
     CounterCacheValue,
     InMemoryAtomicCache,
     InMemoryCache,
     InMemoryCacheFeatures,
+    InMemoryCacheTime,
     InMemoryLeaseCache,
     InMemoryPubSubCache,
     InMemoryScheduleCache,
     InMemoryStreamCache,
     InMemoryWorkQueue,
     LeaseCacheCapability,
+    LeaseToken,
     PubSubCacheCapability,
     ScheduleCacheCapability,
     StreamCacheCapability,
@@ -66,6 +71,7 @@ from wybra.cache.redis_schedule_scripts import (
     SCHEDULE_UPDATE_SCRIPT,
 )
 from wybra.cache.redis_schedules import RedisScheduleCache
+from wybra.cache.redis_stream_scripts import STREAM_APPEND_SCRIPT
 from wybra.cache.redis_streams import RedisStreamCache
 from wybra.core.exceptions import ConfigurationError
 
@@ -82,8 +88,9 @@ class AtomicStub:
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None:
-        del owner, key, value, ttl
+        del owner, key, value, ttl, lease
         return None
 
     async def compare_and_swap(
@@ -94,8 +101,9 @@ class AtomicStub:
         value: bytes,
         *,
         ttl: float,
+        lease: LeaseToken | None = None,
     ) -> AtomicCacheValue | None:
-        del owner, key, expected, value, ttl
+        del owner, key, expected, value, ttl, lease
         return None
 
     async def compare_and_delete(
@@ -103,8 +111,10 @@ class AtomicStub:
         owner: str,
         key: str,
         expected: CacheRevision,
+        *,
+        lease: LeaseToken | None = None,
     ) -> bool:
-        del owner, key, expected
+        del owner, key, expected, lease
         return False
 
     async def increment(
@@ -232,12 +242,14 @@ async def test_default_memory_backend_advertises_process_local_features() -> Non
     assert instance.require(StreamCacheCapability) is not None
     assert instance.require(PubSubCacheCapability) is not None
     assert instance.require(ScheduleCacheCapability) is not None
+    assert instance.require(CacheTimeCapability) is not None
     assert instance.features == (
         "atomic",
         "lease",
         "pub-sub",
         "schedule",
         "stream",
+        "time",
         "work-queue",
     )
     assert all(
@@ -1622,6 +1634,9 @@ async def test_redis_stream_readiness_requires_stream_read_permission() -> None:
             return {"appendonly": "yes", "maxmemory-policy": "noeviction"}
 
         async def eval(self, script: str, *_args: object) -> object:
+            if script == STREAM_APPEND_SCRIPT:
+                assert _args[0] == 3
+                assert _args[6:] == ("", "", "", 0)
             if "xrange" in script:
                 raise PermissionError("XRANGE is denied")
             return 1
@@ -1912,6 +1927,7 @@ async def test_memory_features_pass_shared_conformance() -> None:
     features = InMemoryCacheFeatures(
         atomic=InMemoryAtomicCache(clock),
         leases=InMemoryLeaseCache(clock),
+        time=InMemoryCacheTime(clock),
         work_queue=InMemoryWorkQueue(clock),
         streams=InMemoryStreamCache(max_records=2),
         pubsub=InMemoryPubSubCache(),
@@ -1923,10 +1939,285 @@ async def test_memory_features_pass_shared_conformance() -> None:
 
     await assert_atomic_conformance(features.atomic)
     await assert_lease_conformance(features.leases, advance)
+    await assert_lease_fenced_mutation_conformance(
+        features.atomic,
+        features.streams,
+        features.leases,
+        advance,
+    )
     await assert_work_queue_conformance(features.work_queue, advance)
     await assert_stream_conformance(features.streams, retention_count=2)
     await assert_pubsub_conformance(features.pubsub)
     await assert_schedule_conformance(features.schedules, clock(), advance)
+    assert await features.time.refresh() == clock()
+
+
+@pytest.mark.anyio
+async def test_cache_registers_the_cache_time_feature() -> None:
+    clock = FakeClock()
+    features = InMemoryCacheFeatures(time=InMemoryCacheTime(clock))
+
+    async def factory(_settings: CacheSettings) -> CacheBackend:
+        return CacheBackend(
+            InMemoryCache(),
+            close=features.close,
+            lifecycle_owner=features,
+            features=features.registrations(),
+        )
+
+    settings = CachesSettings(
+        instances=(
+            CacheSettings(
+                backend="memory",
+                features=("time",),
+            ),
+        ),
+    )
+    caches = await build_caches(settings, factories={"memory": factory})
+
+    assert await caches.require("default").require(CacheTimeCapability).refresh() == 100
+    await caches.close()
+
+
+@pytest.mark.anyio
+async def test_memory_features_share_configured_time_with_expiring_features() -> None:
+    clock = FakeClock()
+    features = InMemoryCacheFeatures(time=InMemoryCacheTime(clock))
+
+    assert await features.atomic.create("tasks", "status", b"value", ttl=5)
+    first_lease = await features.leases.acquire("tasks", "status", "one", ttl=5)
+    assert first_lease is not None
+    await features.work_queue.publish("tasks", "default", b"payload", delay=5)
+    assert await features.schedules.create(
+        "tasks",
+        "scheduled",
+        b"payload",
+        next_due_at=clock() + 5,
+    )
+
+    clock.advance(5)
+
+    assert await features.atomic.get("tasks", "status") is None
+    assert await features.leases.acquire("tasks", "status", "two", ttl=5) is not None
+    assert (
+        await features.work_queue.reserve(
+            "tasks",
+            "default",
+            "worker",
+            visibility_timeout=5,
+        )
+        is not None
+    )
+    due = await features.schedules.due("tasks", before=clock())
+    assert [record.identity for record in due] == ["scheduled"]
+
+
+@pytest.mark.anyio
+async def test_redis_cache_time_calibrates_with_bounded_refreshes() -> None:
+    class TimeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.values = [(1_000, 0), (1_300, 0), (1_360, 0), (1_960, 0)]
+
+        async def time(self) -> tuple[int, int]:
+            self.calls += 1
+            await asyncio.sleep(0)
+            return self.values.pop(0)
+
+    wall_clock = FakeClock(10)
+    monotonic_clock = FakeClock(0)
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+    client = TimeClient()
+    runtime._client = client
+    runtime._wall_clock = wall_clock
+    runtime._monotonic_clock = monotonic_clock
+
+    assert await runtime.refresh_time() == 1_000
+    wall_clock.advance(30)
+    monotonic_clock.advance(30)
+    assert await runtime.refresh_time() == 1_030
+    assert client.calls == 1
+
+    wall_clock.advance(270)
+    monotonic_clock.advance(270)
+    assert await runtime.refresh_time() == 1_300
+    assert client.calls == 2
+
+    wall_clock.advance(65)
+    monotonic_clock.advance(60)
+    assert await asyncio.gather(runtime.refresh_time(), runtime.refresh_time()) == [
+        1_360,
+        1_360,
+    ]
+    assert client.calls == 3
+
+    wall_clock.advance(600)
+    monotonic_clock.advance(600)
+    assert await runtime.refresh_time() == 1_960
+    assert client.calls == 4
+
+    wall_clock.advance(600)
+    monotonic_clock.advance(600)
+    with pytest.raises(CacheFeatureError, match="calibration has expired"):
+        runtime.cache_time()
+
+
+@pytest.mark.anyio
+async def test_redis_cache_time_coalesces_concurrent_calibration_failures() -> None:
+    class TimeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def time(self) -> tuple[int, int]:
+            self.calls += 1
+            if self.calls == 1:
+                return (1_000, 0)
+            self.started.set()
+            await self.release.wait()
+            raise OSError("Redis TIME is unavailable")
+
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+    client = TimeClient()
+    runtime._client = client
+    wall_clock = FakeClock(0)
+    monotonic_clock = FakeClock(0)
+    runtime._wall_clock = wall_clock
+    runtime._monotonic_clock = monotonic_clock
+    assert await runtime.refresh_time() == 1_000
+    wall_clock.advance(300)
+    monotonic_clock.advance(300)
+    first = asyncio.create_task(runtime.refresh_time())
+    await client.started.wait()
+    waiting = tuple(asyncio.create_task(runtime.refresh_time()) for _ in range(4))
+    client.release.set()
+
+    assert await first == 1_300
+    assert await asyncio.gather(*waiting) == [1_300] * 4
+    assert client.calls == 2
+
+
+@pytest.mark.anyio
+async def test_redis_cache_time_throttles_unavailable_initial_calibration() -> None:
+    class TimeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def time(self) -> tuple[int, int]:
+            self.calls += 1
+            raise OSError("Redis TIME is unavailable")
+
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+    client = TimeClient()
+    runtime._client = client
+    runtime._monotonic_clock = FakeClock(0)
+
+    with pytest.raises(CacheFeatureError, match="has not been calibrated"):
+        await runtime.refresh_time()
+    with pytest.raises(CacheFeatureError, match="has not been calibrated"):
+        await runtime.refresh_time()
+
+    assert client.calls == 1
+
+
+@pytest.mark.anyio
+async def test_redis_cache_time_throttles_failures_after_hard_expiry() -> None:
+    class TimeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def time(self) -> tuple[int, int]:
+            self.calls += 1
+            if self.calls == 1:
+                return (1_000, 0)
+            if self.calls == 2:
+                raise OSError("Redis TIME is unavailable")
+            return (1_600, 0)
+
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+    client = TimeClient()
+    runtime._client = client
+    wall_clock = FakeClock(0)
+    monotonic_clock = FakeClock(0)
+    runtime._wall_clock = wall_clock
+    runtime._monotonic_clock = monotonic_clock
+
+    assert await runtime.refresh_time() == 1_000
+    wall_clock.advance(599)
+    monotonic_clock.advance(599)
+    assert await runtime.refresh_time() == 1_599
+    assert client.calls == 2
+
+    wall_clock.advance(1)
+    monotonic_clock.advance(1)
+    with pytest.raises(CacheFeatureError, match="calibration has expired"):
+        await runtime.refresh_time()
+    assert client.calls == 2
+
+    wall_clock.advance(59)
+    monotonic_clock.advance(59)
+    assert await runtime.refresh_time() == 1_600
+    assert client.calls == 3
+
+
+@pytest.mark.anyio
+async def test_redis_cache_time_does_not_publish_after_runtime_closes() -> None:
+    class TimeClient:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def time(self) -> tuple[int, int]:
+            self.started.set()
+            await self.release.wait()
+            return (1_000, 0)
+
+        async def aclose(self) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+    client = TimeClient()
+    runtime._client = client
+    refreshing = asyncio.create_task(runtime.refresh_time())
+    await client.started.wait()
+    await runtime.close()
+    client.release.set()
+
+    with pytest.raises(CacheFeatureError, match="backend is closed"):
+        await refreshing
+
+
+@pytest.mark.anyio
+async def test_redis_time_feature_validates_time_without_a_namespace() -> None:
+    class TimeClient:
+        async def time(self) -> tuple[int, int]:
+            return (1_000, 0)
+
+    runtime = RedisCacheRuntime("redis://cache/0")
+    runtime._client = TimeClient()
+
+    await runtime.validate_features(frozenset({"time"}))
+
+
+@pytest.mark.anyio
+async def test_redis_cache_time_is_unavailable_after_runtime_shutdown() -> None:
+    class TimeClient:
+        async def time(self) -> tuple[int, int]:
+            return (1_000, 0)
+
+        async def aclose(self) -> None:
+            return None
+
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+    runtime._client = TimeClient()
+    await runtime.refresh_time()
+    await runtime.close()
+
+    with pytest.raises(CacheFeatureError, match="backend is closed"):
+        runtime.cache_time()
+    with pytest.raises(CacheFeatureError, match="backend is closed"):
+        await runtime.refresh_time()
 
 
 def test_redis_duration_milliseconds_preserves_positive_submilliseconds() -> None:
@@ -2203,6 +2494,25 @@ async def test_lease_renewal_and_release_require_current_token() -> None:
 
 
 @pytest.mark.anyio
+async def test_in_memory_lease_reclaims_idle_resource_locks() -> None:
+    clock = FakeClock()
+    leases = InMemoryLeaseCache(clock)
+    released = await leases.acquire("tasks", "released", "worker", ttl=5)
+    assert released is not None
+    await leases.release(released)
+
+    expired = await leases.acquire("tasks", "expired", "worker", ttl=5)
+    assert expired is not None
+    clock.advance(5)
+    active = await leases.acquire("tasks", "active", "worker", ttl=5)
+    assert active is not None
+
+    assert set(leases._resource_locks) == {("tasks", "active")}
+    await leases.release(active)
+    assert not leases._resource_locks
+
+
+@pytest.mark.anyio
 async def test_lease_capacity_is_global_and_release_reuses_it() -> None:
     leases = InMemoryLeaseCache(max_leases=1)
     first = await leases.acquire("tasks", "one", "worker", ttl=5)
@@ -2370,7 +2680,7 @@ async def test_work_queue_rejects_publication_at_capacity() -> None:
     queue = InMemoryWorkQueue(max_items_per_queue=1)
     await queue.publish("tasks", "default", b"one")
 
-    with pytest.raises(CacheFeatureError, match="item capacity"):
+    with pytest.raises(CacheWorkQueueRejectedError, match="item capacity"):
         await queue.publish("tasks", "default", b"two")
 
 
@@ -2388,7 +2698,7 @@ async def test_work_queue_bounds_namespaces_without_retaining_empty_misses() -> 
     )
     await queue.publish("tasks", "one", b"one")
 
-    with pytest.raises(CacheFeatureError, match="queue capacity"):
+    with pytest.raises(CacheWorkQueueRejectedError, match="queue capacity"):
         await queue.publish("tasks", "two", b"two")
 
     delivery = await queue.reserve(
@@ -2798,3 +3108,36 @@ async def test_schedule_completion_handles_sub_resolution_interval() -> None:
 
     assert recurring is not None
     assert recurring.next_due_at > clock()
+
+
+@pytest.mark.anyio
+async def test_fenced_writes_reject_an_expired_lease_after_reacquisition() -> None:
+    clock = FakeClock()
+    leases = InMemoryLeaseCache(clock)
+    atomic = InMemoryAtomicCache(clock)
+    streams = InMemoryStreamCache()
+    InMemoryCacheFeatures(atomic=atomic, leases=leases, streams=streams)
+    first = await leases.acquire("tasks", "projection", "first", ttl=10)
+    assert first is not None
+    clock.advance(10)
+    second = await leases.acquire("tasks", "projection", "second", ttl=10)
+    assert second is not None
+
+    with pytest.raises(CacheConflictError, match="stale or no longer held"):
+        await streams.append("tasks", "events", b"stale", lease=first)
+    with pytest.raises(CacheConflictError, match="stale or no longer held"):
+        await atomic.create("tasks", "status", b"stale", ttl=60, lease=first)
+
+    assert await streams.append("tasks", "events", b"current", lease=second)
+    assert await atomic.create("tasks", "status", b"current", ttl=60, lease=second)
+
+
+@pytest.mark.parametrize("feature_name", ("atomic", "streams"))
+def test_memory_feature_aggregate_rejects_rebinding_lease_fences(
+    feature_name: str,
+) -> None:
+    features = InMemoryCacheFeatures()
+    feature = getattr(features, feature_name)
+
+    with pytest.raises(CacheFeatureError, match="already bound"):
+        feature.bind_lease_fence(InMemoryLeaseCache())

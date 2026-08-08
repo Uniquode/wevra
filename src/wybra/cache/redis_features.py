@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 from wybra.cache.feature_contracts import (
     AtomicCacheCapability,
+    CacheTimeCapability,
     LeaseCacheCapability,
     PubSubCacheCapability,
     ScheduleCacheCapability,
@@ -23,6 +25,7 @@ from wybra.cache.redis_queues import RedisWorkQueue
 from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.cache.redis_schedules import RedisScheduleCache
 from wybra.cache.redis_streams import RedisStreamCache
+from wybra.cache.redis_time import RedisCacheTime
 
 REDIS_ATOMIC_FEATURE = CacheFeatureMetadata(
     "atomic",
@@ -42,6 +45,16 @@ REDIS_LEASE_FEATURE = CacheFeatureMetadata(
         restart_recovery=True,
         horizontal_consumers=True,
         ordering_scope="resource",
+    ),
+)
+REDIS_TIME_FEATURE = CacheFeatureMetadata(
+    "time",
+    CacheFeatureGuarantees(
+        scope="shared",
+        durable=False,
+        restart_recovery=False,
+        horizontal_consumers=True,
+        ordering_scope="provider-clock",
     ),
 )
 REDIS_PUBSUB_FEATURE = CacheFeatureMetadata(
@@ -95,6 +108,7 @@ REDIS_CACHE_FEATURES = frozenset(
     for feature in (
         REDIS_ATOMIC_FEATURE,
         REDIS_LEASE_FEATURE,
+        REDIS_TIME_FEATURE,
         REDIS_PUBSUB_FEATURE,
         REDIS_WORK_QUEUE_FEATURE,
         REDIS_STREAM_FEATURE,
@@ -108,6 +122,7 @@ class RedisCacheFeatures:
     runtime: RedisCacheRuntime
     atomic: RedisAtomicCache = field(init=False)
     leases: RedisLeaseCache = field(init=False)
+    time: RedisCacheTime = field(init=False)
     pubsub: RedisPubSubCache = field(init=False)
     work_queue: RedisWorkQueue = field(init=False)
     streams: RedisStreamCache = field(init=False)
@@ -115,10 +130,16 @@ class RedisCacheFeatures:
     _pubsub_closed: bool = field(default=False, init=False, repr=False)
     _work_queue_closed: bool = field(default=False, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "atomic", RedisAtomicCache(self.runtime))
         object.__setattr__(self, "leases", RedisLeaseCache(self.runtime))
+        object.__setattr__(self, "time", RedisCacheTime(self.runtime))
         object.__setattr__(self, "pubsub", RedisPubSubCache(self.runtime))
         object.__setattr__(self, "work_queue", RedisWorkQueue(self.runtime))
         object.__setattr__(self, "streams", RedisStreamCache(self.runtime))
@@ -135,6 +156,11 @@ class RedisCacheFeatures:
                 LeaseCacheCapability,
                 self.leases,
                 REDIS_LEASE_FEATURE,
+            ),
+            CacheFeatureRegistration(
+                CacheTimeCapability,
+                self.time,
+                REDIS_TIME_FEATURE,
             ),
             CacheFeatureRegistration(
                 PubSubCacheCapability,
@@ -159,29 +185,30 @@ class RedisCacheFeatures:
         )
 
     async def close(self) -> None:
-        if self._closed:
-            return
+        async with self._close_lock:
+            if self._closed:
+                return
 
-        async def close_pubsub() -> None:
-            await self.pubsub.close()
-            object.__setattr__(self, "_pubsub_closed", True)
+            async def close_pubsub() -> None:
+                await self.pubsub.close()
+                object.__setattr__(self, "_pubsub_closed", True)
 
-        async def close_work_queue() -> None:
-            await self.work_queue.close()
-            object.__setattr__(self, "_work_queue_closed", True)
+            async def close_work_queue() -> None:
+                await self.work_queue.close()
+                object.__setattr__(self, "_work_queue_closed", True)
 
-        closers = []
-        if not self._pubsub_closed:
-            closers.append(close_pubsub)
-        if not self._work_queue_closed:
-            closers.append(close_work_queue)
-        errors = await close_all(closers)
-        object.__setattr__(
-            self,
-            "_closed",
-            self._pubsub_closed and self._work_queue_closed,
-        )
-        raise_cleanup_errors("Redis cache feature cleanup failed.", errors)
+            closers = []
+            if not self._pubsub_closed:
+                closers.append(close_pubsub)
+            if not self._work_queue_closed:
+                closers.append(close_work_queue)
+            errors = await close_all(closers)
+            object.__setattr__(
+                self,
+                "_closed",
+                self._pubsub_closed and self._work_queue_closed,
+            )
+            raise_cleanup_errors("Redis cache feature cleanup failed.", errors)
 
 
 __all__ = (
@@ -191,6 +218,7 @@ __all__ = (
     "REDIS_PUBSUB_FEATURE",
     "REDIS_SCHEDULE_FEATURE",
     "REDIS_STREAM_FEATURE",
+    "REDIS_TIME_FEATURE",
     "REDIS_WORK_QUEUE_FEATURE",
     "RedisCacheFeatures",
 )
