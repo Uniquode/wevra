@@ -421,6 +421,8 @@ async def test_broker_keeps_unvalidated_delivery_at_default_visibility() -> None
     assert isinstance(receipt, str)
     assert broker.delivery_visibility_timeout(restored.labels) == 1
     await broker.relinquish_delivery(receipt)
+    with pytest.raises(CacheConflictError, match="stale or no longer reserved"):
+        await broker.renew_delivery(receipt, visibility_timeout=1)
     clock.advance(0.2)
     redelivered = await work_queue.reserve(
         "taskiq-broker",

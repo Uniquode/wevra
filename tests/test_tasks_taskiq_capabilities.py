@@ -698,6 +698,35 @@ def test_cache_taskiq_receiver_uses_configured_shutdown_grace() -> None:
 
 
 @pytest.mark.anyio
+async def test_cache_taskiq_receiver_honours_zero_cancellation_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability, _broker = _capability()
+    receiver = capability.receiver(validate_params=False)
+    receiver.wait_tasks_timeout = 0
+    callback = asyncio.create_task(asyncio.Event().wait())
+    receiver._active_callbacks.add(callback)
+    captured_timeout: float | None = None
+    original_wait = asyncio.wait
+
+    async def capture_wait(
+        futures: object,
+        *,
+        timeout: float | None = None,
+        return_when: object = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Future[object]], set[asyncio.Future[object]]]:
+        nonlocal captured_timeout
+        captured_timeout = timeout
+        return await original_wait(futures, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr("wybra.tasks.taskiq_receiver.asyncio.wait", capture_wait)
+
+    await receiver._cancel_active_callbacks()
+
+    assert captured_timeout == 0
+
+
+@pytest.mark.anyio
 async def test_cache_taskiq_receiver_marks_delegated_startup_as_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -239,10 +239,15 @@ class CacheTaskiqReceiver(Receiver):
         for callback in callbacks:
             callback.cancel()
         if callbacks:
+            drain_timeout = (
+                _MAXIMUM_CANCELLATION_DRAIN_SECONDS
+                if self.wait_tasks_timeout is None
+                else self.wait_tasks_timeout
+            )
             _done, pending = await asyncio.wait(
                 callbacks,
                 timeout=min(
-                    self.wait_tasks_timeout or _MAXIMUM_CANCELLATION_DRAIN_SECONDS,
+                    drain_timeout,
                     _MAXIMUM_CANCELLATION_DRAIN_SECONDS,
                 ),
             )

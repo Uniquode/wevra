@@ -405,6 +405,7 @@ class CacheTaskiqBroker(AsyncBroker):
         """Stop prefetch renewal and allow an unacknowledged delivery to recover."""
 
         await self._stop_prefetch_renewal(receipt)
+        self._outstanding_deliveries.pop(receipt, None)
 
     def delivery_visibility_timeout(self, labels: dict[str, object]) -> float:
         value = labels.get(
