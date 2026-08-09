@@ -2487,6 +2487,7 @@ class TestTemplateFragmentCache:
             ("x" * (MAX_CACHE_VALUE_BYTES + 1), False),
             ("é" * ((MAX_CACHE_VALUE_BYTES // 2) + 1), False),
         ),
+        ids=("at-limit", "oversized-ascii", "oversized-utf8"),
     )
     async def test_fragment_cache_preserves_oversized_rendering(
         self,
