@@ -5,7 +5,9 @@ import re
 from dataclasses import dataclass, field
 
 MAX_CACHE_FEATURE_PAYLOAD_BYTES = 1_048_576
+MAX_CACHE_VALUE_BYTES = 65_536
 MAX_CACHE_FEATURE_LIMIT = 10_000
+MINIMUM_CACHE_TTL_SECONDS = 1.0
 MAX_STREAM_POSITION = 2**63 - 1
 DEFAULT_STREAM_RETENTION_COUNT = 1_000
 DEFAULT_STREAM_MAX_CONSUMERS = 10_000
@@ -246,13 +248,38 @@ def validate_payload(value: bytes) -> bytes:
     return value
 
 
+def validate_cache_value(value: bytes) -> bytes:
+    if not isinstance(value, bytes):
+        raise TypeError("Cache values must be bytes.")
+    if len(value) > MAX_CACHE_VALUE_BYTES:
+        raise ValueError(f"Cache values cannot exceed {MAX_CACHE_VALUE_BYTES} bytes.")
+    return value
+
+
 def validate_finite(value: float, *, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError(f"{label.capitalize()} must be a finite number.")
-    result = float(value)
+    try:
+        result = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{label.capitalize()} must be finite.") from exc
     if not math.isfinite(result):
         raise ValueError(f"{label.capitalize()} must be finite.")
     return result
+
+
+def validate_cache_ttl(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("Cache TTL must be a finite duration of at least one second.")
+    try:
+        ttl = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "Cache TTL must be a finite duration of at least one second."
+        ) from exc
+    if not math.isfinite(ttl) or ttl < MINIMUM_CACHE_TTL_SECONDS:
+        raise ValueError("Cache TTL must be a finite duration of at least one second.")
+    return ttl
 
 
 def validate_positive_finite(value: float, *, label: str) -> float:
@@ -316,7 +343,9 @@ __all__ = (
     "LeaseToken",
     "MAX_CACHE_FEATURE_LIMIT",
     "MAX_CACHE_FEATURE_PAYLOAD_BYTES",
+    "MAX_CACHE_VALUE_BYTES",
     "MAX_STREAM_POSITION",
+    "MINIMUM_CACHE_TTL_SECONDS",
     "ScheduleClaim",
     "ScheduleCursor",
     "ScheduleRecord",
@@ -324,6 +353,8 @@ __all__ = (
     "StreamRecord",
     "WorkDelivery",
     "WorkIdentity",
+    "validate_cache_ttl",
+    "validate_cache_value",
     "validate_feature_name",
     "validate_finite",
     "validate_limit",

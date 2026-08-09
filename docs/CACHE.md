@@ -6,7 +6,7 @@ callers own serialisation and cache-key variation.
 
 ## Configuration
 
-Install Redis support when using the Redis backend:
+Install external cache support when using the Redis or NATS JetStream backend:
 
 ```sh
 uv add 'wybra[cache]'
@@ -51,9 +51,16 @@ URL, or future provider settings.
 process-local, and its baseline key/value store removes expired values only
 when their keys are accessed. Use it for local development, deterministic
 tests, embedded single-process workers, or small bounded workloads; use Redis
-when baseline cache state must be shared across workers or instances. A memory
-cache cannot configure `url`; a Redis cache requires either `url`, `url_source`,
-or the documented native environment URL override.
+or NATS JetStream when baseline cache state must be shared across workers or
+instances. A memory cache cannot configure `url` or `servers`; a Redis cache
+requires either `url`, `url_source`, or the documented native environment URL
+override.
+
+Every baseline cache TTL is a finite duration of at least one second. This
+common lower bound lets consumers move between memory, Redis, and NATS
+JetStream without provider-specific expiry behaviour.
+Baseline cache values are limited to 65,536 bytes, so the same values remain
+portable across those backends without depending on provider transport limits.
 
 Redis keys are isolated by `namespace`. It defaults to the cache name, so
 `[cache]` uses `default` and `[cache.messages]` uses `messages`. Set an
@@ -67,12 +74,50 @@ list provides only the baseline byte cache. Configuration fails when a feature
 is duplicated, unknown, or not implemented by that backend.
 
 The root section supports `WYBRA_CACHE_BACKEND`, `WYBRA_CACHE_URL`,
-`WYBRA_CACHE_NAMESPACE`, and `WYBRA_CACHE_FEATURES`. Named overrides use
+`WYBRA_CACHE_NAMESPACE`, `WYBRA_CACHE_SERVERS`, and `WYBRA_CACHE_FEATURES`. Named overrides use
 `WYBRA_CACHE__<UPPER_CASE_NAME>__<FIELD>`. For example,
 `WYBRA_CACHE__MESSAGES__FEATURES=atomic` changes only the `messages` cache.
-Environment feature lists are comma-separated.
+Environment feature and server lists are comma-separated.
 A blank environment feature value is treated as unset; use `features = []` in
 configuration when a Redis cache must provide only the baseline byte-cache API.
+
+### NATS JetStream baseline cache
+
+The `nats-jetstream` backend provides the shared baseline byte cache only. It
+does not advertise any optional cache features in this release. It requires a
+reachable JetStream-enabled NATS Server `2.11` or newer; startup verifies the
+server version, JetStream availability, and the required stream configuration
+before the cache is registered.
+
+```toml
+[cache]
+backend = "nats-jetstream"
+servers = ["nats://nats-1.internal:4222", "nats://nats-2.internal:4222"]
+namespace = "website_default"
+```
+
+Each namespace owns one provider-managed stream and subject family. Namespaces
+therefore isolate named caches even when they use the same NATS account. Wybra
+derives each subject token from a deterministic SHA-256 digest of the logical
+owner and key, so raw cache keys do not appear in NATS subject names or
+diagnostics. Subject tokens are not a credential boundary; protect access to
+the NATS account and its monitoring interfaces.
+
+The provider creates or reuses only a `limits`-retention stream with one
+retained value per subject, no stream-level capacity cap, native message TTL,
+direct reads, and deletable entries. Startup rejects streams whose retention,
+capacity, acknowledgement, republish, delete-marker, source, or
+subject-transform settings could change baseline cache semantics or expose
+cache payloads outside the namespace. It also verifies that the configured NATS
+server can carry the 65,536-byte baseline value limit with message headers.
+
+JetStream applies cache expiry through its native per-message TTL support. The
+configured one-second baseline minimum is compatible with that provider
+requirement; fractional TTLs are rounded up only to the nearest nanosecond so
+entries never expire before their requested lifetime. Settings representations
+and diagnostics exclude connection credentials, but a configured URL remains
+available through `CacheSettings.servers`; use secure external configuration
+for production credentials.
 
 ### Redis connection secrets
 
@@ -250,7 +295,7 @@ feature is unavailable. Both memory and Redis supply the feature.
 Every cache operation requires an owner and a logical key. Owners must be
 non-blank and cannot contain `:`; the owner prefixes the backend key and keeps
 independent cache domains separate. Cache entries always have an explicit,
-positive TTL.
+finite TTL of at least one second and no more than 65,536 bytes.
 
 ## Optional features
 
@@ -407,7 +452,8 @@ execution is not promised. Startup probes Redis Streams consumer groups,
 claims, scripts, sorted sets, and settlement operations; a server that lacks
 that command surface cannot advertise the feature. The generic cache-backed
 Taskiq result adapter uses only the baseline byte-value cache; Taskiq broker and
-schedule adapters and the JetStream provider remain separate work.
+schedule adapters remain separate work. The NATS JetStream backend currently
+supplies only the generic baseline byte cache.
 
 ### Redis pub/sub
 
@@ -728,6 +774,8 @@ per-request secrets inside a fragment. Keep those values outside the cached
 body, or use a design that deliberately separates the per-request value from
 the reusable markup.
 
-The fragment cache stores rendered markup as UTF-8 bytes. It does not cache
+The fragment cache stores rendered markup as UTF-8 bytes. Its TTL must be a
+finite duration of at least one second. Fragments larger than 65,536 bytes
+still render, but are returned without being cached. The tag does not cache
 querysets, serialise structured Python values, or invalidate reverse proxies
 or CDNs.

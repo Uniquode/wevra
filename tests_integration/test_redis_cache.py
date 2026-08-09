@@ -17,6 +17,7 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import ExecWaitStrategy
 from tests.cache_feature_conformance import (
     assert_atomic_conformance,
+    assert_baseline_cache_conformance,
     assert_lease_conformance,
     assert_pubsub_conformance,
     assert_schedule_conformance,
@@ -110,24 +111,15 @@ def isolated_redis_container() -> Iterator[tuple[str, DockerContainer]]:
 async def test_redis_cache_round_trips_against_real_redis(redis_url: str) -> None:
     cache = RedisCache(redis_url)
 
-    async def unexpected_factory() -> bytes:
-        pytest.fail("A fresh Redis cache value must not run its factory.")
+    async def advance(seconds: float) -> None:
+        await asyncio.sleep(seconds + 0.1)
 
     try:
-        await cache.set("integration", "round-trip", b"first", ttl=60)
-
-        assert await cache.get("integration", "round-trip") == b"first"
-        assert (
-            await cache.get_or_set(
-                "integration",
-                "round-trip",
-                ttl=60,
-                factory=unexpected_factory,
-            )
-            == b"first"
+        await assert_baseline_cache_conformance(
+            cache,
+            advance,
+            owner="redis-baseline",
         )
-        await cache.delete("integration", "round-trip")
-        assert await cache.get("integration", "round-trip") is None
     finally:
         await cache.close()
 

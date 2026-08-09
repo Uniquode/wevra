@@ -918,7 +918,7 @@ class RedisCacheRuntime:
 
     def ttl_milliseconds(self, value: float, *, label: str) -> int:
         ttl = validate_positive_finite(value, label=label)
-        milliseconds = max(1, round(ttl * 1_000))
+        milliseconds = max(1, ceil(ttl * 1_000))
         if milliseconds > MAX_REDIS_TTL_MILLISECONDS:
             raise ValueError(f"{label.capitalize()} exceeds the Redis TTL limit.")
         return milliseconds

@@ -10,7 +10,9 @@ from typing import Protocol, TypeVar, cast, runtime_checkable
 from wybra.cache.capabilities import (
     DEFAULT_CACHE_FILL_TIMEOUT_SECONDS,
     CacheCapability,
+    CacheFactory,
     InMemoryCache,
+    NatsJetStreamCache,
     RedisCache,
 )
 from wybra.cache.config import to_cache_name
@@ -21,6 +23,7 @@ from wybra.cache.feature_models import (
 )
 from wybra.cache.lifecycle import close_all
 from wybra.cache.memory_features import InMemoryCacheFeatures
+from wybra.cache.nats_runtime import NatsJetStreamRuntime
 from wybra.cache.redis_features import RedisCacheFeatures
 from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.cache.settings import (
@@ -137,7 +140,7 @@ class _CacheValues:
         key: str,
         *,
         ttl: float,
-        factory: Callable[[], Awaitable[bytes]],
+        factory: CacheFactory,
         timeout: float = DEFAULT_CACHE_FILL_TIMEOUT_SECONDS,
     ) -> bytes:
         return await self.backend.get_or_set(
@@ -429,6 +432,31 @@ async def _redis_backend(
     )
 
 
+async def _nats_jetstream_backend(settings: CacheSettings) -> CacheBackend:
+    if not settings.servers:
+        raise ConfigurationError(
+            f"{settings.name!r} cache servers are required for the NATS JetStream "
+            "backend."
+        )
+    runtime = NatsJetStreamRuntime(settings.servers, settings.resolved_namespace)
+    try:
+        await runtime.health_check()
+    except BaseException as startup_error:
+        try:
+            await runtime.close()
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "NATS JetStream cache startup and cleanup failed.",
+                [startup_error, cleanup_error],
+            ) from startup_error
+        raise
+    return CacheBackend(
+        NatsJetStreamCache.from_runtime(runtime),
+        runtime.close,
+        lifecycle_owner=runtime,
+    )
+
+
 def _register_backend_closer(
     backend: CacheBackend,
     lifecycle_owners: list[object],
@@ -449,6 +477,7 @@ def _register_backend_closer(
 
 _DEFAULT_FACTORIES: Mapping[str, CacheBackendFactory] = {
     "memory": _memory_backend,
+    "nats-jetstream": _nats_jetstream_backend,
     "redis": _redis_backend,
 }
 

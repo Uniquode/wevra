@@ -2234,6 +2234,23 @@ def test_redis_duration_milliseconds_preserves_positive_submilliseconds() -> Non
     )
 
 
+@pytest.mark.parametrize(
+    ("ttl", "expected_milliseconds"),
+    (
+        (1.0, 1_000),
+        (1.0001, 1_001),
+        (1.0005, 1_001),
+    ),
+)
+def test_redis_cache_ttl_milliseconds_do_not_expire_early(
+    ttl: float,
+    expected_milliseconds: int,
+) -> None:
+    runtime = RedisCacheRuntime("redis://cache/0", namespace="cache")
+
+    assert runtime.ttl_milliseconds(ttl, label="cache TTL") == expected_milliseconds
+
+
 @pytest.mark.anyio
 async def test_redis_work_queue_reject_preserves_positive_submilliseconds(
     monkeypatch: pytest.MonkeyPatch,

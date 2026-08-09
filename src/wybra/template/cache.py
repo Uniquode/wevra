@@ -15,7 +15,12 @@ from jinja2.exceptions import TemplateNotFound, TemplateRuntimeError
 from jinja2.ext import Extension
 from jinja2.runtime import Context
 
-from wybra.cache import CacheCapability
+from wybra.cache import (
+    MAX_CACHE_VALUE_BYTES,
+    CacheCapability,
+    UncachedCacheValue,
+    validate_cache_ttl,
+)
 
 FRAGMENT_CACHE_OWNER = "template.fragment"
 type CacheProvider = Callable[[], Awaitable[CacheCapability | None]]
@@ -82,8 +87,10 @@ class CacheExtension(Extension):
             raise TemplateRuntimeError(
                 "Cache fragment names must be non-empty strings."
             )
-        if isinstance(ttl, bool) or not isinstance(ttl, int | float) or ttl <= 0:
-            raise TemplateRuntimeError("Cache fragment TTL must be a positive number.")
+        try:
+            cache_ttl = validate_cache_ttl(ttl)
+        except ValueError as exc:
+            raise TemplateRuntimeError(str(exc)) from None
 
         provider = self.cache_provider
         cache = await provider() if provider is not None else None
@@ -92,17 +99,20 @@ class CacheExtension(Extension):
 
         key = self._fragment_key(context, fragment_name, vary_by)
 
-        async def render_fragment() -> bytes:
-            return (await caller()).encode("utf-8")
+        async def render_fragment() -> bytes | UncachedCacheValue:
+            rendered = await caller()
+            value = rendered.encode("utf-8")
+            if len(value) > MAX_CACHE_VALUE_BYTES:
+                return UncachedCacheValue(value)
+            return value
 
-        return (
-            await cache.get_or_set(
-                FRAGMENT_CACHE_OWNER,
-                key,
-                ttl=float(ttl),
-                factory=render_fragment,
-            )
-        ).decode("utf-8")
+        cached_fragment = await cache.get_or_set(
+            FRAGMENT_CACHE_OWNER,
+            key,
+            ttl=cache_ttl,
+            factory=render_fragment,
+        )
+        return cached_fragment.decode("utf-8")
 
     def _fragment_key(
         self,

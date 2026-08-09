@@ -958,6 +958,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nats-py"
+version = "2.15.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/02/f0/fc5e93f2b0dd14a202590ad9d30eda1955ea872039b5204357348d0f4b1e/nats_py-2.15.0.tar.gz", hash = "sha256:6622c547d9a7d2313d9c147d46c386188f4ec2c7b5c9f9a0438a4d1b55f54a93", size = 75995, upload-time = "2026-06-05T07:34:03.904Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/a8/b55606c7c621fb813c8ec78baf201d2c78bf6051091ec0c7ada572999e95/nats_py-2.15.0-py3-none-any.whl", hash = "sha256:9f8d36aa52a9926a88b8f1d70cf1fdce0ad387941479b500ee9ab3e51073cefd", size = 90334, upload-time = "2026-06-05T07:34:02.81Z" },
+]
+
+[[package]]
 name = "nodeenv"
 version = "1.10.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1956,6 +1965,7 @@ aws = [
     { name = "boto3" },
 ]
 cache = [
+    { name = "nats-py" },
     { name = "redis" },
 ]
 databases = [
@@ -2007,6 +2017,7 @@ dev = [
     { name = "asyncpg" },
     { name = "croniter" },
     { name = "httpx2" },
+    { name = "nats-py" },
     { name = "pre-commit" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pyodbc" },
@@ -2044,6 +2055,7 @@ requires-dist = [
     { name = "inflect", specifier = ">=7.5.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "keyring", marker = "extra == 'keychain'", specifier = ">=25.7.0" },
+    { name = "nats-py", marker = "extra == 'cache'", specifier = ">=2.15.0,<3" },
     { name = "phonenumbers", specifier = ">=9.0.35" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'databases'", specifier = ">=3.3.4,<4.0.0" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'psycopg'", specifier = ">=3.3.4,<4.0.0" },
@@ -2074,6 +2086,7 @@ dev = [
     { name = "asyncpg", specifier = ">=0.31.0" },
     { name = "croniter", specifier = ">=6.2.4,<7.0.0" },
     { name = "httpx2", specifier = ">=2.9.1" },
+    { name = "nats-py", specifier = ">=2.15.0,<3" },
     { name = "pre-commit", specifier = ">=4.6.1" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.3.4,<4.0.0" },
     { name = "pyodbc", specifier = ">=5.3.0" },
