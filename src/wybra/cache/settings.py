@@ -37,6 +37,7 @@ CACHE_BACKEND_FEATURES = {
     "nats-jetstream": frozenset(),
     "redis": REDIS_CACHE_FEATURES,
 }
+_NATS_SERVER_SCHEMES = frozenset({"nats", "tls", "ws", "wss"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,12 +425,27 @@ def _nats_jetstream_partition(servers: tuple[str, ...], namespace: str) -> str:
 
 
 def _nats_server_target(server: str) -> str:
-    try:
-        parsed = urlsplit(server)
-        port = parsed.port or 4222
-        return f"{parsed.scheme.lower()}:{parsed.hostname or 'localhost'}:{port}"
-    except ValueError:
-        return "configured"
+    parsed = urlsplit(server)
+    port = parsed.port or 4222
+    return f"{parsed.scheme.lower()}:{parsed.hostname or 'localhost'}:{port}"
+
+
+def _validate_nats_server_urls(servers: tuple[str, ...], *, section_name: str) -> None:
+    for server in servers:
+        try:
+            parsed = urlsplit(server)
+            if (
+                parsed.scheme.lower() not in _NATS_SERVER_SCHEMES
+                or parsed.hostname is None
+            ):
+                raise ValueError
+            port = parsed.port
+            if port is not None and not 0 < port <= 65_535:
+                raise ValueError
+        except ValueError:
+            raise ConfigurationError(
+                f"{section_name}.servers must contain valid NATS server URLs."
+            ) from None
 
 
 def _secret_source(
@@ -502,6 +518,7 @@ def _validate_connection_settings(
             raise ConfigurationError(
                 f"{section_name}.servers must contain at least one NATS server."
             )
+        _validate_nats_server_urls(servers, section_name=section_name)
         for field_name, value in zip(
             ("url", "url_source", "url_key", "credentials_source", "credentials_key"),
             (url, *secret_values),

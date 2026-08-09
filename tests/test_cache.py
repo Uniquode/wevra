@@ -173,6 +173,20 @@ class TestCacheSettings:
         with pytest.raises(ConfigurationError, match=match):
             CacheSettings(**values)
 
+    @pytest.mark.parametrize(
+        "server",
+        (
+            "nats://cache.internal:not-a-port",
+            "cache.internal:4222",
+            "https://cache.internal:4222",
+            "nats://:4222",
+        ),
+        ids=("invalid-port", "missing-scheme", "unsupported-scheme", "missing-host"),
+    )
+    def test_rejects_malformed_nats_jetstream_server_urls(self, server: str) -> None:
+        with pytest.raises(ConfigurationError, match="valid NATS server URLs"):
+            CacheSettings(backend="nats-jetstream", servers=(server,))
+
     def test_named_nats_jetstream_cache_allows_environment_server_override(
         self,
     ) -> None:
@@ -1635,6 +1649,76 @@ class TestNatsJetStreamCache:
         assert runtime.ttls == {("template", "bytecode"): 1.0}
         await cache.delete("template", "bytecode")
         assert await cache.get("template", "bytecode") is None
+
+    @pytest.mark.anyio
+    async def test_shares_uncached_factory_values_without_provider_writes(self) -> None:
+        class ObservedNatsJetStreamCache(NatsJetStreamCache):
+            def __post_init__(self) -> None:
+                self.waiting_for_fill = asyncio.Event()
+                super().__post_init__()
+
+            async def _wait_for_fill(
+                self,
+                completed: asyncio.Event,
+                *,
+                timeout: float,
+            ) -> None:
+                self.waiting_for_fill.set()
+                await super()._wait_for_fill(completed, timeout=timeout)
+
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            async def get(self, _owner: str, _key: str) -> None:
+                return None
+
+            async def set(
+                self,
+                _owner: str,
+                _key: str,
+                _value: bytes,
+                *,
+                ttl: float,
+            ) -> None:
+                del ttl
+                self.writes += 1
+
+        runtime = FakeRuntime()
+        cache = ObservedNatsJetStreamCache.from_runtime(runtime)
+        factory_started = asyncio.Event()
+        release_factory = asyncio.Event()
+        factory_calls = 0
+
+        async def factory() -> UncachedCacheValue:
+            nonlocal factory_calls
+            factory_calls += 1
+            factory_started.set()
+            await release_factory.wait()
+            return UncachedCacheValue(b"uncached")
+
+        first = asyncio.create_task(
+            cache.get_or_set("template", "uncached", ttl=60, factory=factory)
+        )
+        second: asyncio.Task[bytes] | None = None
+        try:
+            await factory_started.wait()
+            second = asyncio.create_task(
+                cache.get_or_set("template", "uncached", ttl=60, factory=factory)
+            )
+            await cache.waiting_for_fill.wait()
+            release_factory.set()
+
+            assert await asyncio.gather(first, second) == [b"uncached", b"uncached"]
+            assert factory_calls == 1
+            assert runtime.writes == 0
+        finally:
+            release_factory.set()
+            fills = (first,) if second is None else (first, second)
+            for fill in fills:
+                if not fill.done():
+                    fill.cancel()
+            await asyncio.gather(*fills, return_exceptions=True)
 
     @pytest.mark.anyio
     async def test_baseline_caches_require_a_minimum_one_second_ttl(self) -> None:
