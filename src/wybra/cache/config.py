@@ -14,6 +14,7 @@ DEFAULT_CACHE_NAME: Final = "default"
 ENV_CACHE_BACKEND: Final = "WYBRA_CACHE_BACKEND"
 ENV_CACHE_FEATURES: Final = "WYBRA_CACHE_FEATURES"
 ENV_CACHE_NAMESPACE: Final = "WYBRA_CACHE_NAMESPACE"
+ENV_CACHE_SERVERS: Final = "WYBRA_CACHE_SERVERS"
 ENV_CACHE_URL: Final = "WYBRA_CACHE_URL"
 ENV_CACHE_URL_SOURCE: Final = "WYBRA_CACHE_URL_SOURCE"
 ENV_CACHE_URL_KEY: Final = "WYBRA_CACHE_URL_KEY"
@@ -25,9 +26,30 @@ _CACHE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 def to_cache_backend(value: object) -> str:
     backend = to_non_blank_string(value).lower()
-    if backend not in {"memory", "redis"}:
-        raise ValueError("cache backend must be 'memory' or 'redis'.")
+    if backend not in {"memory", "nats-jetstream", "redis"}:
+        raise ValueError(
+            "cache backend must be 'memory', 'nats-jetstream', or 'redis'."
+        )
     return backend
+
+
+def to_cache_servers(value: object) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        servers: tuple[object, ...] = tuple(value.split(","))
+    elif isinstance(value, list | tuple):
+        servers = tuple(value)
+    else:
+        raise ValueError(
+            "cache servers must be a list, tuple, or comma-separated string."
+        )
+    normalised_servers: list[str] = []
+    for server in servers:
+        if not isinstance(server, str):
+            raise ValueError("cache servers must be strings.")
+        normalised_servers.append(to_non_blank_string(server))
+    return tuple(normalised_servers)
 
 
 def to_cache_features(value: object) -> tuple[str, ...] | None:
@@ -99,6 +121,11 @@ CACHE_INSTANCE_CONFIG: Final = ConfigGroup(
             default=DEFAULT_CACHE_BACKEND,
             env=ENV_CACHE_BACKEND,
             transform=to_cache_backend,
+        ),
+        ConfigField(
+            name="servers",
+            env=ENV_CACHE_SERVERS,
+            transform=to_cache_servers,
         ),
         ConfigField(
             name="url",
@@ -175,6 +202,7 @@ module_config: Final = ConfigDef(
                 "credentials_source",
                 "features",
                 "namespace",
+                "servers",
                 "url",
                 "url_key",
                 "url_source",
@@ -195,6 +223,7 @@ __all__ = (
     "ENV_CACHE_CREDENTIALS_SOURCE",
     "ENV_CACHE_FEATURES",
     "ENV_CACHE_NAMESPACE",
+    "ENV_CACHE_SERVERS",
     "ENV_NAMED_CACHE_PREFIX",
     "ENV_CACHE_URL",
     "ENV_CACHE_URL_KEY",
@@ -204,6 +233,7 @@ __all__ = (
     "to_cache_features",
     "to_cache_name",
     "to_cache_namespace",
+    "to_cache_servers",
     "to_optional_secret_source",
     "validate_named_cache_name",
 )

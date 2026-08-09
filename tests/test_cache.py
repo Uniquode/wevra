@@ -21,11 +21,15 @@ from wybra.cache import (
     CacheSettings,
     CachesSettings,
     InMemoryCache,
+    NatsJetStreamCache,
     RedisCache,
+    UncachedCacheValue,
     build_caches,
     cache_provider_configured,
     setup_site,
 )
+from wybra.cache.feature_models import MAX_CACHE_VALUE_BYTES
+from wybra.cache.nats_runtime import NatsJetStreamRuntime
 from wybra.cache.redis_connection import resolve_redis_urls
 from wybra.cache.redis_features import RedisCacheFeatures
 from wybra.cache.redis_runtime import RedisCacheRuntime
@@ -106,6 +110,126 @@ class TestCacheSettings:
         assert settings.namespace is None
         assert settings.resolved_namespace == "default"
         assert settings.features is None
+
+    def test_loads_nats_jetstream_cache_servers_and_namespace(self) -> None:
+        settings = CacheSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": (
+                        "nats://first.internal:4222",
+                        "nats://second.internal:4222",
+                    ),
+                    "namespace": "task_cache",
+                }
+            }
+        )
+
+        assert settings.backend == "nats-jetstream"
+        assert settings.servers == (
+            "nats://first.internal:4222",
+            "nats://second.internal:4222",
+        )
+        assert settings.resolved_namespace == "task_cache"
+
+    @pytest.mark.parametrize(
+        ("values", "match"),
+        (
+            ({"backend": "nats-jetstream"}, "servers is required"),
+            (
+                {"backend": "nats-jetstream", "servers": []},
+                "servers must contain at least one",
+            ),
+            (
+                {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                    "url": "redis://cache/0",
+                },
+                "url is not valid",
+            ),
+            (
+                {
+                    "backend": "memory",
+                    "servers": ["nats://cache.internal:4222"],
+                },
+                "servers is not valid",
+            ),
+            (
+                {
+                    "backend": "redis",
+                    "url": "redis://cache/0",
+                    "servers": ["nats://cache.internal:4222"],
+                },
+                "servers is not valid",
+            ),
+        ),
+    )
+    def test_rejects_incompatible_nats_jetstream_connection_settings(
+        self,
+        values: dict[str, object],
+        match: str,
+    ) -> None:
+        with pytest.raises(ConfigurationError, match=match):
+            CacheSettings(**values)
+
+    @pytest.mark.parametrize(
+        "server",
+        (
+            "nats://cache.internal:not-a-port",
+            "cache.internal:4222",
+            "https://cache.internal:4222",
+            "nats://:4222",
+        ),
+        ids=("invalid-port", "missing-scheme", "unsupported-scheme", "missing-host"),
+    )
+    def test_rejects_malformed_nats_jetstream_server_urls(self, server: str) -> None:
+        with pytest.raises(ConfigurationError, match="valid NATS server URLs"):
+            CacheSettings(backend="nats-jetstream", servers=(server,))
+
+    def test_named_nats_jetstream_cache_allows_environment_server_override(
+        self,
+    ) -> None:
+        ConfigService.set_runtime_environment(
+            {
+                "WYBRA_CACHE__TASKS__BACKEND": "nats-jetstream",
+                "WYBRA_CACHE__TASKS__SERVERS": (
+                    "nats://first.internal:4222,nats://second.internal:4222"
+                ),
+            }
+        )
+        config = ConfigService(
+            [
+                MappingConfigSource(
+                    {
+                        "cache": {},
+                        "cache.tasks": {"backend": "memory"},
+                    }
+                )
+            ],
+            config_defs=(CacheSettings.module_config,),
+            discover_module_config=False,
+        )
+
+        settings = CachesSettings.load_settings(config)
+
+        assert settings.require("tasks").servers == (
+            "nats://first.internal:4222",
+            "nats://second.internal:4222",
+        )
+
+    def test_nats_jetstream_partition_diagnostics_are_secret_safe(self) -> None:
+        first = CacheSettings(
+            backend="nats-jetstream",
+            servers=("nats://user:secret@cache.internal:4222",),
+        )
+        second = CacheSettings(
+            backend="nats-jetstream",
+            servers=("nats://user:rotated@cache.internal:4222",),
+        )
+
+        assert first.partition == second.partition
+        assert "secret" not in first.partition
 
     def test_loads_independent_default_and_named_caches(self) -> None:
         settings = CachesSettings.load_settings(
@@ -679,6 +803,33 @@ class TestInMemoryCache:
         )
         assert calls == 1
 
+    @pytest.mark.parametrize("cached", (False, True), ids=("miss", "hit"))
+    @pytest.mark.anyio
+    async def test_get_or_set_rejects_invalid_ttl_before_reading_or_filling(
+        self,
+        cached: bool,
+    ) -> None:
+        cache = InMemoryCache()
+        factory_calls = 0
+
+        if cached:
+            await cache.set("template", "fragment", b"cached", ttl=60)
+
+        async def factory() -> bytes:
+            nonlocal factory_calls
+            factory_calls += 1
+            return b"filled"
+
+        with pytest.raises(ValueError, match="at least one second"):
+            await cache.get_or_set(
+                "template",
+                "fragment",
+                ttl=0.2,
+                factory=factory,
+            )
+
+        assert factory_calls == 0
+
     @pytest.mark.anyio
     async def test_get_or_set_allows_only_one_concurrent_factory(self) -> None:
         cache = InMemoryCache()
@@ -714,6 +865,72 @@ class TestInMemoryCache:
         assert await first == b"value"
         assert await second == b"value"
         assert calls == 1
+
+    @pytest.mark.anyio
+    async def test_get_or_set_shares_uncached_factory_output_without_failure_events(
+        self,
+    ) -> None:
+        class ObservedInMemoryCache(InMemoryCache):
+            def __init__(self) -> None:
+                super().__init__()
+                self.waiting_for_fill = asyncio.Event()
+
+            async def _wait_for_fill(
+                self,
+                completed: asyncio.Event,
+                *,
+                timeout: float,
+            ) -> None:
+                self.waiting_for_fill.set()
+                await super()._wait_for_fill(completed, timeout=timeout)
+
+        cache = ObservedInMemoryCache()
+        factory_started = asyncio.Event()
+        release_factory = asyncio.Event()
+        factory_calls = 0
+        observed: list[Event] = []
+
+        async def factory() -> UncachedCacheValue:
+            nonlocal factory_calls
+            factory_calls += 1
+            factory_started.set()
+            await release_factory.wait()
+            return UncachedCacheValue(b"x" * (MAX_CACHE_VALUE_BYTES + 1))
+
+        async def handler(event: Event) -> None:
+            observed.append(event)
+
+        async with _started_events_site() as site:
+            await site.require_capability(EventsCapability).subscribe(
+                EVT_CACHE, handler
+            )
+            first = asyncio.create_task(
+                cache.get_or_set("template", "oversized", ttl=60, factory=factory)
+            )
+            await asyncio.wait_for(factory_started.wait(), timeout=60)
+            second = asyncio.create_task(
+                cache.get_or_set("template", "oversized", ttl=60, factory=factory)
+            )
+            await asyncio.wait_for(cache.waiting_for_fill.wait(), timeout=60)
+            release_factory.set()
+
+            assert await asyncio.wait_for(
+                asyncio.gather(first, second), timeout=60
+            ) == [
+                b"x" * (MAX_CACHE_VALUE_BYTES + 1),
+                b"x" * (MAX_CACHE_VALUE_BYTES + 1),
+            ]
+
+        assert factory_calls == 1
+        assert await cache.get("template", "oversized") is None
+        assert not any(
+            isinstance(event, CacheOperationFailedEvent) for event in observed
+        )
+        assert any(
+            isinstance(event, CacheOperationCompletedEvent)
+            and event.outcome == "uncached"
+            for event in observed
+        )
 
     @pytest.mark.anyio
     async def test_get_or_set_records_a_miss_before_waiting_for_the_factory(
@@ -992,16 +1209,24 @@ class TestRedisCache:
             asyncio.run(awaitable)
 
     @pytest.mark.anyio
-    async def test_memory_backend_does_not_import_redis_dependency(
+    async def test_memory_backend_does_not_import_optional_cache_dependencies(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         def unexpected_import(_: str) -> None:
-            pytest.fail("Memory cache construction must not import Redis.")
+            pytest.fail("Memory cache construction must not import an optional client.")
 
+        redis_runtime = importlib.import_module("wybra.cache.redis_runtime")
+        nats_runtime = importlib.import_module("wybra.cache.nats_runtime")
         monkeypatch.setattr(
-            "wybra.cache.redis_runtime.importlib.import_module",
-            unexpected_import,
+            redis_runtime,
+            "importlib",
+            SimpleNamespace(import_module=unexpected_import),
+        )
+        monkeypatch.setattr(
+            nats_runtime,
+            "importlib",
+            SimpleNamespace(import_module=unexpected_import),
         )
 
         caches = await build_caches(CachesSettings.load_settings({"cache": {}}))
@@ -1122,6 +1347,505 @@ class TestRedisCache:
         await asyncio.gather(first, second)
 
         assert client.close_count == 1
+
+
+class TestNatsJetStreamCache:
+    @pytest.mark.anyio
+    async def test_requires_the_optional_cache_dependency(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def missing_nats(_: str) -> None:
+            raise ImportError("nats is not installed")
+
+        monkeypatch.setattr(
+            "wybra.cache.nats_runtime.importlib.import_module",
+            missing_nats,
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                }
+            }
+        )
+
+        with pytest.raises(ConfigurationError, match=r"Install wybra\[cache\]"):
+            await build_caches(settings)
+
+    @pytest.mark.anyio
+    async def test_rejects_a_server_without_per_message_ttl_support(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = SimpleNamespace(
+            connected_server_version=SimpleNamespace(major=2, minor=10, patch=19),
+            max_payload=1_048_576,
+            close_count=0,
+        )
+
+        async def close() -> None:
+            client.close_count += 1
+
+        async def connect(*, servers: list[str]) -> SimpleNamespace:
+            assert servers == ["nats://cache.internal:4222"]
+            return client
+
+        client.close = close
+        monkeypatch.setattr(
+            "wybra.cache.nats_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(connect=connect),
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                }
+            }
+        )
+
+        with pytest.raises(ConfigurationError, match="requires NATS server 2.11.0"):
+            await build_caches(settings)
+
+        assert client.close_count == 1
+
+    @pytest.mark.anyio
+    async def test_rejects_a_server_without_portable_value_capacity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = SimpleNamespace(
+            connected_server_version=SimpleNamespace(major=2, minor=11, patch=0),
+            max_payload=1,
+            close_count=0,
+        )
+
+        async def close() -> None:
+            client.close_count += 1
+
+        async def connect(*, servers: list[str]) -> SimpleNamespace:
+            assert servers == ["nats://cache.internal:4222"]
+            return client
+
+        client.close = close
+        monkeypatch.setattr(
+            "wybra.cache.nats_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(connect=connect),
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                }
+            }
+        )
+
+        with pytest.raises(ConfigurationError, match="payload limit"):
+            await build_caches(settings)
+
+        assert client.close_count == 1
+
+    @pytest.mark.anyio
+    async def test_retries_failed_startup_cleanup_before_releasing_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client = SimpleNamespace(
+            connected_server_version=SimpleNamespace(major=2, minor=10, patch=19),
+            max_payload=1_048_576,
+            close_attempts=0,
+        )
+
+        async def close() -> None:
+            client.close_attempts += 1
+            if client.close_attempts == 1:
+                raise RuntimeError("transient close failure")
+
+        async def connect(*, servers: list[str]) -> SimpleNamespace:
+            assert servers == ["nats://cache.internal:4222"]
+            return client
+
+        client.close = close
+        monkeypatch.setattr(
+            "wybra.cache.nats_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(connect=connect),
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                }
+            }
+        )
+
+        with pytest.raises(ConfigurationError, match="requires NATS server 2.11.0"):
+            await build_caches(settings)
+
+        assert client.close_attempts == 2
+
+    @pytest.mark.parametrize(
+        "stream_configuration",
+        (
+            {"mirror": object()},
+            {"republish": object()},
+            {"sources": (object(),)},
+            {"subject_delete_marker_ttl": 60},
+            {"subject_transform": object()},
+        ),
+        ids=(
+            "mirror",
+            "republish",
+            "sources",
+            "subject-delete-marker",
+            "subject-transform",
+        ),
+    )
+    @pytest.mark.anyio
+    async def test_rejects_stream_topology_that_changes_baseline_semantics(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stream_configuration: dict[str, object],
+    ) -> None:
+        client = SimpleNamespace(
+            connected_server_version=SimpleNamespace(major=2, minor=11, patch=0),
+            max_payload=1_048_576,
+            close_count=0,
+        )
+        config = SimpleNamespace(
+            **(
+                {
+                    "name": "WYBRA_CACHE_DEFAULT",
+                    "subjects": ("wybra.cache.default.>",),
+                    "retention": "limits",
+                    "max_msgs_per_subject": 1,
+                    "max_msgs": -1,
+                    "max_bytes": -1,
+                    "max_age": 0,
+                    "max_msg_size": -1,
+                    "discard_new_per_subject": False,
+                    "discard": "old",
+                    "no_ack": False,
+                    "sealed": False,
+                    "deny_delete": False,
+                    "mirror": None,
+                    "republish": None,
+                    "sources": (),
+                    "subject_delete_marker_ttl": None,
+                    "subject_transform": None,
+                    "allow_direct": True,
+                    "allow_msg_ttl": True,
+                }
+                | stream_configuration
+            )
+        )
+
+        async def close() -> None:
+            client.close_count += 1
+
+        async def connect(*, servers: list[str]) -> SimpleNamespace:
+            assert servers == ["nats://cache.internal:4222"]
+            return client
+
+        async def account_info() -> None:
+            return None
+
+        async def stream_info(_name: str) -> SimpleNamespace:
+            return SimpleNamespace(config=config)
+
+        class NotFoundError(Exception):
+            pass
+
+        def import_module(name: str) -> SimpleNamespace:
+            if name == "nats":
+                return SimpleNamespace(connect=connect)
+            if name == "nats.js.errors":
+                return SimpleNamespace(NotFoundError=NotFoundError)
+            pytest.fail(f"Unexpected NATS module request: {name}")
+
+        client.close = close
+        client.jetstream = lambda: SimpleNamespace(
+            account_info=account_info,
+            stream_info=stream_info,
+        )
+        monkeypatch.setattr(
+            "wybra.cache.nats_runtime.importlib.import_module",
+            import_module,
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                }
+            }
+        )
+
+        with pytest.raises(
+            ConfigurationError, match="stream configuration is incompatible"
+        ):
+            await build_caches(settings)
+
+        assert client.close_count == 1
+
+    @pytest.mark.anyio
+    async def test_reports_connection_startup_failure_safely(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def connect(*, servers: list[str]) -> None:
+            del servers
+            raise RuntimeError("connection refused")
+
+        monkeypatch.setattr(
+            "wybra.cache.nats_runtime.importlib.import_module",
+            lambda _: SimpleNamespace(connect=connect),
+        )
+        settings = CachesSettings.load_settings(
+            {
+                "cache": {
+                    "backend": "nats-jetstream",
+                    "servers": ["nats://cache.internal:4222"],
+                }
+            }
+        )
+
+        with pytest.raises(ConfigurationError, match="cache backend startup failed"):
+            await build_caches(settings)
+
+    @pytest.mark.anyio
+    async def test_delegates_byte_values_ttl_and_deletion_to_jetstream(self) -> None:
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.values: dict[tuple[str, str], bytes] = {}
+                self.ttls: dict[tuple[str, str], float] = {}
+
+            async def get(self, owner: str, key: str) -> bytes | None:
+                return self.values.get((owner, key))
+
+            async def set(
+                self,
+                owner: str,
+                key: str,
+                value: bytes,
+                *,
+                ttl: float,
+            ) -> None:
+                self.values[(owner, key)] = value
+                self.ttls[(owner, key)] = ttl
+
+            async def delete(self, owner: str, key: str) -> None:
+                self.values.pop((owner, key), None)
+
+        runtime = FakeRuntime()
+        cache = NatsJetStreamCache.from_runtime(runtime)
+
+        await cache.set("template", "bytecode", b"compiled", ttl=1)
+
+        assert await cache.get("template", "bytecode") == b"compiled"
+        assert runtime.ttls == {("template", "bytecode"): 1.0}
+        await cache.delete("template", "bytecode")
+        assert await cache.get("template", "bytecode") is None
+
+    @pytest.mark.anyio
+    async def test_shares_uncached_factory_values_without_provider_writes(self) -> None:
+        class ObservedNatsJetStreamCache(NatsJetStreamCache):
+            def __post_init__(self) -> None:
+                self.waiting_for_fill = asyncio.Event()
+                super().__post_init__()
+
+            async def _wait_for_fill(
+                self,
+                completed: asyncio.Event,
+                *,
+                timeout: float,
+            ) -> None:
+                self.waiting_for_fill.set()
+                await super()._wait_for_fill(completed, timeout=timeout)
+
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.writes = 0
+
+            async def get(self, _owner: str, _key: str) -> None:
+                return None
+
+            async def set(
+                self,
+                _owner: str,
+                _key: str,
+                _value: bytes,
+                *,
+                ttl: float,
+            ) -> None:
+                del ttl
+                self.writes += 1
+
+        runtime = FakeRuntime()
+        cache = ObservedNatsJetStreamCache.from_runtime(runtime)
+        factory_started = asyncio.Event()
+        release_factory = asyncio.Event()
+        factory_calls = 0
+
+        async def factory() -> UncachedCacheValue:
+            nonlocal factory_calls
+            factory_calls += 1
+            factory_started.set()
+            await release_factory.wait()
+            return UncachedCacheValue(b"uncached")
+
+        first = asyncio.create_task(
+            cache.get_or_set("template", "uncached", ttl=60, factory=factory)
+        )
+        second: asyncio.Task[bytes] | None = None
+        try:
+            await factory_started.wait()
+            second = asyncio.create_task(
+                cache.get_or_set("template", "uncached", ttl=60, factory=factory)
+            )
+            await cache.waiting_for_fill.wait()
+            release_factory.set()
+
+            assert await asyncio.gather(first, second) == [b"uncached", b"uncached"]
+            assert factory_calls == 1
+            assert runtime.writes == 0
+        finally:
+            release_factory.set()
+            fills = (first,) if second is None else (first, second)
+            for fill in fills:
+                if not fill.done():
+                    fill.cancel()
+            await asyncio.gather(*fills, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_baseline_caches_require_a_minimum_one_second_ttl(self) -> None:
+        caches = (
+            InMemoryCache(),
+            RedisCache("redis://cache.internal/0"),
+            NatsJetStreamCache.from_runtime(SimpleNamespace()),
+        )
+
+        for cache in caches:
+            with pytest.raises(ValueError, match="at least one second"):
+                await cache.set("template", "short-lived", b"value", ttl=0.2)
+
+    @pytest.mark.parametrize(
+        "ttl",
+        (10**400, -(10**400)),
+        ids=("huge-positive-integer", "huge-negative-integer"),
+    )
+    @pytest.mark.anyio
+    async def test_baseline_caches_reject_unrepresentable_ttls_before_io(
+        self,
+        ttl: int,
+    ) -> None:
+        caches = (
+            InMemoryCache(),
+            RedisCache("redis://cache.internal/0"),
+            NatsJetStreamCache.from_runtime(SimpleNamespace()),
+        )
+
+        for cache in caches:
+            with pytest.raises(ValueError, match="finite duration"):
+                await cache.set("template", "unrepresentable", b"value", ttl=ttl)
+
+            async def factory() -> bytes:
+                pytest.fail("An invalid TTL must not invoke its factory.")
+
+            with pytest.raises(ValueError, match="finite duration"):
+                await cache.get_or_set(
+                    "template",
+                    "unrepresentable",
+                    ttl=ttl,
+                    factory=factory,
+                )
+
+    @pytest.mark.anyio
+    async def test_baseline_caches_reject_values_above_the_portable_limit(
+        self,
+    ) -> None:
+        caches = (
+            InMemoryCache(),
+            RedisCache("redis://cache.internal/0"),
+            NatsJetStreamCache.from_runtime(SimpleNamespace()),
+        )
+        oversized = b"x" * (MAX_CACHE_VALUE_BYTES + 1)
+
+        for cache in caches:
+            with pytest.raises(ValueError, match="cannot exceed"):
+                await cache.set("template", "oversized", oversized, ttl=60)
+
+    @pytest.mark.anyio
+    async def test_nats_ttl_limit_is_reported_as_invalid_input(self) -> None:
+        class FakeJetStream:
+            async def publish(self, *_args: object, **_kwargs: object) -> None:
+                pytest.fail("An invalid TTL must not attempt a provider write.")
+
+        runtime = NatsJetStreamRuntime(("nats://cache.internal:4222",), "default")
+        runtime._jetstream = FakeJetStream()
+
+        with pytest.raises(ValueError, match="exceeds the NATS JetStream TTL limit"):
+            await runtime.set("template", "bytecode", b"compiled", ttl=1e30)
+
+    def test_subject_tokens_do_not_reveal_logical_cache_keys(self) -> None:
+        runtime = NatsJetStreamRuntime(("nats://cache.internal:4222",), "default")
+
+        first = runtime.cache_subject("session", "user:42/reset-token")
+        second = runtime.cache_subject("session", "user:42/reset-token")
+
+        assert first == second
+        assert "session" not in first
+        assert "user:42/reset-token" not in first
+
+    @pytest.mark.anyio
+    async def test_close_retries_after_a_transient_client_failure(self) -> None:
+        class FakeClient:
+            close_attempts = 0
+
+            async def close(self) -> None:
+                self.close_attempts += 1
+                if self.close_attempts == 1:
+                    raise RuntimeError("transient close failure")
+
+        runtime = NatsJetStreamRuntime(("nats://cache.internal:4222",), "default")
+        client = FakeClient()
+        runtime._client = client
+        runtime._jetstream = object()
+
+        with pytest.raises(CacheFeatureError, match="shutdown failed"):
+            await runtime.close()
+
+        await runtime.close()
+        assert client.close_attempts == 2
+
+    @pytest.mark.anyio
+    async def test_delete_accepts_a_concurrently_replaced_value(self) -> None:
+        class FakeJetStream:
+            def __init__(self) -> None:
+                self.reads = 0
+
+            async def get_last_msg(
+                self,
+                stream: str,
+                subject: str,
+                *,
+                direct: bool,
+            ) -> SimpleNamespace:
+                del stream, subject, direct
+                self.reads += 1
+                return SimpleNamespace(seq=1 if self.reads == 1 else 2)
+
+            async def delete_msg(self, stream: str, sequence: int) -> None:
+                del stream, sequence
+                raise RuntimeError("message was replaced")
+
+        runtime = NatsJetStreamRuntime(("nats://cache.internal:4222",), "default")
+        runtime._jetstream = FakeJetStream()
+
+        await runtime.delete("template", "bytecode")
 
 
 class TestCacheModule:
@@ -1754,6 +2478,116 @@ class TestTemplateFragmentCache:
             )
             == "troisième"
         )
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        ("value", "is_cached"),
+        (
+            ("x" * MAX_CACHE_VALUE_BYTES, True),
+            ("x" * (MAX_CACHE_VALUE_BYTES + 1), False),
+            ("é" * ((MAX_CACHE_VALUE_BYTES // 2) + 1), False),
+        ),
+        ids=("at-limit", "oversized-ascii", "oversized-utf8"),
+    )
+    async def test_fragment_cache_preserves_oversized_rendering(
+        self,
+        tmp_path: Path,
+        value: str,
+        *,
+        is_cached: bool,
+    ) -> None:
+        (tmp_path / "fragment.html").write_text(
+            '{% cache "greeting" ttl=60 %}{{ value }}{% endcache %}',
+            encoding="utf-8",
+        )
+        cache = InMemoryCache()
+        templates = DefaultTemplateCapability(
+            template_root=tmp_path,
+            cache_provider=lambda: _cache_provider(cache),
+        )
+
+        assert (
+            await templates.render_template("fragment.html", {"value": value}) == value
+        )
+        assert await templates.render_template(
+            "fragment.html", {"value": "replacement"}
+        ) == (value if is_cached else "replacement")
+
+    @pytest.mark.anyio
+    async def test_fragment_cache_shares_concurrent_oversized_rendering(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        class ObservedInMemoryCache(InMemoryCache):
+            def __init__(self) -> None:
+                super().__init__()
+                self.waiting_for_fill = asyncio.Event()
+
+            async def _wait_for_fill(
+                self,
+                completed: asyncio.Event,
+                *,
+                timeout: float,
+            ) -> None:
+                self.waiting_for_fill.set()
+                await super()._wait_for_fill(completed, timeout=timeout)
+
+        (tmp_path / "fragment.html").write_text(
+            '{% cache "greeting" ttl=60 %}{{ render_fragment() }}{% endcache %}',
+            encoding="utf-8",
+        )
+        cache = ObservedInMemoryCache()
+        templates = DefaultTemplateCapability(
+            template_root=tmp_path,
+            cache_provider=lambda: _cache_provider(cache),
+        )
+        rendered = "x" * (MAX_CACHE_VALUE_BYTES + 1)
+        render_started = asyncio.Event()
+        release_render = asyncio.Event()
+        render_calls = 0
+
+        async def render_fragment() -> str:
+            nonlocal render_calls
+            render_calls += 1
+            render_started.set()
+            await release_render.wait()
+            return rendered
+
+        templates.environment.globals["render_fragment"] = render_fragment
+        first = asyncio.create_task(templates.render_template("fragment.html", {}))
+        await asyncio.wait_for(render_started.wait(), timeout=60)
+        second = asyncio.create_task(templates.render_template("fragment.html", {}))
+        await asyncio.wait_for(cache.waiting_for_fill.wait(), timeout=60)
+        release_render.set()
+
+        assert await asyncio.wait_for(asyncio.gather(first, second), timeout=60) == [
+            rendered,
+            rendered,
+        ]
+        assert render_calls == 1
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("ttl", (0.5, float("nan"), float("inf")))
+    async def test_fragment_cache_rejects_invalid_ttl_before_cache_resolution(
+        self,
+        tmp_path: Path,
+        ttl: float,
+    ) -> None:
+        (tmp_path / "fragment.html").write_text(
+            '{% cache "greeting" ttl=ttl %}{{ value }}{% endcache %}',
+            encoding="utf-8",
+        )
+
+        async def unexpected_cache_provider() -> CacheCapability | None:
+            pytest.fail("Invalid cache fragment TTLs must not resolve a cache.")
+
+        templates = DefaultTemplateCapability(
+            template_root=tmp_path,
+            cache_provider=unexpected_cache_provider,
+        )
+
+        with pytest.raises(TemplateRuntimeError, match="at least one second"):
+            await templates.render_template("fragment.html", {"ttl": ttl, "value": "x"})
 
     @pytest.mark.anyio
     async def test_isolates_user_scoped_fragments(self, tmp_path: Path) -> None:

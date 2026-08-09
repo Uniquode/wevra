@@ -6,12 +6,29 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from wybra.cache.feature_models import (
+    MINIMUM_CACHE_TTL_SECONDS,
+    validate_cache_ttl,
+    validate_cache_value,
+)
 from wybra.cache.redis_runtime import RedisCacheRuntime
 from wybra.core.exceptions import ConfigurationError
 from wybra.events import observe
 from wybra.events.cache import cache_event
 
-type CacheFactory = Callable[[], Awaitable[bytes]]
+
+@dataclass(frozen=True, slots=True)
+class UncachedCacheValue:
+    """Return a factory value to current callers without storing it."""
+
+    value: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, bytes):
+            raise TypeError("Uncached cache values must be bytes.")
+
+
+type CacheFactory = Callable[[], Awaitable[bytes | UncachedCacheValue]]
 DEFAULT_CACHE_FILL_TIMEOUT_SECONDS = 30.0
 
 
@@ -35,10 +52,16 @@ class CacheCapability(Protocol):
 
 
 @dataclass(slots=True)
+class _CacheFill:
+    completed: asyncio.Event
+    uncached_value: bytes | None = None
+
+
+@dataclass(slots=True)
 class _SingleFlightCache:
     """Coordinate one in-process cache fill for each backend key."""
 
-    _fills: dict[str, asyncio.Event] = field(default_factory=dict, init=False)
+    _fills: dict[str, _CacheFill] = field(default_factory=dict, init=False)
     _fills_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def get(self, owner: str, key: str) -> bytes | None:
@@ -66,6 +89,7 @@ class _SingleFlightCache:
         factory: CacheFactory,
         timeout: float,
     ) -> bytes:
+        ttl = validate_cache_ttl(ttl)
         cache_key = _cache_key(owner, key)
         timeout = _fill_timeout(timeout)
         while True:
@@ -87,25 +111,34 @@ class _SingleFlightCache:
             )
 
             async with self._fills_lock:
-                completed = self._fills.get(cache_key)
-                if completed is None:
-                    completed = asyncio.Event()
-                    self._fills[cache_key] = completed
+                fill = self._fills.get(cache_key)
+                if fill is None:
+                    fill = _CacheFill(asyncio.Event())
+                    self._fills[cache_key] = fill
                     is_filler = True
                 else:
                     is_filler = False
 
             if not is_filler:
-                await asyncio.wait_for(completed.wait(), timeout=timeout)
+                await self._wait_for_fill(fill.completed, timeout=timeout)
+                if fill.uncached_value is not None:
+                    return fill.uncached_value
                 continue
 
             fill_started = time.perf_counter()
+            uncached = False
             try:
                 try:
-                    value = await asyncio.wait_for(factory(), timeout=timeout)
-                    await self._set_value(owner, key, value, ttl=ttl)
+                    factory_value = await asyncio.wait_for(factory(), timeout=timeout)
+                    if isinstance(factory_value, UncachedCacheValue):
+                        value = factory_value.value
+                        fill.uncached_value = value
+                        uncached = True
+                    else:
+                        value = factory_value
+                        await self._set_value(owner, key, value, ttl=ttl)
                 finally:
-                    await self._release_fill(cache_key, completed)
+                    await self._release_fill(cache_key, fill)
             except Exception as exc:
                 await self._record_failed(
                     "fill",
@@ -116,25 +149,29 @@ class _SingleFlightCache:
                 )
                 raise
             else:
-                await self._record_completed(
-                    "set", owner, key, outcome="stored", started=fill_started
-                )
+                if not uncached:
+                    await self._record_completed(
+                        "set", owner, key, outcome="stored", started=fill_started
+                    )
                 await self._record_completed(
                     "fill",
                     owner,
                     key,
-                    outcome="filled",
+                    outcome="uncached" if uncached else "filled",
                     started=fill_started,
                 )
                 return value
 
-    async def _release_fill(self, cache_key: str, completed: asyncio.Event) -> None:
+    async def _release_fill(self, cache_key: str, fill: _CacheFill) -> None:
         """Wake waiters before observational event delivery can delay them."""
 
         async with self._fills_lock:
-            if self._fills.get(cache_key) is completed:
+            if self._fills.get(cache_key) is fill:
                 self._fills.pop(cache_key, None)
-            completed.set()
+            fill.completed.set()
+
+    async def _wait_for_fill(self, completed: asyncio.Event, *, timeout: float) -> None:
+        await asyncio.wait_for(completed.wait(), timeout=timeout)
 
     @observe(cache_event)
     async def _record_completed(
@@ -204,8 +241,7 @@ class InMemoryCache(_SingleFlightCache):
     async def _set_value(
         self, owner: str, key: str, value: bytes, *, ttl: float
     ) -> None:
-        if not isinstance(value, bytes):
-            raise TypeError("Cache values must be bytes.")
+        value = validate_cache_value(value)
         cache_key = _cache_key(owner, key)
         expires_at = time.monotonic() + _ttl(ttl)
         async with self._lock:
@@ -299,8 +335,8 @@ class RedisCache(_SingleFlightCache):
     async def _set_value(
         self, owner: str, key: str, value: bytes, *, ttl: float
     ) -> None:
-        if not isinstance(value, bytes):
-            raise TypeError("Cache values must be bytes.")
+        value = validate_cache_value(value)
+        ttl = validate_cache_ttl(ttl)
         runtime = self._runtime()
         cache_key = runtime.baseline_key(owner, key)
         ttl_milliseconds = runtime.ttl_milliseconds(ttl, label="cache TTL")
@@ -353,6 +389,100 @@ class RedisCache(_SingleFlightCache):
         return self._runtime_owner
 
 
+@dataclass(slots=True)
+class NatsJetStreamCache(_SingleFlightCache):
+    servers: tuple[str, ...] = field(default_factory=tuple, repr=False)
+    namespace: str | None = None
+    _runtime_owner: Any = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._runtime_owner is not None:
+            return
+        if not self.servers:
+            raise ConfigurationError("NATS JetStream cache servers must be configured.")
+        from wybra.cache.nats_runtime import NatsJetStreamRuntime
+
+        self._runtime_owner = NatsJetStreamRuntime(
+            self.servers,
+            self.namespace or "default",
+        )
+
+    @classmethod
+    def from_runtime(cls, runtime: Any) -> NatsJetStreamCache:
+        return cls(_runtime_owner=runtime)
+
+    async def get(self, owner: str, key: str) -> bytes | None:
+        started = time.perf_counter()
+        try:
+            value, outcome = await self._get_value(owner, key)
+        except Exception as exc:
+            await self._record_failed("read", owner, key, started=started, error=exc)
+            raise
+        await self._record_completed(
+            "read", owner, key, outcome=outcome, started=started
+        )
+        return value
+
+    async def set(self, owner: str, key: str, value: bytes, *, ttl: float) -> None:
+        started = time.perf_counter()
+        try:
+            await self._set_value(owner, key, value, ttl=ttl)
+        except Exception as exc:
+            await self._record_failed("set", owner, key, started=started, error=exc)
+            raise
+        await self._record_completed(
+            "set", owner, key, outcome="stored", started=started
+        )
+
+    async def _get_value(self, owner: str, key: str) -> tuple[bytes | None, str]:
+        value = await self._runtime().get(owner, key)
+        return value, "hit" if value is not None else "miss"
+
+    async def _set_value(
+        self, owner: str, key: str, value: bytes, *, ttl: float
+    ) -> None:
+        value = validate_cache_value(value)
+        ttl = validate_cache_ttl(ttl)
+        await self._runtime().set(owner, key, value, ttl=ttl)
+
+    async def delete(self, owner: str, key: str) -> None:
+        started = time.perf_counter()
+        try:
+            await self._runtime().delete(owner, key)
+        except Exception as exc:
+            await self._record_failed("delete", owner, key, started=started, error=exc)
+            raise
+        await self._record_completed(
+            "delete", owner, key, outcome="deleted", started=started
+        )
+
+    async def get_or_set(
+        self,
+        owner: str,
+        key: str,
+        *,
+        ttl: float,
+        factory: CacheFactory,
+        timeout: float = DEFAULT_CACHE_FILL_TIMEOUT_SECONDS,
+    ) -> bytes:
+        return await self._get_or_set(
+            owner,
+            key,
+            ttl=ttl,
+            factory=factory,
+            timeout=timeout,
+        )
+
+    async def close(self) -> None:
+        await self._runtime().close()
+
+    def _runtime(self) -> Any:
+        runtime = self._runtime_owner
+        if runtime is None:
+            raise ConfigurationError("NATS JetStream cache runtime is not configured.")
+        return runtime
+
+
 def _cache_key(owner: str, key: str) -> str:
     if not isinstance(owner, str) or not owner.strip():
         raise ValueError("Cache owner must be a non-blank string.")
@@ -364,9 +494,7 @@ def _cache_key(owner: str, key: str) -> str:
 
 
 def _ttl(value: float) -> float:
-    if not isinstance(value, int | float) or value <= 0:
-        raise ValueError("Cache TTL must be positive.")
-    return float(value)
+    return validate_cache_ttl(value)
 
 
 def _fill_timeout(value: float) -> float:
@@ -380,5 +508,9 @@ __all__ = (
     "CacheFactory",
     "DEFAULT_CACHE_FILL_TIMEOUT_SECONDS",
     "InMemoryCache",
+    "MINIMUM_CACHE_TTL_SECONDS",
+    "NatsJetStreamCache",
     "RedisCache",
+    "UncachedCacheValue",
+    "validate_cache_ttl",
 )

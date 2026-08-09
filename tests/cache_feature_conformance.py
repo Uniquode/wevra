@@ -7,7 +7,9 @@ from collections.abc import Awaitable, Callable
 import pytest
 
 from wybra.cache import (
+    MAX_CACHE_VALUE_BYTES,
     AtomicCacheCapability,
+    CacheCapability,
     CacheConflictError,
     CachePositionExpiredError,
     LeaseCacheCapability,
@@ -19,6 +21,86 @@ from wybra.cache import (
 )
 
 type AdvanceClock = Callable[[float], Awaitable[None]]
+CONFORMANCE_TIMEOUT_SECONDS = 60.0
+
+
+async def assert_baseline_cache_conformance(
+    cache: CacheCapability,
+    advance: AdvanceClock,
+    *,
+    owner: str = "conformance-baseline",
+) -> None:
+    async def unexpected_factory() -> bytes:
+        pytest.fail("A cache hit must not run its factory.")
+
+    await cache.set(owner, "value", b"first", ttl=60)
+    assert await cache.get(owner, "value") == b"first"
+    assert (
+        await cache.get_or_set(
+            owner,
+            "value",
+            ttl=60,
+            factory=unexpected_factory,
+        )
+        == b"first"
+    )
+    await cache.delete(owner, "value")
+    assert await cache.get(owner, "value") is None
+
+    maximum_value = b"x" * MAX_CACHE_VALUE_BYTES
+    await cache.set(owner, "maximum", maximum_value, ttl=60)
+    assert await cache.get(owner, "maximum") == maximum_value
+    with pytest.raises(ValueError, match="cannot exceed"):
+        await cache.set(owner, "oversized", maximum_value + b"x", ttl=60)
+
+    fill_started = asyncio.Event()
+    release_fill = asyncio.Event()
+    factory_calls = 0
+
+    async def factory() -> bytes:
+        nonlocal factory_calls
+        factory_calls += 1
+        fill_started.set()
+        await release_fill.wait()
+        return b"filled"
+
+    first_fill = asyncio.create_task(
+        cache.get_or_set(owner, "fill", ttl=60, factory=factory)
+    )
+    second_fill: asyncio.Task[bytes] | None = None
+    second_started = asyncio.Event()
+
+    async def second_get_or_set() -> bytes:
+        second_started.set()
+        return await cache.get_or_set(owner, "fill", ttl=60, factory=factory)
+
+    try:
+        await asyncio.wait_for(fill_started.wait(), timeout=CONFORMANCE_TIMEOUT_SECONDS)
+        second_fill = asyncio.create_task(second_get_or_set())
+        await asyncio.wait_for(
+            second_started.wait(),
+            timeout=CONFORMANCE_TIMEOUT_SECONDS,
+        )
+        await asyncio.sleep(0)
+        assert factory_calls == 1
+        release_fill.set()
+        assert await asyncio.wait_for(
+            asyncio.gather(first_fill, second_fill),
+            timeout=CONFORMANCE_TIMEOUT_SECONDS,
+        ) == [b"filled", b"filled"]
+    finally:
+        release_fill.set()
+        fills = (first_fill,) if second_fill is None else (first_fill, second_fill)
+        for fill in fills:
+            if not fill.done():
+                fill.cancel()
+        await asyncio.gather(*fills, return_exceptions=True)
+    assert factory_calls == 1
+    assert await cache.get(owner, "fill") == b"filled"
+
+    await cache.set(owner, "expires", b"value", ttl=1)
+    await advance(1)
+    assert await cache.get(owner, "expires") is None
 
 
 async def assert_atomic_conformance(

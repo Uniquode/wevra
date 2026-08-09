@@ -31,6 +31,10 @@ The smoke helper starts `wybra-runserver` through `uv`, creates a temporary host
 ASGI application, verifies an HTTP response on loopback, and terminates the
 server process.
 
+Parameterised tests that use very large values must declare concise `ids`.
+Pytest records the active test name in `PYTEST_CURRENT_TEST`; Windows limits a
+single environment variable value to 32,767 UTF-16 characters.
+
 ## Support Boundaries
 
 - Windows CI validates the package workflow on GitHub-hosted

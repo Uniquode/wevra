@@ -47,6 +47,9 @@ _EXPORT_MODULES = {
     "MAX_CACHE_FEATURE_PAYLOAD_BYTES": "wybra.cache.feature_models",
     "MAX_CACHE_FEATURE_LIMIT": "wybra.cache.feature_models",
     "MAX_STREAM_POSITION": "wybra.cache.feature_models",
+    "MAX_CACHE_VALUE_BYTES": "wybra.cache.feature_models",
+    "MINIMUM_CACHE_TTL_SECONDS": "wybra.cache.feature_models",
+    "NatsJetStreamCache": "wybra.cache.capabilities",
     "PubSubCacheCapability": "wybra.cache.feature_contracts",
     "PubSubSubscription": "wybra.cache.feature_contracts",
     "RedisCache": "wybra.cache.capabilities",
@@ -57,6 +60,7 @@ _EXPORT_MODULES = {
     "StreamCacheCapability": "wybra.cache.feature_contracts",
     "StreamPosition": "wybra.cache.feature_models",
     "StreamRecord": "wybra.cache.feature_models",
+    "UncachedCacheValue": "wybra.cache.capabilities",
     "WorkDelivery": "wybra.cache.feature_models",
     "WorkIdentity": "wybra.cache.feature_models",
     "WorkQueueCacheCapability": "wybra.cache.feature_contracts",
@@ -65,6 +69,7 @@ _EXPORT_MODULES = {
     "module_config": "wybra.cache.config",
     "setup_site": "wybra.cache.setup",
     "to_cache_name": "wybra.cache.config",
+    "validate_cache_ttl": "wybra.cache.feature_models",
     "validate_lease_token": "wybra.cache.feature_models",
 }
 

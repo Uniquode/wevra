@@ -16,6 +16,7 @@ from wybra.cache.config import (
     to_cache_features,
     to_cache_name,
     to_cache_namespace,
+    to_cache_servers,
     to_optional_secret_source,
 )
 from wybra.cache.memory_features import MEMORY_CACHE_FEATURES
@@ -33,8 +34,10 @@ from wybra.services.secrets import (
 
 CACHE_BACKEND_FEATURES = {
     "memory": MEMORY_CACHE_FEATURES,
+    "nats-jetstream": frozenset(),
     "redis": REDIS_CACHE_FEATURES,
 }
+_NATS_SERVER_SCHEMES = frozenset({"nats", "tls", "ws", "wss"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +46,7 @@ class CacheSettings(BaseSettings):
     config_section: ClassVar[str | None] = CACHE_CONFIG_SECTION
 
     backend: str = DEFAULT_CACHE_BACKEND
+    servers: tuple[str, ...] | None = field(default=None, repr=False)
     url: str | None = field(default=None, repr=False)
     url_source: SecretSource | None = None
     url_key: str | None = None
@@ -67,6 +71,10 @@ class CacheSettings(BaseSettings):
             url = to_optional_non_blank_string(self.url)
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(f"{_section_name(name)}.url: {exc}") from exc
+        try:
+            servers = to_cache_servers(self.servers)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError(f"{_section_name(name)}.servers: {exc}") from exc
         url_source = _secret_source(self.url_source, name=name, field_name="url_source")
         url_key = _secret_key(self.url_key, name=name, field_name="url_key")
         credentials_source = _secret_source(
@@ -79,9 +87,10 @@ class CacheSettings(BaseSettings):
             name=name,
             field_name="credentials_key",
         )
-        _validate_redis_connection_settings(
+        _validate_connection_settings(
             name=name,
             backend=backend,
+            servers=servers,
             url=url,
             url_source=url_source,
             url_key=url_key,
@@ -112,6 +121,7 @@ class CacheSettings(BaseSettings):
                 )
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "backend", backend)
+        object.__setattr__(self, "servers", servers)
         object.__setattr__(self, "url", url)
         object.__setattr__(self, "url_source", url_source)
         object.__setattr__(self, "url_key", url_key)
@@ -124,6 +134,13 @@ class CacheSettings(BaseSettings):
     def partition(self) -> str:
         if self.backend == "memory":
             return f"process:{self.name}"
+        if self.backend == "nats-jetstream":
+            if not self.servers:
+                raise ConfigurationError(
+                    f"{_section_name(self.name)}.servers is required when backend is "
+                    "'nats-jetstream'."
+                )
+            return _nats_jetstream_partition(self.servers, self.resolved_namespace)
         url_reference = self.url_reference
         if self.url is None and url_reference is None:
             raise ConfigurationError(
@@ -321,6 +338,10 @@ def _load_cache_settings(
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(f"{section_name}.url: {exc}") from exc
     try:
+        servers = to_cache_servers(values.get("servers"))
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(f"{section_name}.servers: {exc}") from exc
+    try:
         url_source = to_optional_secret_source(values.get("url_source"))
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(f"{section_name}.url_source: {exc}") from exc
@@ -347,6 +368,7 @@ def _load_cache_settings(
     return CacheSettings(
         name=name,
         backend=backend,
+        servers=servers,
         url=url,
         url_source=url_source,
         url_key=url_key,
@@ -396,6 +418,36 @@ def _secret_redis_partition(source: SecretSource, key: str, namespace: str) -> s
     return f"redis:{fingerprint}"
 
 
+def _nats_jetstream_partition(servers: tuple[str, ...], namespace: str) -> str:
+    targets = tuple(sorted(_nats_server_target(server) for server in servers))
+    fingerprint = sha256(f"{targets}:{namespace}".encode()).hexdigest()[:12]
+    return f"nats-jetstream:{fingerprint}"
+
+
+def _nats_server_target(server: str) -> str:
+    parsed = urlsplit(server)
+    port = parsed.port or 4222
+    return f"{parsed.scheme.lower()}:{parsed.hostname or 'localhost'}:{port}"
+
+
+def _validate_nats_server_urls(servers: tuple[str, ...], *, section_name: str) -> None:
+    for server in servers:
+        try:
+            parsed = urlsplit(server)
+            if (
+                parsed.scheme.lower() not in _NATS_SERVER_SCHEMES
+                or parsed.hostname is None
+            ):
+                raise ValueError
+            port = parsed.port
+            if port is not None and not 0 < port <= 65_535:
+                raise ValueError
+        except ValueError:
+            raise ConfigurationError(
+                f"{section_name}.servers must contain valid NATS server URLs."
+            ) from None
+
+
 def _secret_source(
     value: SecretSource | str | None,
     *,
@@ -424,10 +476,11 @@ def _secret_key(
         raise ConfigurationError(f"{_section_name(name)}.{field_name}: {exc}") from exc
 
 
-def _validate_redis_connection_settings(
+def _validate_connection_settings(
     *,
     name: str,
     backend: str,
+    servers: tuple[str, ...] | None,
     url: str | None,
     url_source: SecretSource | None,
     url_key: str | None,
@@ -437,6 +490,10 @@ def _validate_redis_connection_settings(
     section_name = _section_name(name)
     secret_values = (url_source, url_key, credentials_source, credentials_key)
     if backend == "memory":
+        if servers is not None:
+            raise ConfigurationError(
+                f"{section_name}.servers is not valid when backend is 'memory'."
+            )
         if url is not None:
             raise ConfigurationError(
                 f"{section_name}.url is not valid when backend is 'memory'."
@@ -452,6 +509,31 @@ def _validate_redis_connection_settings(
                     "'memory'."
                 )
         return
+    if backend == "nats-jetstream":
+        if servers is None:
+            raise ConfigurationError(
+                f"{section_name}.servers is required when backend is 'nats-jetstream'."
+            )
+        if not servers:
+            raise ConfigurationError(
+                f"{section_name}.servers must contain at least one NATS server."
+            )
+        _validate_nats_server_urls(servers, section_name=section_name)
+        for field_name, value in zip(
+            ("url", "url_source", "url_key", "credentials_source", "credentials_key"),
+            (url, *secret_values),
+            strict=True,
+        ):
+            if value is not None:
+                raise ConfigurationError(
+                    f"{section_name}.{field_name} is not valid when backend is "
+                    "'nats-jetstream'."
+                )
+        return
+    if servers is not None:
+        raise ConfigurationError(
+            f"{section_name}.servers is not valid when backend is 'redis'."
+        )
     for source, field_name in (
         (url_source, "url_source"),
         (credentials_source, "credentials_source"),
