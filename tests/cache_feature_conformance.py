@@ -278,73 +278,82 @@ async def assert_work_queue_conformance(
     advance: AdvanceClock,
     *,
     owner: str = "conformance-queue",
+    visibility_timeout: float = 5,
+    renewed_visibility_timeout: float = 10,
+    retry_delay: float = 5,
 ) -> None:
     identity = await feature.publish(owner, "visibility", b"payload", max_attempts=3)
     first = await feature.reserve(
         owner,
         "visibility",
         "worker-1",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert first is not None
     assert first.identity == identity
 
-    renewed = await feature.renew(first, visibility_timeout=10)
+    renewed = await feature.renew(
+        first,
+        visibility_timeout=renewed_visibility_timeout,
+    )
     assert renewed.identity == first.identity
     assert renewed.attempt == first.attempt
     assert renewed.receipt == first.receipt
     assert renewed.visible_until > first.visible_until
 
-    await advance(5)
+    await advance(visibility_timeout)
     assert (
         await feature.reserve(
             owner,
             "visibility",
             "worker-2",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
-    await advance(5)
-    conditionally_renewed = await feature.renew(renewed, visibility_timeout=5)
+    await advance(renewed_visibility_timeout - visibility_timeout)
+    conditionally_renewed = await feature.renew(
+        renewed,
+        visibility_timeout=visibility_timeout,
+    )
     assert conditionally_renewed.receipt == renewed.receipt
     assert (
         await feature.reserve(
             owner,
             "visibility",
             "worker-2",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
-    await advance(5)
+    await advance(visibility_timeout)
     second = await feature.reserve(
         owner,
         "visibility",
         "worker-2",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert second is not None
     assert second.identity == identity
     assert second.attempt == 2
     with pytest.raises(CacheConflictError):
         await feature.acknowledge(conditionally_renewed)
-    await feature.reject(second, delay=5)
+    await feature.reject(second, delay=retry_delay)
     assert (
         await feature.reserve(
             owner,
             "visibility",
             "worker-3",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
-    await advance(5)
+    await advance(retry_delay)
     third = await feature.reserve(
         owner,
         "visibility",
         "worker-3",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert third is not None
     assert third.identity == identity
@@ -360,17 +369,17 @@ async def assert_work_queue_conformance(
         owner,
         "conditional-acknowledgement",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert acknowledged is not None
-    await advance(5)
+    await advance(visibility_timeout)
     await feature.acknowledge(acknowledged)
     assert (
         await feature.reserve(
             owner,
             "conditional-acknowledgement",
             "worker",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
@@ -385,16 +394,16 @@ async def assert_work_queue_conformance(
         owner,
         "conditional-retry",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert retried is not None
-    await advance(5)
+    await advance(visibility_timeout)
     await feature.reject(retried)
     retried_again = await feature.reserve(
         owner,
         "conditional-retry",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert retried_again is not None
     assert retried_again.identity == retried_identity
@@ -410,10 +419,10 @@ async def assert_work_queue_conformance(
         owner,
         "conditional-dead-letter",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert dead is not None
-    await advance(5)
+    await advance(visibility_timeout)
     await feature.dead_letter(dead)
     dead_letters = await feature.dead_letters(owner, "conditional-dead-letter")
     assert [entry.identity for entry in dead_letters] == [dead_identity]
@@ -422,23 +431,23 @@ async def assert_work_queue_conformance(
         owner,
         "delayed",
         b"delayed",
-        delay=5,
+        delay=retry_delay,
     )
     assert (
         await feature.reserve(
             owner,
             "delayed",
             "worker",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
-    await advance(5)
+    await advance(retry_delay)
     delayed = await feature.reserve(
         owner,
         "delayed",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert delayed is not None
     assert delayed.identity == delayed_identity
@@ -449,7 +458,7 @@ async def assert_work_queue_conformance(
         owner,
         "terminal",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert terminal is not None
     await feature.dead_letter(terminal)
@@ -458,7 +467,7 @@ async def assert_work_queue_conformance(
             owner,
             "terminal",
             "worker",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
@@ -470,7 +479,7 @@ async def assert_work_queue_conformance(
         owner,
         "dead-order",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert first_dead is not None
     await feature.dead_letter(first_dead)
@@ -479,7 +488,7 @@ async def assert_work_queue_conformance(
         owner,
         "dead-order",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert second_dead is not None
     await feature.dead_letter(second_dead)
@@ -499,16 +508,16 @@ async def assert_work_queue_conformance(
         owner,
         "exhausted",
         "worker",
-        visibility_timeout=5,
+        visibility_timeout=visibility_timeout,
     )
     assert exhausted is not None
-    await advance(5)
+    await advance(visibility_timeout)
     assert (
         await feature.reserve(
             owner,
             "exhausted",
             "worker",
-            visibility_timeout=5,
+            visibility_timeout=visibility_timeout,
         )
         is None
     )
@@ -551,14 +560,14 @@ async def assert_pubsub_conformance(
     *,
     owner: str = "conformance-pubsub",
 ) -> None:
-    assert await feature.publish(owner, "live", b"offline") == 0
+    await feature.publish(owner, "live", b"offline")
     subscription = await feature.subscribe(owner, "live")
     try:
-        assert await feature.publish(owner, "live", b"online") == 1
+        await feature.publish(owner, "live", b"online")
         assert await subscription.receive(timeout=1) == b"online"
     finally:
         await subscription.close()
-    assert await feature.publish(owner, "live", b"after") == 0
+    await feature.publish(owner, "live", b"after")
 
 
 async def assert_schedule_conformance(

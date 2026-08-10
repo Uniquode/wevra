@@ -23,6 +23,7 @@ from wybra.cache.feature_models import (
 )
 from wybra.cache.lifecycle import close_all
 from wybra.cache.memory_features import InMemoryCacheFeatures
+from wybra.cache.nats_features import NatsJetStreamCacheFeatures
 from wybra.cache.nats_runtime import NatsJetStreamRuntime
 from wybra.cache.redis_features import RedisCacheFeatures
 from wybra.cache.redis_runtime import RedisCacheRuntime
@@ -439,21 +440,75 @@ async def _nats_jetstream_backend(settings: CacheSettings) -> CacheBackend:
             "backend."
         )
     runtime = NatsJetStreamRuntime(settings.servers, settings.resolved_namespace)
+    features = NatsJetStreamCacheFeatures(runtime)
+    registrations = features.registrations()
+    selected_features = tuple(
+        registration
+        for registration in registrations
+        if settings.features is None or registration.metadata.name in settings.features
+    )
+    selected_feature_names = {
+        registration.metadata.name for registration in selected_features
+    }
     try:
-        await runtime.health_check()
+        await runtime.health_check(
+            advanced_features="schedule" in selected_feature_names
+        )
+        if selected_feature_names & {
+            "atomic",
+            "lease",
+            "schedule",
+            "stream",
+            "time",
+            "work-queue",
+        }:
+            await features.start()
     except BaseException as startup_error:
+        cleanup_errors: list[BaseException] = []
+        try:
+            await features.close()
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
         try:
             await runtime.close()
         except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
             raise BaseExceptionGroup(
                 "NATS JetStream cache startup and cleanup failed.",
-                [startup_error, cleanup_error],
+                [startup_error, *cleanup_errors],
             ) from startup_error
         raise
+    close_lock = asyncio.Lock()
+    features_closed = False
+    runtime_closed = False
+
+    async def close() -> None:
+        nonlocal features_closed, runtime_closed
+        async with close_lock:
+            errors: list[BaseException] = []
+            if not features_closed:
+                try:
+                    await features.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    features_closed = True
+            if not runtime_closed:
+                try:
+                    await runtime.close()
+                except BaseException as error:
+                    errors.append(error)
+                else:
+                    runtime_closed = True
+            if errors:
+                raise BaseExceptionGroup("NATS cache cleanup failed.", errors)
+
     return CacheBackend(
         NatsJetStreamCache.from_runtime(runtime),
-        runtime.close,
-        lifecycle_owner=runtime,
+        close,
+        lifecycle_owner=features,
+        features=registrations,
     )
 
 

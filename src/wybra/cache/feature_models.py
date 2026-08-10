@@ -4,9 +4,10 @@ import math
 import re
 from dataclasses import dataclass, field
 
-MAX_CACHE_FEATURE_PAYLOAD_BYTES = 1_048_576
+MAX_CACHE_FEATURE_PAYLOAD_BYTES = 65_536
 MAX_CACHE_VALUE_BYTES = 65_536
 MAX_CACHE_FEATURE_LIMIT = 10_000
+MAX_CACHE_RESOURCE_LENGTH = 4_096
 MINIMUM_CACHE_TTL_SECONDS = 1.0
 MAX_STREAM_POSITION = 2**63 - 1
 DEFAULT_STREAM_RETENTION_COUNT = 1_000
@@ -234,6 +235,11 @@ def validate_feature_name(value: str, *, label: str = "feature name") -> str:
 def validate_resource(value: str, *, label: str = "resource") -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label.capitalize()} must be a non-blank string.")
+    if len(value) > MAX_CACHE_RESOURCE_LENGTH:
+        raise ValueError(
+            f"{label.capitalize()} cannot exceed "
+            f"{MAX_CACHE_RESOURCE_LENGTH} characters."
+        )
     return value
 
 

@@ -20,6 +20,7 @@ from wybra.cache.config import (
     to_optional_secret_source,
 )
 from wybra.cache.memory_features import MEMORY_CACHE_FEATURES
+from wybra.cache.nats_features import NATS_CACHE_FEATURES
 from wybra.cache.redis_features import REDIS_CACHE_FEATURES
 from wybra.config import BaseSettings, ConfigDef, ConfigService, CredentialReference
 from wybra.config.transforms import to_optional_non_blank_string
@@ -34,7 +35,7 @@ from wybra.services.secrets import (
 
 CACHE_BACKEND_FEATURES = {
     "memory": MEMORY_CACHE_FEATURES,
-    "nats-jetstream": frozenset(),
+    "nats-jetstream": NATS_CACHE_FEATURES,
     "redis": REDIS_CACHE_FEATURES,
 }
 _NATS_SERVER_SCHEMES = frozenset({"nats", "tls", "ws", "wss"})

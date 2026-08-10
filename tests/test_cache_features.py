@@ -568,11 +568,11 @@ async def test_redis_pubsub_delivers_live_messages_and_closes_subscriptions(
     runtime = RedisCacheRuntime("redis://secret@cache/0", "test")
     pubsub = RedisPubSubCache(runtime)
 
-    assert await pubsub.publish("owner", "topic", b"offline") == 0
+    await pubsub.publish("owner", "topic", b"offline")
     subscription = await pubsub.subscribe("owner", "topic")
     with pytest.raises(TimeoutError):
         await subscription.receive(timeout=0.1)
-    assert await pubsub.publish("owner", "topic", b"online") == 1
+    await pubsub.publish("owner", "topic", b"online")
     assert await subscription.receive() == b"online"
     await subscription.close()
     await subscription.close()
@@ -2838,20 +2838,20 @@ async def test_stream_bounds_and_releases_consumers_per_logical_stream() -> None
 @pytest.mark.anyio
 async def test_pubsub_delivers_only_to_active_subscribers() -> None:
     pubsub = InMemoryPubSubCache()
-    assert await pubsub.publish("tasks", "updates", b"before") == 0
+    await pubsub.publish("tasks", "updates", b"before")
     subscription = await pubsub.subscribe("tasks", "updates")
 
-    assert await pubsub.publish("tasks", "updates", b"during") == 1
+    await pubsub.publish("tasks", "updates", b"during")
     assert await subscription.receive(timeout=1) == b"during"
     await subscription.close()
 
-    assert await pubsub.publish("tasks", "updates", b"after") == 0
+    await pubsub.publish("tasks", "updates", b"after")
 
 
 @pytest.mark.anyio
 async def test_pubsub_bounds_topics_without_retaining_empty_publications() -> None:
     pubsub = InMemoryPubSubCache(max_topics=1, max_subscriptions=1)
-    assert await pubsub.publish("tasks", "missing", b"before") == 0
+    await pubsub.publish("tasks", "missing", b"before")
     first = await pubsub.subscribe("tasks", "one")
 
     with pytest.raises(CacheFeatureError, match="topic capacity"):

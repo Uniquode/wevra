@@ -81,13 +81,13 @@ Environment feature and server lists are comma-separated.
 A blank environment feature value is treated as unset; use `features = []` in
 configuration when a Redis cache must provide only the baseline byte-cache API.
 
-### NATS JetStream baseline cache
+### NATS JetStream cache
 
-The `nats-jetstream` backend provides the shared baseline byte cache only. It
-does not advertise any optional cache features in this release. It requires a
-reachable JetStream-enabled NATS Server `2.11` or newer; startup verifies the
-server version, JetStream availability, and the required stream configuration
-before the cache is registered.
+The `nats-jetstream` backend provides a shared baseline byte cache plus
+`atomic`, `lease`, `time`, `pub-sub`, `stream`, `work-queue`, and `schedule`
+features. It requires a reachable JetStream-enabled NATS Server `2.11` or
+newer; startup verifies the server version, JetStream availability, and the
+required stream configuration before the cache is registered.
 
 ```toml
 [cache]
@@ -96,20 +96,58 @@ servers = ["nats://nats-1.internal:4222", "nats://nats-2.internal:4222"]
 namespace = "website_default"
 ```
 
-Each namespace owns one provider-managed stream and subject family. Namespaces
-therefore isolate named caches even when they use the same NATS account. Wybra
-derives each subject token from a deterministic SHA-256 digest of the logical
-owner and key, so raw cache keys do not appear in NATS subject names or
-diagnostics. Subject tokens are not a credential boundary; protect access to
-the NATS account and its monitoring interfaces.
+Each namespace owns baseline and private coordination streams. Logical durable
+streams, work queues, and dead-letter streams create additional bounded
+JetStream streams on first use; live pub/sub uses core NATS subjects and
+retains nothing. Namespaces therefore isolate named caches even when they use
+the same NATS account. Wybra derives each subject token from a deterministic
+SHA-256 digest of the logical owner and key, so raw cache keys do not appear in
+NATS subject names or diagnostics. Subject tokens are not a credential
+boundary; protect access to the NATS account and its monitoring interfaces.
 
-The provider creates or reuses only a `limits`-retention stream with one
-retained value per subject, no stream-level capacity cap, native message TTL,
-direct reads, and deletable entries. Startup rejects streams whose retention,
-capacity, acknowledgement, republish, delete-marker, source, or
-subject-transform settings could change baseline cache semantics or expose
-cache payloads outside the namespace. It also verifies that the configured NATS
-server can carry the 65,536-byte baseline value limit with message headers.
+The value and feature-state streams retain one value per subject with native
+message TTL and direct reads. The command stream uses a shared durable consumer
+with one in-flight mutation, which keeps compare-and-swap, counters, leases,
+and fencing consistent across application instances. It retains at most 10,000
+pending commands and rejects additional requests while the coordinator is
+unavailable. Durable streams retain 1,000 records each and persist consumer
+checkpoints through provider-side compare-and-set state. Startup rejects
+incompatible stream settings that could change these semantics or expose cache
+payloads outside the namespace. It also verifies that the configured NATS
+server accepts the selected feature payloads: the portable 64 KiB baseline
+bound for every cache, and 128 KiB only when the `schedule` feature is enabled
+because schedule envelopes carry additional metadata and headers.
+
+The optional `time` feature derives its calibration from a JetStream-assigned
+message timestamp. It reuses a local monotonic-clock offset for at least one
+minute, targets a refresh after five minutes, and refuses to use a calibration
+older than ten minutes. This avoids a provider request for every visibility or
+schedule comparison while keeping shared cache decisions on provider time.
+
+The `pub-sub` feature provides live namespace-isolated fan-out only. A
+publication confirms provider acceptance but does not promise a subscriber
+count, replay, acknowledgement, or delivery to an offline subscriber. Use the
+durable `stream` feature when a consumer needs replay or a resumable position.
+
+The `work-queue` feature uses JetStream work-queue streams and explicit pull
+consumer acknowledgement. Wybra keeps each opaque delivery receipt in private
+state, so a visibility timeout makes work eligible for another reservation but
+does not revoke the original receipt until a later reservation succeeds. A
+receipt can therefore renew, acknowledge, reject, or dead-letter while it has
+conditional ownership. Retries use JetStream negative acknowledgement delays;
+publication, retry, and worker loss all recover through the durable queue.
+After the configured delivery-attempt limit, work is retained in a bounded
+dead-letter stream instead of being delivered again. Handlers must remain
+idempotent because the queue intentionally provides at-least-once delivery.
+
+The `schedule` feature stores revisioned one-time and interval records in the
+private state stream. Due discovery reads schedule metadata, not earlier opaque
+payload bytes, then returns records in due-time and identity order. Fenced
+claims use the same provider-time lease primitive as atomic cache mutations;
+only the current claim can release, complete, discard, or advance a schedule.
+An expired claim becomes available to another scheduler with a newer fencing
+token. Cron evaluation, timezone conversion, coalescing, and task hand-off are
+implemented by the Taskiq schedule adapter, not by NATS server scheduling.
 
 JetStream applies cache expiry through its native per-message TTL support. The
 configured one-second baseline minimum is compatible with that provider
@@ -333,6 +371,27 @@ Each `CacheInstance` exposes `features` and `feature_metadata`. Presence and
 operational guarantees are deliberately separate: callers must not infer
 durability or horizontal safety from a feature name.
 
+### Backend feature matrix
+
+All three backends implement the same baseline byte-value cache and the same
+optional capability interfaces. Select a provider for its operational
+guarantees rather than changing application code:
+
+| Capability | Memory | Redis | NATS JetStream |
+| --- | --- | --- | --- |
+| Baseline values | Process-local, volatile | Shared, expiring | Shared, durable, expiring |
+| Atomic values and leases | Process-local | Shared, provider-atomic | Shared, serialised through private coordination |
+| Provider time | Configured process clock | Redis `TIME` calibration | JetStream timestamp calibration |
+| Pub/sub | Process-local live fan-out | Shared live fan-out | Shared core-NATS live fan-out |
+| Streams | Process-local bounded replay | Shared durable replay | Shared durable replay |
+| Work queues | Process-local at-least-once | Shared durable at-least-once | Shared durable at-least-once |
+| Schedules | Process-local fenced records | Shared durable fenced records | Shared durable fenced records |
+
+Memory is suitable for local development, deterministic tests, and one
+process. Redis is the usual choice for cache-centric deployments. NATS
+JetStream is suitable when a deployment already operates NATS and requires
+durable cache features, queues, streams, and schedules through one provider.
+
 ### Memory guarantees
 
 The memory backend implements every current optional feature so application
@@ -357,8 +416,10 @@ records have explicit capacity or retention bounds; operations fail or evict
 the oldest retained dead-letter or stream history according to the relevant
 contract rather than growing state indefinitely.
 
-Feature payloads are opaque bytes and are limited to 1 MiB. Callers own
+Feature payloads are opaque bytes and are limited to 64 KiB. Callers own
 serialisation, schema versioning, redaction, and domain validation.
+JetStream rounds positive advanced-feature TTLs shorter than one second up to
+one second because the server does not accept finer per-message expiry.
 
 ### Redis guarantees
 
@@ -431,6 +492,94 @@ Wybra logs the failed operation and exception type for operator diagnostics.
 The underlying Redis service still owns persistence and availability; deploy
 and back it up according to the application's durability requirements.
 
+### NATS JetStream guarantees
+
+The NATS backend performs its readiness check during cache-registry startup.
+It requires NATS Server 2.11 or later with JetStream enabled, native message
+TTL, direct reads, durable consumers, and the stream configuration used by
+Wybra's private namespace. Startup rejects a reachable but incompatible server
+or stream rather than advertising a weaker capability.
+
+NATS values, atomic state, lease state, schedules, streams, and work queues
+are durable according to the JetStream account and server storage policy.
+Atomic mutation and lease fencing use the namespace-private command stream.
+Queue receipt and schedule-record state use provider-side per-subject
+compare-and-set, while schedule revision allocation and claims use coordinated
+primitives. This preserves the provider-neutral compare-and-set and lease
+contracts across application instances without exposing NATS subjects or client
+types to callers.
+
+A lease-bearing durable stream append is best-effort only: the coordinator
+validates the live lease immediately before publication, but JetStream cannot
+atomically condition a publication to the replay stream on lease state held in
+the separate coordination stream. A lease that expires or is replaced between
+validation and provider acknowledgement can therefore allow a stale append.
+Do not use this operation where strict cross-resource fencing is required.
+
+Work-queue delivery is at least once. A reservation becomes recoverable after
+its visibility timeout, while its original receipt retains conditional
+ownership until another worker successfully replaces it. A worker must remain
+idempotent, renew deliveries that outlive their initial visibility budget, and
+expect a maximum of three delivery attempts unless it selects another positive
+limit at publication. JetStream uses a short native acknowledgement window and
+the provider-private receipt state to honour the provider-neutral visibility
+deadline. Atomic and lease feature TTLs retain the provider-neutral positive
+finite contract.
+
+NATS live pub/sub is core-NATS fan-out and is intentionally non-durable. Use
+the `stream` feature for replay. Durable NATS stream and dead-letter history is
+bounded to 1,000 records per logical stream. Schedule metadata and opaque
+payloads remain namespace-private; cache diagnostics expose logical identities
+but never credentials, raw keys, queue receipts, or payloads.
+
+### Deployment patterns
+
+Use a memory-only cache for a single local process:
+
+```toml
+[cache]
+backend = "memory"
+```
+
+Use isolated Redis caches when session values and task infrastructure have
+different operational partitions:
+
+```toml
+[cache]
+backend = "redis"
+url_source = "keychain"
+
+[cache.tasks]
+backend = "redis"
+url_source = "keychain"
+namespace = "website_tasks"
+```
+
+Use a mixed deployment when Redis serves ordinary cache traffic and NATS
+JetStream owns durable task queues, lifecycle streams, and schedules:
+
+```toml
+[cache]
+backend = "redis"
+url_source = "keychain"
+
+[cache.tasks]
+backend = "nats-jetstream"
+servers = ["nats://nats-1.internal:4222", "nats://nats-2.internal:4222"]
+namespace = "website_tasks"
+
+[tasks]
+backend = "taskiq"
+cache_name = "tasks"
+```
+
+Run Taskiq workers and cooperating schedulers in separate processes or
+instances, all configured with the same named `tasks` cache and namespace.
+The provider coordinates queue delivery and fenced schedule claims, so
+horizontal workers and schedulers can share that cache. Keep the cache names
+and namespaces stable across replicas; use a different named cache or
+namespace for an independent tenant or environment.
+
 ### Redis work queues
 
 The Redis `work-queue` feature provides durable, at-least-once delivery across
@@ -452,15 +601,15 @@ execution is not promised. Startup probes Redis Streams consumer groups,
 claims, scripts, sorted sets, and settlement operations; a server that lacks
 that command surface cannot advertise the feature. The generic cache-backed
 Taskiq result adapter uses only the baseline byte-value cache; Taskiq broker and
-schedule adapters remain separate work. The NATS JetStream backend currently
-supplies only the generic baseline byte cache.
+schedule adapters remain separate work.
 
 ### Redis pub/sub
 
 The Redis `pub-sub` feature provides live fan-out for one logical owner and
 topic across application instances. Each channel is private to the configured
 cache namespace, so named caches sharing a Redis database cannot cross-deliver
-messages. `publish()` returns Redis's active-subscriber count.
+messages. `publish()` confirms that the provider accepted the publication; the
+cache contract does not promise a subscriber count.
 
 Pub/sub retains no messages and does not promise replay, acknowledgement,
 redelivery, or delivery to offline subscribers. Each subscription owns a Redis

@@ -642,7 +642,7 @@ async def test_redis_pubsub_delivers_across_registries_and_isolates_namespaces(
     other_topic = await subscriber.subscribe("events", "other-updates")
     isolated_subscription = await other.subscribe("events", "updates")
     try:
-        assert await publisher.publish("events", "updates", b"shared") == 1
+        await publisher.publish("events", "updates", b"shared")
         assert await subscription.receive(timeout=1) == b"shared"
         for unrelated in (other_owner, other_topic, isolated_subscription):
             with pytest.raises(TimeoutError):

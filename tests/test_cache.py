@@ -1449,6 +1449,72 @@ class TestNatsJetStreamCache:
         assert client.close_count == 1
 
     @pytest.mark.anyio
+    async def test_requires_the_larger_payload_limit_only_for_advanced_features(
+        self,
+    ) -> None:
+        runtime = NatsJetStreamRuntime(("nats://cache.internal:4222",), "default")
+        runtime._client = SimpleNamespace(max_payload=100_000)
+        runtime._jetstream = object()
+
+        await runtime.health_check()
+
+        with pytest.raises(ConfigurationError, match="payload limit"):
+            await runtime.health_check(advanced_features=True)
+
+    @pytest.mark.anyio
+    async def test_releases_subscription_when_existing_consumer_is_incompatible(
+        self,
+    ) -> None:
+        subscription = SimpleNamespace(unsubscribed=False)
+
+        async def unsubscribe() -> None:
+            subscription.unsubscribed = True
+
+        subscription.unsubscribe = unsubscribe
+
+        async def pull_subscribe(
+            _subject: str,
+            **_kwargs: object,
+        ) -> SimpleNamespace:
+            return subscription
+
+        async def consumer_info(*_args: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    durable_name="WYBRA_DEFAULT_COORDINATOR",
+                    filter_subject="wybra.cache.default.commands",
+                    ack_policy="explicit",
+                    ack_wait=10,
+                    max_deliver=3,
+                    max_ack_pending=1,
+                    deliver_policy="all",
+                    replay_policy="instant",
+                    headers_only=False,
+                    filter_subjects=(),
+                    backoff=(),
+                    pause_until="2099-01-01T00:00:00Z",
+                )
+            )
+
+        runtime = NatsJetStreamRuntime(("nats://cache.internal:4222",), "default")
+        runtime._jetstream = SimpleNamespace(
+            pull_subscribe=pull_subscribe,
+            consumer_info=consumer_info,
+        )
+
+        with pytest.raises(ConfigurationError, match="consumer configuration"):
+            await runtime.pull_subscribe(
+                "wybra.cache.default.commands",
+                durable="WYBRA_DEFAULT_COORDINATOR",
+                stream="WYBRA_CACHE_COMMANDS_DEFAULT",
+                ack_wait=10,
+                max_deliver=3,
+                max_ack_pending=1,
+            )
+
+        assert subscription.unsubscribed
+
+    @pytest.mark.anyio
     async def test_retries_failed_startup_cleanup_before_releasing_runtime(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1519,7 +1585,7 @@ class TestNatsJetStreamCache:
             **(
                 {
                     "name": "WYBRA_CACHE_DEFAULT",
-                    "subjects": ("wybra.cache.default.>",),
+                    "subjects": ("wybra.cache.default.values.>",),
                     "retention": "limits",
                     "max_msgs_per_subject": 1,
                     "max_msgs": -1,

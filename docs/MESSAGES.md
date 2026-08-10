@@ -87,7 +87,7 @@ database_connection_name = "default"
 
 ```toml
 [wybra.messages]
-queue_depth = 20
+queue_depth = 5
 message_max_length = 1000
 message_ttl_seconds = 86400
 ```
@@ -104,7 +104,7 @@ configured message TTL.
 
 Named cache storage keeps one queue in an atomic cache value. Configuration
 fails when the worst-case serialised queue could exceed the cache feature's
-1 MiB payload limit; reduce `queue_depth` or `message_max_length` in that case.
+64 KiB payload limit; reduce `queue_depth` or `message_max_length` in that case.
 
 When `wybra.messages` uses session storage and `wybra.sessions` uses cookie
 storage, queued alerts are stored in the session cookie. The default

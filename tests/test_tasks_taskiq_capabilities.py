@@ -169,6 +169,7 @@ async def test_oversized_submission_is_definitively_rejected() -> None:
         )
 
     assert raised.value.acceptance_unknown is False
+    assert "payload limit" in str(raised.value)
     status = await capability.status(raised.value.task_id)
     assert status is not None
     assert status.state is TaskState.DEAD_LETTERED
