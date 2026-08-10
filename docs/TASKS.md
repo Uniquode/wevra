@@ -84,6 +84,10 @@ result_retention_seconds = 3600
 max_result_bytes = 65536
 ```
 
+Durable task messages, including their validated arguments and Taskiq envelope,
+must fit the selected cache feature's 64 KiB payload limit. A submission that
+exceeds it is definitively rejected before publication.
+
 `backend = "immediate"` is the default. The optional `taskiq` backend registers
 the durable `TasksCapability` during site composition when its selected cache
 provides every required feature.

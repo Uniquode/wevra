@@ -163,7 +163,7 @@ class RedisPubSubCache:
         repr=False,
     )
 
-    async def publish(self, owner: str, topic: str, payload: bytes) -> int:
+    async def publish(self, owner: str, topic: str, payload: bytes) -> None:
         self._require_open()
         channel = _channel(self.runtime, owner, topic)
         payload = validate_payload(payload)
@@ -171,8 +171,7 @@ class RedisPubSubCache:
         async def publish_message(client: Any) -> object:
             return await client.publish(channel, payload)
 
-        result = await self.runtime.feature_call(publish_message)
-        return _subscriber_count(result)
+        await self.runtime.feature_call(publish_message)
 
     async def subscribe(
         self,
@@ -332,21 +331,6 @@ def _channel(runtime: RedisCacheRuntime, owner: str, topic: str) -> str:
         validate_resource(owner, label="cache owner"),
         validate_resource(topic, label="topic"),
     )
-
-
-def _subscriber_count(value: object) -> int:
-    if isinstance(value, bool):
-        raise CacheFeatureError("Redis pub/sub publish returned invalid state.")
-    if isinstance(value, bytes):
-        try:
-            value = int(value)
-        except ValueError:
-            raise CacheFeatureError(
-                "Redis pub/sub publish returned invalid state."
-            ) from None
-    if not isinstance(value, int) or value < 0:
-        raise CacheFeatureError("Redis pub/sub publish returned invalid state.")
-    return value
 
 
 def _message_payload(value: object, channel: str) -> bytes:

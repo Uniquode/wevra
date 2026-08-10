@@ -186,7 +186,7 @@ def test_messages_settings_defaults_to_session_storage() -> None:
     settings = _settings()
 
     assert settings.storage_backend is MessageStorageBackend.SESSION
-    assert settings.queue_depth == 20
+    assert settings.queue_depth == 5
 
 
 def test_cache_messages_settings_default_to_named_default_cache() -> None:

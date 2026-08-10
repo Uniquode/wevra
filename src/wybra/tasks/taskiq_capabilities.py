@@ -175,7 +175,7 @@ class CacheTaskiqTasksCapability:
             except SendTaskError as error:
                 if isinstance(error.__cause__, CacheWorkQueueRejectedError):
                     raise TaskSubmissionError(
-                        "The configured task provider rejected the submission.",
+                        str(error.__cause__),
                         task_id=task_id,
                         acceptance_unknown=False,
                     ) from None

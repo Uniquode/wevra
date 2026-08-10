@@ -274,22 +274,18 @@ class InMemoryPubSubCache:
             label="maximum pub/sub subscriptions",
         )
 
-    async def publish(self, owner: str, topic: str, payload: bytes) -> int:
+    async def publish(self, owner: str, topic: str, payload: bytes) -> None:
         topic_key = _stream_key(owner, topic)
         payload = validate_payload(payload)
         async with self._lock:
             self._require_open()
             subscriptions = tuple(self._subscriptions.get(topic_key, ()))
-            delivered = 0
             for subscription in subscriptions:
                 try:
                     subscription._messages.put_nowait(payload)
                 except asyncio.QueueFull:
                     subscription._mark_closed()
                     self._remove_subscription(topic_key, subscription)
-                else:
-                    delivered += 1
-            return delivered
 
     async def subscribe(
         self,
